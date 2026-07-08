@@ -1,0 +1,24 @@
+# 本项目依赖：接入 AgentScope agent、OpenAI 模型，以及前端可视化 REST 服务。
+
+# AgentScope（真实 LLM agent 节点）。需 Python>=3.10 才能装到 2.x。
+agentscope>=2.0.0
+
+# OpenAI 模型 + 从 .env 读取配置
+openai>=1.30.0
+python-dotenv>=1.0.0
+
+# travel_planner 示例的 Web 工具
+# ddgs：DuckDuckGo 搜索库，用于 web_search 工具
+# playwright：真实浏览器，用于 browse_webpage 工具
+# 安装 playwright 后需执行：python -m playwright install chromium
+ddgs>=9.0.0
+playwright>=1.40.0
+
+# REST 服务（前端可视化编排接口）
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+
+# 测试
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

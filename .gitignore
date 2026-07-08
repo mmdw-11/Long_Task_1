@@ -1,0 +1,19 @@
+# IDE
+.idea/
+.vscode/
+
+# 环境与密钥
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# AgentScope 运行产物
+runs/
