@@ -321,6 +321,12 @@ class CompiledGraph:
                 base_succ = await self._successors(name, current_snapshot)
                 overridden = self.hooks.resolve_successors(name, base_succ, current_snapshot)
                 succ_list = overridden if overridden is not None else base_succ
+                yield {
+                    "type": "route",
+                    "node": name,
+                    "candidates": list(base_succ),
+                    "targets": list(succ_list),
+                }
                 for succ in succ_list:
                     if succ == END:
                         continue  # 该路径结束
@@ -361,6 +367,10 @@ class CompiledGraph:
         cond = self.conditional_edges.get(name)
         if cond is not None:
             for tgt in await cond.resolve(state):
+                if tgt != END and tgt not in self.nodes:
+                    raise GraphExecutionError(
+                        f"节点 {name!r} 的条件边解析到未知目标 {tgt!r}"
+                    )
                 if tgt not in successors:
                     successors.append(tgt)
         return successors

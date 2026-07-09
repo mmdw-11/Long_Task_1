@@ -71,6 +71,31 @@ async def test_async_node():
     assert state["ok"] is True
 
 
+@pytest.mark.asyncio
+async def test_stream_includes_route_event():
+    graph = StateGraph()
+    graph.add_node("a", lambda s: {"ok": True})
+    graph.set_entry_point("a")
+    graph.set_finish_point("a")
+
+    events = [event async for event in graph.compile().astream({})]
+    route_events = [e for e in events if e["type"] == "route"]
+    assert route_events == [
+        {"type": "route", "node": "a", "candidates": [END], "targets": [END]}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_unknown_conditional_target_raises():
+    graph = StateGraph()
+    graph.add_node("router", lambda s: {})
+    graph.set_entry_point("router")
+    graph.add_conditional_edges("router", lambda s: "missing")
+
+    with pytest.raises(GraphExecutionError, match="未知目标"):
+        await graph.compile().ainvoke({})
+
+
 def test_missing_entry_raises():
     graph = StateGraph()
     graph.add_node("x", lambda s: None)
