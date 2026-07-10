@@ -15,6 +15,8 @@ dependencies = []
 agentscope = ["agentscope>=2.0.0", "openai>=1.30.0", "python-dotenv>=1.0.0"]
 # 启动前端可视化 REST 服务
 server = ["fastapi>=0.110.0", "uvicorn[standard]>=0.29.0", "pydantic>=2.0.0"]
+# 记忆模块 BGE-M3 稠密向量 embedding
+memory = ["FlagEmbedding>=1.2.0"]
 # 测试
 test = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0"]
 # travel_planner 示例的 Web 工具（安装 playwright 后需 python -m playwright install chromium）
