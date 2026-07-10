@@ -50,6 +50,28 @@ class MemoryScope(str, enum.Enum):
         ]
 
 
+class MemoryMedium(str, enum.Enum):
+    """Storage media used inside each memory scope."""
+
+    HOT = "hot"                # In-process dict / LRU.
+    WARM = "warm"              # Redis, optionally shared and TTL-based.
+    COLD = "cold"              # Markdown / JSONL audit archive.
+    STRUCTURED = "structured"  # SQLite / PostgreSQL row store.
+    SEMANTIC = "semantic"      # Vector index, currently SQLite embedding rows.
+    GRAPH = "graph"            # Zep / Graphiti style graph memory.
+
+
+@dataclass
+class MediaRoute:
+    """Resolved media destinations for a memory item."""
+
+    media: List[MemoryMedium]
+    ttl_seconds: Optional[int] = None
+
+    def contains(self, medium: MemoryMedium) -> bool:
+        return medium in self.media
+
+
 @dataclass
 class MemoryContext:
     """记忆上下文：标识当前操作所属的各级作用域 id。
@@ -309,31 +331,89 @@ class HybridTieredMemoryStore(MemoryStore):
         long_text_threshold: int = 2000,
         summary_max_chars: int = 1200,
         redis_url: Optional[str] = None,
+        redis_default_ttl: int = 3600,
+        postgres_dsn: Optional[str] = None,
+        graph_backend: Optional[Any] = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.archive_dir = self.root_dir / "project_archive"
         self.archive_dir.mkdir(parents=True, exist_ok=True)
+        self.audit_dir = self.root_dir / "audit"
+        self.audit_dir.mkdir(parents=True, exist_ok=True)
+        self.audit_jsonl = self.audit_dir / "memories.jsonl"
         self.sqlite_path = Path(sqlite_path) if sqlite_path else self.root_dir / "memory.sqlite3"
         self.working_max_items = working_max_items
         self.long_text_threshold = long_text_threshold
         self.summary_max_chars = summary_max_chars
         self.embedding_model = embedding_model or HashingEmbeddingModel()
+        self.redis_default_ttl = redis_default_ttl
         self._working: "OrderedDict[str, MemoryItem]" = OrderedDict()
         self._redis = self._connect_redis(redis_url)
+        self._postgres = self._connect_postgres(postgres_dsn)
+        self._graph_backend = graph_backend
         self._init_db()
 
     def write(self, item: MemoryItem, *, context: Optional[MemoryContext] = None) -> None:
         item.scope_id = item.scope_id or (context.id_for(item.scope) if context else None)
         self._prepare_item(item)
-        if item.scope == MemoryScope.WORKING:
+        route = self.route(item)
+        item.metadata = {
+            **item.metadata,
+            "media_route": [medium.value for medium in route.media],
+        }
+        if route.contains(MemoryMedium.HOT):
             self._write_working(item)
-            return
-        if item.scope == MemoryScope.PROJECT:
-            self._archive_project_raw_if_needed(item)
-        self._write_sqlite(item)
+        if route.contains(MemoryMedium.COLD):
+            self._archive_cold(item)
+        if route.contains(MemoryMedium.STRUCTURED) or route.contains(MemoryMedium.SEMANTIC):
+            self._write_sqlite(item)
+        if route.contains(MemoryMedium.WARM):
+            self._write_redis(item, ttl_seconds=route.ttl_seconds)
+        if route.contains(MemoryMedium.GRAPH):
+            self._write_graph(item)
+
+    def route(self, item: MemoryItem) -> MediaRoute:
+        """Choose storage media for a memory item.
+
+        Metadata overrides:
+        - ``media``: explicit list of medium names.
+        - ``temperature``: hot | warm | cold.
+        - ``ttl_seconds``: Redis TTL for warm data.
+        - ``graph``: truthy enables graph backend write.
+        - ``audit``: truthy forces cold JSONL/Markdown archive.
+        """
+        explicit = item.metadata.get("media")
+        if explicit:
+            media = [
+                medium if isinstance(medium, MemoryMedium) else MemoryMedium(str(medium))
+                for medium in explicit
+            ]
+            return MediaRoute(media=list(dict.fromkeys(media)), ttl_seconds=item.metadata.get("ttl_seconds"))
+
+        media: List[MemoryMedium] = []
+        temperature = item.metadata.get("temperature")
+        if item.scope == MemoryScope.WORKING or temperature == "hot":
+            media.append(MemoryMedium.HOT)
+        if temperature == "warm" or item.metadata.get("ttl_seconds") is not None:
+            media.append(MemoryMedium.WARM)
+        if item.scope in (MemoryScope.TASK, MemoryScope.PROJECT, MemoryScope.GLOBAL):
+            media.extend([MemoryMedium.STRUCTURED, MemoryMedium.SEMANTIC])
+        if (
+            item.scope == MemoryScope.PROJECT
+            or temperature == "cold"
+            or item.metadata.get("audit")
+            or item.token_count >= self.long_text_threshold
+        ):
+            media.append(MemoryMedium.COLD)
         if item.scope == MemoryScope.GLOBAL:
-            self._write_redis(item)
+            media.append(MemoryMedium.WARM)
+        if item.metadata.get("graph") or item.metadata.get("entity") or item.metadata.get("relations"):
+            media.append(MemoryMedium.GRAPH)
+        return MediaRoute(
+            media=list(dict.fromkeys(media)),
+            ttl_seconds=item.metadata.get("ttl_seconds", self.redis_default_ttl),
+        )
 
     def read(
         self,
@@ -421,6 +501,23 @@ class HybridTieredMemoryStore(MemoryStore):
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories(scope, scope_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts ON memories(ts)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_embeddings (
+                    memory_id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    scope_id TEXT,
+                    embedding_json TEXT NOT NULL,
+                    index_text TEXT NOT NULL,
+                    ts REAL NOT NULL,
+                    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mem_embedding_scope "
+                "ON memory_embeddings(scope, scope_id)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.sqlite_path)
@@ -449,9 +546,19 @@ class HybridTieredMemoryStore(MemoryStore):
             if scope_id is None or item.scope_id == scope_id
         ]
 
-    def _archive_project_raw_if_needed(self, item: MemoryItem) -> None:
+    def _archive_cold(self, item: MemoryItem) -> None:
+        self._append_jsonl_audit(item)
+        self._archive_markdown_raw_if_needed(item)
+
+    def _append_jsonl_audit(self, item: MemoryItem) -> None:
+        with self.audit_jsonl.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(item.to_dict(), ensure_ascii=False, default=str) + "\n")
+
+    def _archive_markdown_raw_if_needed(self, item: MemoryItem) -> None:
         text = _stringify(item.content)
-        if item.raw_ref or len(text) < self.long_text_threshold:
+        if item.raw_ref:
+            return
+        if item.scope != MemoryScope.PROJECT and len(text) < self.long_text_threshold:
             return
         safe_scope = _safe_filename(item.scope_id or "default")
         folder = self.archive_dir / safe_scope
@@ -484,6 +591,21 @@ class HybridTieredMemoryStore(MemoryStore):
                     item.token_count,
                     json.dumps(item.tags, ensure_ascii=False),
                     json.dumps(item.metadata, ensure_ascii=False, default=str),
+                    item.ts,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO memory_embeddings (
+                    memory_id, scope, scope_id, embedding_json, index_text, ts
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.id,
+                    item.scope.value,
+                    item.scope_id,
+                    json.dumps(item.embedding or []),
+                    " ".join([item.summary, " ".join(item.tags)]),
                     item.ts,
                 ),
             )
@@ -531,13 +653,43 @@ class HybridTieredMemoryStore(MemoryStore):
         except Exception:
             return None
 
-    def _write_redis(self, item: MemoryItem) -> None:
+    def _connect_postgres(self, postgres_dsn: Optional[str]) -> Any:
+        if not postgres_dsn:
+            return None
+        try:
+            import psycopg  # type: ignore
+
+            return psycopg.connect(postgres_dsn)
+        except Exception:
+            return None
+
+    def _write_redis(self, item: MemoryItem, *, ttl_seconds: Optional[int]) -> None:
         if self._redis is None:
             return
         try:
-            self._redis.set(f"memory:global:{item.id}", json.dumps(item.to_dict(), default=str))
+            key = f"memory:{item.scope.value}:{item.scope_id or 'default'}:{item.id}"
+            payload = json.dumps(item.to_dict(), ensure_ascii=False, default=str)
+            if ttl_seconds:
+                self._redis.setex(key, int(ttl_seconds), payload)
+            else:
+                self._redis.set(key, payload)
         except Exception:
             return
+
+    def _write_graph(self, item: MemoryItem) -> None:
+        if self._graph_backend is None:
+            return
+        payload = item.to_dict()
+        for method_name in ("add_memory", "add", "write"):
+            method = getattr(self._graph_backend, method_name, None)
+            if callable(method):
+                try:
+                    method(payload)
+                except TypeError:
+                    method(item)
+                except Exception:
+                    return
+                return
 
 
 def _tokenize(text: str) -> List[str]:

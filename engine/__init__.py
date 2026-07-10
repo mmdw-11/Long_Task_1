@@ -25,8 +25,10 @@ from .hooks import ExecutionHook, HookManager, NodeContext
 from .modules.memory import (
     HashingEmbeddingModel,
     HybridTieredMemoryStore,
+    MediaRoute,
     MemoryContext,
     MemoryItem,
+    MemoryMedium,
     MemoryScope,
     MemoryStore,
 )
@@ -56,8 +58,10 @@ __all__ = [
     # Memory
     "HashingEmbeddingModel",
     "HybridTieredMemoryStore",
+    "MediaRoute",
     "MemoryContext",
     "MemoryItem",
+    "MemoryMedium",
     "MemoryScope",
     "MemoryStore",
 ]

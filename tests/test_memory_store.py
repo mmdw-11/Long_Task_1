@@ -1,6 +1,7 @@
 import pytest
 
 from engine import HybridTieredMemoryStore, MemoryContext, MemoryScope, Orchestrator
+from engine.modules.memory import MemoryItem, MemoryMedium
 
 
 def test_working_memory_uses_lru(tmp_path):
@@ -49,17 +50,19 @@ def test_project_long_text_archives_raw_markdown_and_indexes_summary(tmp_path):
     assert results[0].id == item.id
     assert "architecture" in results[0].summary
     assert "embedding retrieval markdown archive" in store.expand(results[0])
+    assert MemoryMedium.COLD.value in item.metadata["media_route"]
 
 
 def test_global_memory_uses_sqlite_when_redis_is_absent(tmp_path):
     store = HybridTieredMemoryStore(tmp_path)
     ctx = MemoryContext(global_id="org")
 
-    store.append("global lesson: always add regression tests", MemoryScope.GLOBAL, context=ctx)
+    item = store.append("global lesson: always add regression tests", MemoryScope.GLOBAL, context=ctx)
 
     results = store.read("regression tests", scope=MemoryScope.GLOBAL, context=ctx, top_k=1)
     assert results[0].scope == MemoryScope.GLOBAL
     assert "regression tests" in results[0].content
+    assert MemoryMedium.WARM.value in item.metadata["media_route"]
 
 
 def test_cascade_read_searches_from_narrow_to_broad(tmp_path):
@@ -108,3 +111,53 @@ async def test_hook_writes_node_output_to_task_memory(tmp_path):
     results = store.read("draft memory note", scope=MemoryScope.TASK, context=ctx)
     assert results
     assert results[0].metadata["node"] == "writer"
+
+
+def test_media_route_can_be_explicit(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path)
+    item = MemoryItem(
+        "manual warm audit memory",
+        metadata={"media": ["hot", "cold"], "audit": True},
+    )
+
+    store.write(item)
+
+    assert item.id in store._working
+    assert item.metadata["media_route"] == ["hot", "cold"]
+    assert (tmp_path / "audit" / "memories.jsonl").exists()
+
+
+def test_sqlite_has_separate_semantic_index_table(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path)
+    ctx = MemoryContext(task_id="semantic-task")
+    item = store.append("semantic embedding table row", MemoryScope.TASK, context=ctx)
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT memory_id, index_text FROM memory_embeddings WHERE memory_id = ?",
+            (item.id,),
+        ).fetchone()
+
+    assert row["memory_id"] == item.id
+    assert "semantic embedding" in row["index_text"]
+
+
+def test_graph_route_calls_optional_backend(tmp_path):
+    class FakeGraph:
+        def __init__(self):
+            self.payloads = []
+
+        def add_memory(self, payload):
+            self.payloads.append(payload)
+
+    graph = FakeGraph()
+    store = HybridTieredMemoryStore(tmp_path, graph_backend=graph)
+    item = store.append(
+        "alice manages project apollo",
+        MemoryScope.GLOBAL,
+        graph=True,
+        entity="alice",
+    )
+
+    assert MemoryMedium.GRAPH.value in item.metadata["media_route"]
+    assert graph.payloads[0]["id"] == item.id
