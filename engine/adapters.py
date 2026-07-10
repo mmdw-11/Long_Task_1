@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
+from .hooks import MEMORY_CONTEXT_TEXT_KEY
 from .node import Node, NodeType
 
 
@@ -109,6 +110,9 @@ def make_agent_node_func(
         if raw_input is None:
             input_msg = None
         elif isinstance(raw_input, str):
+            memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
+            if memory_context:
+                raw_input = f"{memory_context}\n\nCurrent input:\n{raw_input}"
             input_msg = _build_user_msg(Msg, TextBlock, raw_input)
         else:
             input_msg = raw_input  # 已经是 Msg

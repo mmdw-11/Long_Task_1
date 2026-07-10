@@ -300,9 +300,11 @@ class CompiledGraph:
 
             # 流控：逐节点决定 执行 / 跳过 / 延迟。
             decisions: Dict[str, FlowDecision] = {}
+            node_snapshots: Dict[str, Dict[str, Any]] = {}
             for name in frontier:
                 ctx = NodeContext(node=name, step=step, state=snapshot)
                 decisions[name] = self.hooks.on_node_start(ctx)
+                node_snapshots[name] = ctx.state
             executable = [n for n in frontier if decisions[n] == FlowDecision.EXECUTE]
             skipped = [n for n in frontier if decisions[n] == FlowDecision.SKIP]
             deferred = [n for n in frontier if decisions[n] == FlowDecision.DEFER]
@@ -311,7 +313,7 @@ class CompiledGraph:
                 yield {"type": "node_start", "node": name}
 
             results = await asyncio.gather(
-                *[self._run_node(name, step, snapshot) for name in executable],
+                *[self._run_node(name, step, node_snapshots.get(name, snapshot)) for name in executable],
                 return_exceptions=False,
             )
 

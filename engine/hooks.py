@@ -12,12 +12,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .failure import FAILURES_KEY, FailureRecord, FailureTrace
 from .modules.flow import FlowController, FlowDecision, NoOpFlowController
-from .modules.memory import MemoryStore, NoOpMemoryStore
+from .modules.memory import MemoryContext, MemoryItem, MemoryScope, MemoryStore, NoOpMemoryStore
 from .modules.recovery import (
     NoOpRecoveryStrategy,
     RecoveryAction,
@@ -37,6 +38,10 @@ from .modules.scheduling import (
     ResourceRequest,
     ResourceScheduler,
 )
+
+MEMORY_CONTEXT_KEY = "__memory_context__"
+MEMORY_CONTEXT_ITEMS_KEY = "__memory_context_items__"
+MEMORY_CONTEXT_TEXT_KEY = "__memory_context_text__"
 
 
 @dataclass
@@ -108,6 +113,7 @@ class HookManager(ExecutionHook):
         project_rules: Optional[Dict[str, Any]] = None,
         graph_view: Optional[Dict[str, Any]] = None,
         extra_hooks: Optional[List[ExecutionHook]] = None,
+        memory_top_k: int = 5,
     ) -> None:
         self.memory = memory or NoOpMemoryStore()
         self.router = router or NoOpRouter()
@@ -118,6 +124,7 @@ class HookManager(ExecutionHook):
         self.project_rules = project_rules or {}
         self.graph_view = graph_view or {}
         self.extra_hooks: List[ExecutionHook] = list(extra_hooks or [])
+        self.memory_top_k = memory_top_k
 
     # ------------------------------------------------------------------ #
     # 扩展点实现（桥接到各模块）
@@ -127,6 +134,7 @@ class HookManager(ExecutionHook):
             h.on_step_start(step, frontier, state)
 
     def on_node_start(self, ctx: NodeContext) -> FlowDecision:
+        self._inject_memory_context(ctx)
         deps = self.flow_controller.resolve_dependencies(ctx.node, self.graph_view)
         deps_satisfied = self._deps_satisfied(deps, ctx.state)
         decision = self.flow_controller.decide(
@@ -146,7 +154,14 @@ class HookManager(ExecutionHook):
     def on_node_end(self, ctx: NodeContext, update: Optional[Dict[str, Any]]) -> None:
         # 将节点产出写入记忆（NoOp 桩会丢弃）。
         if update:
-            self.memory.append(update, node=ctx.node, step=ctx.step)
+            self.memory.append(
+                update,
+                MemoryScope.TASK,
+                context=self._memory_context(ctx),
+                tags=[ctx.node],
+                node=ctx.node,
+                step=ctx.step,
+            )
         for h in self.extra_hooks:
             h.on_node_end(ctx, update)
 
@@ -173,7 +188,11 @@ class HookManager(ExecutionHook):
             state=state,
             context={
                 "project_rules": self.project_rules,
-                "memory_ctx": self.memory.read(query=node),
+                "memory_ctx": self.memory.cascade_read(
+                    query=node,
+                    context=self._memory_context_from_state(state, node=node, step=0),
+                    top_k=self.memory_top_k,
+                ),
                 "failure_trace": FailureTrace.from_state(state),
             },
         )
@@ -203,3 +222,83 @@ class HookManager(ExecutionHook):
         if not deps:
             return True
         return all(d in state for d in deps)
+
+    def _inject_memory_context(self, ctx: NodeContext) -> None:
+        memory_ctx = self._memory_context(ctx)
+        query = self._memory_query(ctx)
+        items = self.memory.cascade_read(
+            query,
+            narrowest=MemoryScope.WORKING,
+            context=memory_ctx,
+            top_k=self.memory_top_k,
+        )
+        ctx.state[MEMORY_CONTEXT_KEY] = {
+            "working_id": memory_ctx.working_id,
+            "task_id": memory_ctx.task_id,
+            "project_id": memory_ctx.project_id,
+            "global_id": memory_ctx.global_id,
+            "query": query,
+        }
+        ctx.state[MEMORY_CONTEXT_ITEMS_KEY] = [item.to_dict() for item in items]
+        ctx.state[MEMORY_CONTEXT_TEXT_KEY] = self._format_context_pack(items)
+
+    def _memory_context(self, ctx: NodeContext) -> MemoryContext:
+        return self._memory_context_from_state(ctx.state, node=ctx.node, step=ctx.step)
+
+    def _memory_context_from_state(
+        self, state: Dict[str, Any], *, node: str, step: int
+    ) -> MemoryContext:
+        existing = state.get(MEMORY_CONTEXT_KEY) or {}
+        task_id = (
+            state.get("task_id")
+            or state.get("run_id")
+            or existing.get("task_id")
+            or self.project_rules.get("task_id")
+            or "default-task"
+        )
+        project_id = (
+            state.get("project_id")
+            or existing.get("project_id")
+            or self.project_rules.get("project_id")
+            or "default-project"
+        )
+        global_id = (
+            state.get("global_id")
+            or existing.get("global_id")
+            or self.project_rules.get("global_id")
+            or "default"
+        )
+        working_id = f"{task_id}:{step}:{node}" if step else f"{task_id}:{node}"
+        return MemoryContext(
+            working_id=working_id,
+            task_id=str(task_id),
+            project_id=str(project_id),
+            global_id=str(global_id),
+        )
+
+    def _memory_query(self, ctx: NodeContext) -> str:
+        parts: List[str] = [ctx.node]
+        for key in ("input", "task", "goal", "query"):
+            value = ctx.state.get(key)
+            if value:
+                parts.append(self._stringify(value))
+        messages = ctx.state.get("messages") or []
+        if messages:
+            parts.append(self._stringify(messages[-3:]))
+        return "\n".join(parts)
+
+    def _format_context_pack(self, items: List[MemoryItem]) -> str:
+        if not items:
+            return ""
+        lines = ["Relevant memory:"]
+        for idx, item in enumerate(items, 1):
+            summary = item.summary or self._stringify(item.content)
+            ref = f" (ref: {item.raw_ref})" if item.raw_ref else ""
+            lines.append(f"{idx}. [{item.scope.value}] {summary}{ref}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _stringify(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, default=str)

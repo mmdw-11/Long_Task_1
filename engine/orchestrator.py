@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .constants import END, START
 from .failure import FAILURES_KEY
 from .graph import CompiledGraph, StateGraph
-from .hooks import HookManager
+from .hooks import MEMORY_CONTEXT_TEXT_KEY, HookManager
 from .modules.flow import FlowController
 from .modules.memory import MemoryStore
 from .modules.recovery import RecoveryStrategy
@@ -96,7 +96,10 @@ def echo_node_factory(spec: AgentSpec) -> Node:
 
     async def _echo(state: Dict[str, Any]) -> Dict[str, Any]:
         incoming = state.get("input")
+        memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
         text = f"[{spec.name}] 收到: {incoming}"
+        if memory_context:
+            text = f"{text}\n\n{memory_context}"
         return {
             "input": text,          # 传递给下游
             spec.name: text,        # 记录本节点输出
@@ -131,6 +134,7 @@ class Orchestrator:
         self._recovery_strategy: Optional[RecoveryStrategy] = None
         self._scheduler: Optional[ResourceScheduler] = None
         self._project_rules: Dict[str, Any] = {}
+        self._memory_top_k: int = 5
 
     # ------------------------------------------------------------------ #
     # 注册可插拔模块（接入或替换默认策略）
@@ -138,6 +142,12 @@ class Orchestrator:
     def set_memory(self, store: MemoryStore) -> None:
         """注入记忆模块。"""
         self._memory = store
+
+    def set_memory_options(self, *, top_k: int = 5) -> None:
+        """Configure how many memory items are injected before each node."""
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        self._memory_top_k = top_k
 
     def set_router(self, router: Router) -> None:
         """注入基于任务类型的静态路由表。"""
@@ -429,6 +439,7 @@ class Orchestrator:
         kwargs: Dict[str, Any] = {
             "project_rules": self._project_rules,
             "graph_view": graph.to_dict(),
+            "memory_top_k": self._memory_top_k,
         }
         if self._memory is not None:
             kwargs["memory"] = self._memory

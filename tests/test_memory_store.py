@@ -1,4 +1,6 @@
-from engine import HybridTieredMemoryStore, MemoryContext, MemoryScope
+import pytest
+
+from engine import HybridTieredMemoryStore, MemoryContext, MemoryScope, Orchestrator
 
 
 def test_working_memory_uses_lru(tmp_path):
@@ -69,3 +71,40 @@ def test_cascade_read_searches_from_narrow_to_broad(tmp_path):
 
     results = store.cascade_read("clue", narrowest=MemoryScope.WORKING, context=ctx, top_k=2)
     assert [item.scope for item in results] == [MemoryScope.TASK, MemoryScope.PROJECT]
+
+
+@pytest.mark.asyncio
+async def test_hook_injects_relevant_memory_into_node_state(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path)
+    ctx = MemoryContext(task_id="run-1", project_id="project-1", global_id="org")
+    store.append("sqlite migration lesson", MemoryScope.PROJECT, context=ctx)
+
+    orch = Orchestrator()
+    orch.set_memory(store)
+    orch.set_memory_options(top_k=1)
+    node = orch.create_agent("worker")
+    orch.set_entry(node)
+
+    graph = orch.build_graph()
+    state = await graph.ainvoke(
+        {"input": "please use sqlite", "task_id": "run-1", "project_id": "project-1"}
+    )
+
+    assert "sqlite migration lesson" in state["worker"]
+
+
+@pytest.mark.asyncio
+async def test_hook_writes_node_output_to_task_memory(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path)
+    orch = Orchestrator()
+    orch.set_memory(store)
+    node = orch.create_agent("writer")
+    orch.set_entry(node)
+
+    graph = orch.build_graph()
+    await graph.ainvoke({"input": "draft memory note", "task_id": "run-2"})
+
+    ctx = MemoryContext(task_id="run-2")
+    results = store.read("draft memory note", scope=MemoryScope.TASK, context=ctx)
+    assert results
+    assert results[0].metadata["node"] == "writer"
