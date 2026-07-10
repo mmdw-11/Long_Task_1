@@ -18,7 +18,15 @@ from typing import Any, Dict, List, Optional
 
 from .failure import FAILURES_KEY, FailureRecord, FailureTrace
 from .modules.flow import FlowController, FlowDecision, NoOpFlowController
-from .modules.memory import MemoryContext, MemoryItem, MemoryScope, MemoryStore, NoOpMemoryStore
+from .modules.memory import (
+    MemoryContext,
+    MemoryItem,
+    MemoryScope,
+    MemoryStore,
+    NoOpMemoryStore,
+    WakeupLevel,
+    wakeup_profile,
+)
 from .modules.recovery import (
     NoOpRecoveryStrategy,
     RecoveryAction,
@@ -114,6 +122,7 @@ class HookManager(ExecutionHook):
         graph_view: Optional[Dict[str, Any]] = None,
         extra_hooks: Optional[List[ExecutionHook]] = None,
         memory_top_k: int = 5,
+        wakeup_level: int | str = WakeupLevel.STANDARD,
     ) -> None:
         self.memory = memory or NoOpMemoryStore()
         self.router = router or NoOpRouter()
@@ -125,6 +134,7 @@ class HookManager(ExecutionHook):
         self.graph_view = graph_view or {}
         self.extra_hooks: List[ExecutionHook] = list(extra_hooks or [])
         self.memory_top_k = memory_top_k
+        self.wakeup_profile = wakeup_profile(wakeup_level)
 
     # ------------------------------------------------------------------ #
     # 扩展点实现（桥接到各模块）
@@ -226,21 +236,30 @@ class HookManager(ExecutionHook):
     def _inject_memory_context(self, ctx: NodeContext) -> None:
         memory_ctx = self._memory_context(ctx)
         query = self._memory_query(ctx)
-        items = self.memory.cascade_read(
-            query,
-            narrowest=MemoryScope.WORKING,
-            context=memory_ctx,
-            top_k=self.memory_top_k,
-        )
+        wake = getattr(self.memory, "wake", None)
+        if callable(wake):
+            result = wake(query, profile=self.wakeup_profile, context=memory_ctx)
+            items = result.items
+            context_text = result.context_text
+        else:
+            items = self.memory.cascade_read(
+                query,
+                narrowest=MemoryScope.WORKING,
+                context=memory_ctx,
+                top_k=self.memory_top_k,
+            )
+            context_text = self._format_context_pack(items)
         ctx.state[MEMORY_CONTEXT_KEY] = {
             "working_id": memory_ctx.working_id,
             "task_id": memory_ctx.task_id,
             "project_id": memory_ctx.project_id,
             "global_id": memory_ctx.global_id,
             "query": query,
+            "wakeup_level": self.wakeup_profile.level.value,
+            "wakeup_profile": self.wakeup_profile.name,
         }
         ctx.state[MEMORY_CONTEXT_ITEMS_KEY] = [item.to_dict() for item in items]
-        ctx.state[MEMORY_CONTEXT_TEXT_KEY] = self._format_context_pack(items)
+        ctx.state[MEMORY_CONTEXT_TEXT_KEY] = context_text
 
     def _memory_context(self, ctx: NodeContext) -> MemoryContext:
         return self._memory_context_from_state(ctx.state, node=ctx.node, step=ctx.step)

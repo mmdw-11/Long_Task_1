@@ -72,6 +72,105 @@ class MediaRoute:
         return medium in self.media
 
 
+class RetrievalMode(str, enum.Enum):
+    DENSE = "dense"
+    SPARSE = "sparse"
+    HYBRID = "hybrid"
+    HYBRID_TEMPORAL = "hybrid_temporal"
+
+
+class ArchiveExpandPolicy(str, enum.Enum):
+    NONE = "none"
+    ON_DEMAND = "on_demand"
+    PRE_EXPAND_TOP = "pre_expand_top"
+    EXPAND_ALL = "expand_all"
+
+
+class WakeupLevel(int, enum.Enum):
+    SILENT = 0
+    STANDARD = 1
+    DEEP = 2
+    RECOVERY = 3
+
+
+@dataclass(frozen=True)
+class WakeupProfile:
+    """Context wakeup profile controlling retrieval and archive expansion."""
+
+    level: WakeupLevel
+    name: str
+    scopes: List[MemoryScope]
+    top_k: int
+    retrieval_mode: RetrievalMode
+    expand_policy: ArchiveExpandPolicy
+    temporal_weight: float = 0.0
+    pre_expand_limit: int = 0
+
+
+@dataclass
+class WakeupResult:
+    profile: WakeupProfile
+    items: List[MemoryItem]
+    context_text: str
+
+
+def wakeup_profile(level: int | WakeupLevel | str = WakeupLevel.STANDARD) -> WakeupProfile:
+    """Return a built-in wakeup profile."""
+    if isinstance(level, str):
+        normalized = level.lower()
+        aliases = {
+            "0": WakeupLevel.SILENT,
+            "silent": WakeupLevel.SILENT,
+            "light": WakeupLevel.SILENT,
+            "1": WakeupLevel.STANDARD,
+            "standard": WakeupLevel.STANDARD,
+            "default": WakeupLevel.STANDARD,
+            "2": WakeupLevel.DEEP,
+            "deep": WakeupLevel.DEEP,
+            "3": WakeupLevel.RECOVERY,
+            "recovery": WakeupLevel.RECOVERY,
+        }
+        level = aliases.get(normalized, WakeupLevel.STANDARD)
+    level = WakeupLevel(level)
+    profiles = {
+        WakeupLevel.SILENT: WakeupProfile(
+            level=WakeupLevel.SILENT,
+            name="silent_light",
+            scopes=[MemoryScope.WORKING, MemoryScope.TASK],
+            top_k=3,
+            retrieval_mode=RetrievalMode.DENSE,
+            expand_policy=ArchiveExpandPolicy.NONE,
+        ),
+        WakeupLevel.STANDARD: WakeupProfile(
+            level=WakeupLevel.STANDARD,
+            name="standard_business",
+            scopes=MemoryScope.hierarchy(),
+            top_k=5,
+            retrieval_mode=RetrievalMode.HYBRID,
+            expand_policy=ArchiveExpandPolicy.ON_DEMAND,
+        ),
+        WakeupLevel.DEEP: WakeupProfile(
+            level=WakeupLevel.DEEP,
+            name="deep_task",
+            scopes=MemoryScope.hierarchy(),
+            top_k=8,
+            retrieval_mode=RetrievalMode.HYBRID,
+            expand_policy=ArchiveExpandPolicy.PRE_EXPAND_TOP,
+            pre_expand_limit=2,
+        ),
+        WakeupLevel.RECOVERY: WakeupProfile(
+            level=WakeupLevel.RECOVERY,
+            name="recovery_traceback",
+            scopes=MemoryScope.hierarchy(),
+            top_k=10,
+            retrieval_mode=RetrievalMode.HYBRID_TEMPORAL,
+            expand_policy=ArchiveExpandPolicy.EXPAND_ALL,
+            temporal_weight=0.15,
+        ),
+    }
+    return profiles[level]
+
+
 @dataclass
 class MemoryContext:
     """记忆上下文：标识当前操作所属的各级作用域 id。
@@ -422,9 +521,12 @@ class HybridTieredMemoryStore(MemoryStore):
         scope: Optional[MemoryScope] = None,
         context: Optional[MemoryContext] = None,
         top_k: int = 5,
+        retrieval_mode: RetrievalMode = RetrievalMode.DENSE,
+        temporal_weight: float = 0.0,
     ) -> List[MemoryItem]:
         effective_scope = scope or MemoryScope.TASK
         query_embedding = self.embedding_model.embed(query)
+        query_tokens = _tokenize(query)
         if effective_scope == MemoryScope.WORKING:
             candidates = self._read_working(context=context)
         else:
@@ -432,13 +534,68 @@ class HybridTieredMemoryStore(MemoryStore):
         ranked = sorted(
             candidates,
             key=lambda item: (
-                _cosine(query_embedding, item.embedding or []),
+                self._score_item(
+                    item,
+                    query_embedding=query_embedding,
+                    query_tokens=query_tokens,
+                    retrieval_mode=retrieval_mode,
+                    temporal_weight=temporal_weight,
+                ),
                 item.importance,
                 item.ts,
             ),
             reverse=True,
         )
         return ranked[:top_k]
+
+    def cascade_read(
+        self,
+        query: str,
+        *,
+        narrowest: MemoryScope = MemoryScope.WORKING,
+        context: Optional[MemoryContext] = None,
+        top_k: int = 5,
+        retrieval_mode: RetrievalMode = RetrievalMode.DENSE,
+        temporal_weight: float = 0.0,
+    ) -> List[MemoryItem]:
+        hierarchy = MemoryScope.hierarchy()
+        start_idx = hierarchy.index(narrowest)
+        collected: List[MemoryItem] = []
+        for scope in hierarchy[start_idx:]:
+            remaining = top_k - len(collected)
+            if remaining <= 0:
+                break
+            items = self.read(
+                query,
+                scope=scope,
+                context=context,
+                top_k=remaining,
+                retrieval_mode=retrieval_mode,
+                temporal_weight=temporal_weight,
+            )
+            collected.extend(items)
+        return collected
+
+    def wake(
+        self,
+        query: str,
+        *,
+        profile: WakeupProfile | int | str = WakeupLevel.STANDARD,
+        context: Optional[MemoryContext] = None,
+    ) -> WakeupResult:
+        effective_profile = (
+            profile if isinstance(profile, WakeupProfile) else wakeup_profile(profile)
+        )
+        items = self._read_scopes(
+            query,
+            scopes=effective_profile.scopes,
+            context=context,
+            top_k=effective_profile.top_k,
+            retrieval_mode=effective_profile.retrieval_mode,
+            temporal_weight=effective_profile.temporal_weight,
+        )
+        context_text = self.format_wakeup_context(items, effective_profile)
+        return WakeupResult(profile=effective_profile, items=items, context_text=context_text)
 
     def clear(
         self,
@@ -477,6 +634,30 @@ class HybridTieredMemoryStore(MemoryStore):
             if path.exists():
                 return path.read_text(encoding="utf-8")
         return _stringify(item.content)
+
+    def format_wakeup_context(
+        self, items: List[MemoryItem], profile: WakeupProfile
+    ) -> str:
+        if not items:
+            return ""
+        lines = [f"Relevant memory ({profile.name}, level={profile.level.value}):"]
+        for idx, item in enumerate(items, 1):
+            summary = item.summary or _stringify(item.content)
+            ref = f" ref={item.raw_ref}" if item.raw_ref else ""
+            lines.append(f"{idx}. [{item.scope.value}]{ref} {summary}")
+            should_expand = (
+                profile.expand_policy == ArchiveExpandPolicy.EXPAND_ALL
+                or (
+                    profile.expand_policy == ArchiveExpandPolicy.PRE_EXPAND_TOP
+                    and idx <= profile.pre_expand_limit
+                )
+            )
+            if should_expand and item.raw_ref:
+                lines.append("   Expanded archive:")
+                lines.append(_indent_block(_clip_text(self.expand(item), 4000), "   "))
+        if profile.expand_policy == ArchiveExpandPolicy.ON_DEMAND:
+            lines.append("Archived items are summarized only; request expansion by ref if needed.")
+        return "\n".join(lines)
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -626,6 +807,71 @@ class HybridTieredMemoryStore(MemoryStore):
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def _read_scopes(
+        self,
+        query: str,
+        *,
+        scopes: List[MemoryScope],
+        context: Optional[MemoryContext],
+        top_k: int,
+        retrieval_mode: RetrievalMode,
+        temporal_weight: float,
+    ) -> List[MemoryItem]:
+        query_embedding = self.embedding_model.embed(query)
+        query_tokens = _tokenize(query)
+        candidates: List[MemoryItem] = []
+        for scope in scopes:
+            if scope == MemoryScope.WORKING:
+                candidates.extend(self._read_working(context=context))
+            else:
+                candidates.extend(self._read_sqlite(scope, context=context))
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                self._score_item(
+                    item,
+                    query_embedding=query_embedding,
+                    query_tokens=query_tokens,
+                    retrieval_mode=retrieval_mode,
+                    temporal_weight=temporal_weight,
+                ),
+                item.importance,
+                item.ts,
+            ),
+            reverse=True,
+        )
+        deduped: List[MemoryItem] = []
+        seen = set()
+        for item in ranked:
+            if item.id in seen:
+                continue
+            seen.add(item.id)
+            deduped.append(item)
+            if len(deduped) >= top_k:
+                break
+        return deduped
+
+    def _score_item(
+        self,
+        item: MemoryItem,
+        *,
+        query_embedding: List[float],
+        query_tokens: List[str],
+        retrieval_mode: RetrievalMode,
+        temporal_weight: float,
+    ) -> float:
+        dense = _cosine(query_embedding, item.embedding or [])
+        sparse = _sparse_score(query_tokens, _tokenize(_memory_index_text(item)))
+        if retrieval_mode == RetrievalMode.DENSE:
+            score = dense
+        elif retrieval_mode == RetrievalMode.SPARSE:
+            score = sparse
+        else:
+            score = 0.65 * dense + 0.35 * sparse
+        if retrieval_mode == RetrievalMode.HYBRID_TEMPORAL and temporal_weight:
+            score += temporal_weight * _recency_score(item.ts)
+        return score
+
     def _row_to_item(self, row: sqlite3.Row) -> MemoryItem:
         return MemoryItem(
             id=row["id"],
@@ -710,6 +956,30 @@ def _cosine(left: List[float], right: List[float]) -> float:
     return sum(left[i] * right[i] for i in range(size))
 
 
+def _sparse_score(query_tokens: List[str], item_tokens: List[str]) -> float:
+    if not query_tokens or not item_tokens:
+        return 0.0
+    item_set = set(item_tokens)
+    hits = sum(1 for token in query_tokens if token in item_set)
+    return hits / max(1, len(set(query_tokens)))
+
+
+def _recency_score(ts: float) -> float:
+    age_seconds = max(0.0, time.time() - ts)
+    return 1.0 / (1.0 + age_seconds / 86400.0)
+
+
+def _memory_index_text(item: MemoryItem) -> str:
+    return " ".join(
+        [
+            item.summary,
+            _stringify(item.content),
+            " ".join(item.tags),
+            _stringify(item.metadata),
+        ]
+    )
+
+
 def _stringify(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -729,6 +999,16 @@ def _rough_token_count(text: str) -> int:
 
 def _safe_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "default"
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _indent_block(text: str, prefix: str) -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
 
 
 def _format_markdown_memory(item: MemoryItem, raw_text: str) -> str:

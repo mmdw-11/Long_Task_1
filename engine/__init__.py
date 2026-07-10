@@ -31,6 +31,10 @@ from .modules.memory import (
     MemoryMedium,
     MemoryScope,
     MemoryStore,
+    WakeupLevel,
+    WakeupProfile,
+    WakeupResult,
+    wakeup_profile,
 )
 
 __all__ = [
@@ -64,6 +68,10 @@ __all__ = [
     "MemoryMedium",
     "MemoryScope",
     "MemoryStore",
+    "WakeupLevel",
+    "WakeupProfile",
+    "WakeupResult",
+    "wakeup_profile",
 ]
 
 __version__ = "0.1.0"

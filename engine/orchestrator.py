@@ -135,6 +135,7 @@ class Orchestrator:
         self._scheduler: Optional[ResourceScheduler] = None
         self._project_rules: Dict[str, Any] = {}
         self._memory_top_k: int = 5
+        self._wakeup_level: int | str = 1
 
     # ------------------------------------------------------------------ #
     # 注册可插拔模块（接入或替换默认策略）
@@ -143,11 +144,12 @@ class Orchestrator:
         """注入记忆模块。"""
         self._memory = store
 
-    def set_memory_options(self, *, top_k: int = 5) -> None:
+    def set_memory_options(self, *, top_k: int = 5, wakeup_level: int | str = 1) -> None:
         """Configure how many memory items are injected before each node."""
         if top_k <= 0:
             raise ValueError("top_k must be positive")
         self._memory_top_k = top_k
+        self._wakeup_level = wakeup_level
 
     def set_router(self, router: Router) -> None:
         """注入基于任务类型的静态路由表。"""
@@ -440,6 +442,7 @@ class Orchestrator:
             "project_rules": self._project_rules,
             "graph_view": graph.to_dict(),
             "memory_top_k": self._memory_top_k,
+            "wakeup_level": self._wakeup_level,
         }
         if self._memory is not None:
             kwargs["memory"] = self._memory

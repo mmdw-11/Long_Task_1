@@ -1,6 +1,7 @@
 import pytest
 
 from engine import HybridTieredMemoryStore, MemoryContext, MemoryScope, Orchestrator
+from engine import WakeupLevel, wakeup_profile
 from engine.modules.memory import MemoryItem, MemoryMedium
 
 
@@ -161,3 +162,49 @@ def test_graph_route_calls_optional_backend(tmp_path):
 
     assert MemoryMedium.GRAPH.value in item.metadata["media_route"]
     assert graph.payloads[0]["id"] == item.id
+
+
+def test_wakeup_level_zero_is_silent_and_narrow(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path)
+    ctx = MemoryContext(task_id="t", project_id="p")
+    store.append("task dense clue", MemoryScope.TASK, context=ctx)
+    store.append("project dense clue", MemoryScope.PROJECT, context=ctx)
+
+    result = store.wake("dense clue", profile=WakeupLevel.SILENT, context=ctx)
+
+    assert result.profile.top_k == 3
+    assert {item.scope for item in result.items} == {MemoryScope.TASK}
+    assert "Expanded archive" not in result.context_text
+
+
+def test_wakeup_level_two_pre_expands_top_archive(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path, long_text_threshold=20, summary_max_chars=24)
+    ctx = MemoryContext(project_id="p")
+    raw = "apollo archive " * 20
+    store.append(raw, MemoryScope.PROJECT, context=ctx)
+
+    result = store.wake("apollo archive", profile=WakeupLevel.DEEP, context=ctx)
+
+    assert result.profile.pre_expand_limit == 2
+    assert "Expanded archive" in result.context_text
+    assert "apollo archive" in result.context_text
+
+
+def test_wakeup_level_three_expands_all_and_uses_temporal_profile(tmp_path):
+    store = HybridTieredMemoryStore(tmp_path, long_text_threshold=20, summary_max_chars=24)
+    ctx = MemoryContext(project_id="p")
+    old = store.append("phoenix incident " * 20, MemoryScope.PROJECT, context=ctx)
+    old.ts -= 10_000
+    store.write(old, context=ctx)
+    new = store.append("phoenix incident recent " * 20, MemoryScope.PROJECT, context=ctx)
+
+    result = store.wake("phoenix incident", profile=WakeupLevel.RECOVERY, context=ctx)
+
+    assert result.profile.temporal_weight > 0
+    assert result.items[0].id == new.id
+    assert result.context_text.count("Expanded archive") >= 2
+
+
+def test_wakeup_profile_aliases():
+    assert wakeup_profile("default").level == WakeupLevel.STANDARD
+    assert wakeup_profile("deep").top_k == 8
