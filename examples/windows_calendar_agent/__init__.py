@@ -1,0 +1,1 @@
+"""Windows calendar control example."""
