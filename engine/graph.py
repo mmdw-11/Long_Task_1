@@ -39,6 +39,7 @@ class GraphExecutionError(RuntimeError):
 
 # 条件路由函数：接收状态快照，返回下一节点名 / 名列表 / END / 供 path_map 映射的 key
 ConditionFn = Callable[[Dict[str, Any]], Union[str, List[str], Awaitable[Union[str, List[str]]]]]
+LoopConditionFn = Callable[[Dict[str, Any]], Union[bool, Awaitable[bool]]]
 
 
 class _ConditionalEdge:
@@ -144,6 +145,37 @@ class StateGraph:
             raise ValueError(f"节点 {source!r} 已存在条件边")
         self.conditional_edges[source] = _ConditionalEdge(source, condition, path_map)
         return self
+
+    def add_loop(
+        self,
+        source: str,
+        condition: LoopConditionFn,
+        *,
+        loop_target: Optional[str] = None,
+        exit_target: str = END,
+    ) -> "StateGraph":
+        """Add a boolean-controlled loop edge.
+
+        If ``condition(state)`` returns True, execution goes to ``loop_target``
+        (defaults to ``source``). Otherwise execution goes to ``exit_target``
+        (defaults to ``END``).
+        """
+        target = loop_target or source
+        self._validate_endpoint(source, is_source=True)
+        self._validate_endpoint(target, is_source=False)
+        self._validate_endpoint(exit_target, is_source=False)
+
+        async def _route(state: Dict[str, Any]) -> str:
+            result = condition(state)
+            if inspect.isawaitable(result):
+                result = await result
+            return "loop" if result else "exit"
+
+        return self.add_conditional_edges(
+            source,
+            _route,
+            path_map={"loop": target, "exit": exit_target},
+        )
 
     def set_entry_point(self, name: str) -> "StateGraph":
         """设置入口节点，等价于 ``add_edge(START, name)``。"""

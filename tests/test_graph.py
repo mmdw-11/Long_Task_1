@@ -39,6 +39,17 @@ async def test_conditional_and_loop():
 
 
 @pytest.mark.asyncio
+async def test_add_loop_api():
+    graph = StateGraph()
+    graph.add_node("inc", lambda s: {"n": s.get("n", 0) + 1})
+    graph.set_entry_point("inc")
+    graph.add_loop("inc", lambda s: s["n"] < 3)
+
+    state = await graph.compile().ainvoke({"n": 0})
+    assert state["n"] == 3
+
+
+@pytest.mark.asyncio
 async def test_fanout_fanin_dedup():
     # a 扇出到 b、c，二者再汇聚到 d；d 只应执行一次。
     graph = StateGraph(schema={"log": add_messages})
