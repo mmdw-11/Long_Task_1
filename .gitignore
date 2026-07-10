@@ -17,3 +17,4 @@ dist/
 
 # AgentScope 运行产物
 runs/
+.memory/

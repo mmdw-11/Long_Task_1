@@ -22,6 +22,14 @@ from .graph import StateGraph, CompiledGraph, GraphExecutionError
 from .orchestrator import Orchestrator, AgentSpec
 from .failure import FailureRecord, FailureTrace, FAILURES_KEY
 from .hooks import ExecutionHook, HookManager, NodeContext
+from .modules.memory import (
+    HashingEmbeddingModel,
+    HybridTieredMemoryStore,
+    MemoryContext,
+    MemoryItem,
+    MemoryScope,
+    MemoryStore,
+)
 
 __all__ = [
     "START",
@@ -45,6 +53,13 @@ __all__ = [
     "ExecutionHook",
     "HookManager",
     "NodeContext",
+    # Memory
+    "HashingEmbeddingModel",
+    "HybridTieredMemoryStore",
+    "MemoryContext",
+    "MemoryItem",
+    "MemoryScope",
+    "MemoryStore",
 ]
 
 __version__ = "0.1.0"
