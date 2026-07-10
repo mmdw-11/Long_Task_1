@@ -7,6 +7,10 @@ agentscope>=2.0.0
 openai>=1.30.0
 python-dotenv>=1.0.0
 
+# 记忆模块 embedding（BGE-M3 稠密向量检索）
+# 安装后可使用 BGEM3EmbeddingModel 替代默认的 HashingEmbeddingModel
+FlagEmbedding>=1.2.0
+
 # travel_planner 示例的 Web 工具
 # ddgs：DuckDuckGo 搜索库，用于 web_search 工具
 # playwright：真实浏览器，用于 browse_webpage 工具

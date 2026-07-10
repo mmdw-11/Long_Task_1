@@ -23,6 +23,7 @@ from .orchestrator import Orchestrator, AgentSpec
 from .failure import FailureRecord, FailureTrace, FAILURES_KEY
 from .hooks import ExecutionHook, HookManager, NodeContext
 from .modules.memory import (
+    BGEM3EmbeddingModel,
     HashingEmbeddingModel,
     HybridTieredMemoryStore,
     MediaRoute,
@@ -31,6 +32,8 @@ from .modules.memory import (
     MemoryMedium,
     MemoryScope,
     MemoryStore,
+    MemoryUpdateAction,
+    OpenAIMemoryJudge,
     WakeupLevel,
     WakeupProfile,
     WakeupResult,
@@ -60,6 +63,7 @@ __all__ = [
     "HookManager",
     "NodeContext",
     # Memory
+    "BGEM3EmbeddingModel",
     "HashingEmbeddingModel",
     "HybridTieredMemoryStore",
     "MediaRoute",
@@ -68,6 +72,8 @@ __all__ = [
     "MemoryMedium",
     "MemoryScope",
     "MemoryStore",
+    "MemoryUpdateAction",
+    "OpenAIMemoryJudge",
     "WakeupLevel",
     "WakeupProfile",
     "WakeupResult",
