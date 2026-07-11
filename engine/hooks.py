@@ -50,6 +50,7 @@ from .modules.scheduling import (
 MEMORY_CONTEXT_KEY = "__memory_context__"
 MEMORY_CONTEXT_ITEMS_KEY = "__memory_context_items__"
 MEMORY_CONTEXT_TEXT_KEY = "__memory_context_text__"
+RESOURCE_ALLOCATION_KEY = "__resource_allocation__"
 
 
 @dataclass
@@ -155,7 +156,18 @@ class HookManager(ExecutionHook):
         return decision
 
     def acquire_resource(self, ctx: NodeContext) -> Optional[ResourceAllocation]:
-        return self.scheduler.acquire(ResourceRequest(node=ctx.node))
+        request = ResourceRequest(
+            node=ctx.node,
+            metadata={
+                **ctx.metadata,
+                **self._node_metadata(ctx.node),
+                **self._scheduling_rules(),
+            },
+            state=ctx.state,
+        )
+        allocation = self.scheduler.acquire(request)
+        ctx.state[RESOURCE_ALLOCATION_KEY] = allocation.to_dict()
+        return allocation
 
     def release_resource(self, ctx: NodeContext, allocation: Optional[ResourceAllocation]) -> None:
         if allocation is not None:
@@ -321,3 +333,14 @@ class HookManager(ExecutionHook):
         if isinstance(value, str):
             return value
         return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _node_metadata(self, node: str) -> Dict[str, Any]:
+        for item in self.graph_view.get("nodes", []):
+            if item.get("name") == node:
+                metadata = item.get("metadata") or {}
+                return dict(metadata)
+        return {}
+
+    def _scheduling_rules(self) -> Dict[str, Any]:
+        rules = self.project_rules.get("scheduling") or {}
+        return dict(rules) if isinstance(rules, dict) else {}

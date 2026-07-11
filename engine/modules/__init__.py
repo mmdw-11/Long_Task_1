@@ -25,11 +25,22 @@ from .recovery import (
     NoOpRecoveryStrategy,
 )
 from .scheduling import (
+    AdaptiveResourceScheduler,
+    HeuristicTaskGate,
+    ModelSplitStep,
+    RealtimeRequirement,
+    ResourceProfile,
     ResourceTier,
     ResourceRequest,
     ResourceAllocation,
     ResourceScheduler,
     NoOpResourceScheduler,
+    SchedulingDecision,
+    SensitivityLevel,
+    TaskComplexity,
+    TaskGate,
+    TaskProfile,
+    TrustedWorkspacePolicy,
 )
 
 __all__ = [
@@ -56,9 +67,20 @@ __all__ = [
     "RecoveryStrategy",
     "NoOpRecoveryStrategy",
     # scheduling
+    "AdaptiveResourceScheduler",
+    "HeuristicTaskGate",
+    "ModelSplitStep",
+    "RealtimeRequirement",
+    "ResourceProfile",
     "ResourceTier",
     "ResourceRequest",
     "ResourceAllocation",
     "ResourceScheduler",
     "NoOpResourceScheduler",
+    "SchedulingDecision",
+    "SensitivityLevel",
+    "TaskComplexity",
+    "TaskGate",
+    "TaskProfile",
+    "TrustedWorkspacePolicy",
 ]

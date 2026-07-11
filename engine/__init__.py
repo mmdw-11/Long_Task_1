@@ -39,6 +39,23 @@ from .modules.memory import (
     WakeupResult,
     wakeup_profile,
 )
+from .modules.scheduling import (
+    AdaptiveResourceScheduler,
+    HeuristicTaskGate,
+    ModelSplitStep,
+    RealtimeRequirement,
+    ResourceAllocation,
+    ResourceProfile,
+    ResourceRequest,
+    ResourceScheduler,
+    ResourceTier,
+    SchedulingDecision,
+    SensitivityLevel,
+    TaskComplexity,
+    TaskGate,
+    TaskProfile,
+    TrustedWorkspacePolicy,
+)
 
 __all__ = [
     "START",
@@ -78,6 +95,22 @@ __all__ = [
     "WakeupProfile",
     "WakeupResult",
     "wakeup_profile",
+    # Scheduling
+    "AdaptiveResourceScheduler",
+    "HeuristicTaskGate",
+    "ModelSplitStep",
+    "RealtimeRequirement",
+    "ResourceAllocation",
+    "ResourceProfile",
+    "ResourceRequest",
+    "ResourceScheduler",
+    "ResourceTier",
+    "SchedulingDecision",
+    "SensitivityLevel",
+    "TaskComplexity",
+    "TaskGate",
+    "TaskProfile",
+    "TrustedWorkspacePolicy",
 ]
 
 __version__ = "0.1.0"
