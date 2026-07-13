@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
@@ -302,7 +303,12 @@ class CompiledGraph:
             decisions: Dict[str, FlowDecision] = {}
             node_snapshots: Dict[str, Dict[str, Any]] = {}
             for name in frontier:
-                ctx = NodeContext(node=name, step=step, state=snapshot)
+                ctx = NodeContext(
+                    node=name,
+                    step=step,
+                    state=copy.deepcopy(snapshot),
+                    metadata=dict(self.nodes[name].metadata),
+                )
                 decisions[name] = self.hooks.on_node_start(ctx)
                 node_snapshots[name] = ctx.state
             executable = [n for n in frontier if decisions[n] == FlowDecision.EXECUTE]
@@ -322,7 +328,12 @@ class CompiledGraph:
             recovery_targets: List[str] = []
             for name, update, error in results:
                 if error is not None:
-                    err_ctx = NodeContext(node=name, step=step, state=state.snapshot())
+                    err_ctx = NodeContext(
+                        node=name,
+                        step=step,
+                        state=state.snapshot(),
+                        metadata=dict(self.nodes[name].metadata),
+                    )
                     repair = self.hooks.on_node_error(err_ctx, error)
                     if repair is None:
                         raise GraphExecutionError(
@@ -342,7 +353,12 @@ class CompiledGraph:
                     yield {"type": "node_end", "node": name, "update": {FAILURES_KEY: [rec.to_dict()]}}
                     continue
                 state.update(update)
-                end_ctx = NodeContext(node=name, step=step, state=state.snapshot())
+                end_ctx = NodeContext(
+                    node=name,
+                    step=step,
+                    state=state.snapshot(),
+                    metadata=dict(self.nodes[name].metadata),
+                )
                 self.hooks.on_node_end(end_ctx, update)
                 executed_ok.append(name)
                 yield {"type": "node_end", "node": name, "update": update or {}}
@@ -382,10 +398,15 @@ class CompiledGraph:
         self, name: str, step: int, snapshot: Dict[str, Any]
     ):
         """执行单个节点（含资源申请/释放），返回 (name, update, error)。"""
-        ctx = NodeContext(node=name, step=step, state=snapshot)
+        ctx = NodeContext(
+            node=name,
+            step=step,
+            state=snapshot,
+            metadata=dict(self.nodes[name].metadata),
+        )
         allocation = self.hooks.acquire_resource(ctx)
         try:
-            update = await self.nodes[name].invoke(snapshot)
+            update = await self.nodes[name].invoke(ctx.state)
             return name, update, None
         except Exception as exc:  # noqa: BLE001 - 交由恢复策略处理
             return name, None, exc
