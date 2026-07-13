@@ -110,7 +110,13 @@ def echo_node_factory(spec: AgentSpec) -> Node:
         name=spec.name,
         func=_echo,
         node_type=NodeType.AGENT,
-        metadata={"id": spec.id, "model": spec.model, "description": spec.description},
+        metadata={
+            "id": spec.id,
+            "model": spec.model,
+            "description": spec.description,
+            "sys_prompt": spec.sys_prompt,
+            **spec.config,
+        },
     )
 
 

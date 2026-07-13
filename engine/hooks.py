@@ -40,6 +40,7 @@ from .modules.routing import (
     RoutingPolicy,
     Router,
 )
+from .modules.security import AuditPackBuilder, SensitiveDataRedactor
 from .modules.scheduling import (
     NoOpResourceScheduler,
     ResourceAllocation,
@@ -50,6 +51,9 @@ from .modules.scheduling import (
 MEMORY_CONTEXT_KEY = "__memory_context__"
 MEMORY_CONTEXT_ITEMS_KEY = "__memory_context_items__"
 MEMORY_CONTEXT_TEXT_KEY = "__memory_context_text__"
+RESOURCE_ALLOCATION_KEY = "__resource_allocation__"
+REDACTION_RESULT_KEY = "__redaction__"
+AUDIT_PACK_KEY = "__audit_pack__"
 
 
 @dataclass
@@ -118,6 +122,8 @@ class HookManager(ExecutionHook):
         flow_controller: Optional[FlowController] = None,
         recovery_strategy: Optional[RecoveryStrategy] = None,
         scheduler: Optional[ResourceScheduler] = None,
+        redactor: Optional[SensitiveDataRedactor] = None,
+        audit_builder: Optional[AuditPackBuilder] = None,
         project_rules: Optional[Dict[str, Any]] = None,
         graph_view: Optional[Dict[str, Any]] = None,
         extra_hooks: Optional[List[ExecutionHook]] = None,
@@ -130,6 +136,8 @@ class HookManager(ExecutionHook):
         self.flow_controller = flow_controller or NoOpFlowController()
         self.recovery_strategy = recovery_strategy or NoOpRecoveryStrategy()
         self.scheduler = scheduler or NoOpResourceScheduler()
+        self.redactor = redactor or SensitiveDataRedactor()
+        self.audit_builder = audit_builder or AuditPackBuilder()
         self.project_rules = project_rules or {}
         self.graph_view = graph_view or {}
         self.extra_hooks: List[ExecutionHook] = list(extra_hooks or [])
@@ -155,7 +163,19 @@ class HookManager(ExecutionHook):
         return decision
 
     def acquire_resource(self, ctx: NodeContext) -> Optional[ResourceAllocation]:
-        return self.scheduler.acquire(ResourceRequest(node=ctx.node))
+        request = ResourceRequest(
+            node=ctx.node,
+            metadata={
+                **ctx.metadata,
+                **self._node_metadata(ctx.node),
+                **self._scheduling_rules(),
+            },
+            state=ctx.state,
+        )
+        allocation = self.scheduler.acquire(request)
+        self._apply_security_controls(ctx, allocation)
+        ctx.state[RESOURCE_ALLOCATION_KEY] = allocation.to_dict()
+        return allocation
 
     def release_resource(self, ctx: NodeContext, allocation: Optional[ResourceAllocation]) -> None:
         if allocation is not None:
@@ -321,3 +341,55 @@ class HookManager(ExecutionHook):
         if isinstance(value, str):
             return value
         return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _node_metadata(self, node: str) -> Dict[str, Any]:
+        for item in self.graph_view.get("nodes", []):
+            if item.get("name") == node:
+                metadata = item.get("metadata") or {}
+                return dict(metadata)
+        return {}
+
+    def _scheduling_rules(self) -> Dict[str, Any]:
+        rules = self.project_rules.get("scheduling") or {}
+        return dict(rules) if isinstance(rules, dict) else {}
+
+    def _apply_security_controls(
+        self, ctx: NodeContext, allocation: ResourceAllocation
+    ) -> None:
+        split = allocation.metadata.get("model_split") or []
+        needs_redaction = any(step.get("name") == "trusted_redaction" for step in split)
+        if not needs_redaction:
+            return
+        payload = self._security_payload(ctx)
+        result = self.redactor.redact(payload)
+        audit = self.audit_builder.build(
+            node=ctx.node,
+            result=result,
+            approved=bool(ctx.state.get("cloud_audit_approved") or ctx.state.get("human_approved")),
+            reviewer=str(ctx.state.get("audit_reviewer") or ""),
+            reason=str(ctx.state.get("audit_reason") or "trusted workspace preflight"),
+            metadata={
+                "step": ctx.step,
+                "allocation_tier": allocation.tier.value,
+                "allocation_endpoint": allocation.endpoint,
+            },
+        )
+        ctx.state[REDACTION_RESULT_KEY] = result.to_dict(include_payload=True)
+        ctx.state[AUDIT_PACK_KEY] = audit.to_dict()
+        allocation.metadata["redaction"] = result.to_dict(include_payload=False)
+        allocation.metadata["audit_pack"] = audit.to_dict()
+
+    def _security_payload(self, ctx: NodeContext) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "node": ctx.node,
+            "metadata": {
+                key: value
+                for key, value in ctx.metadata.items()
+                if key in {"description", "sys_prompt", "task_type"}
+            },
+            "state": {},
+        }
+        for key in ("input", "task", "goal", "query", "messages"):
+            if key in ctx.state:
+                payload["state"][key] = ctx.state[key]
+        return payload
