@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional
 
 from ._types import (
@@ -25,11 +26,7 @@ from .production import load_production_gate
 
 
 class AdaptiveResourceScheduler(ResourceScheduler):
-    """端-边-云异构资源自适应调度器。
-
-    该实现基于确定性规则，不调用大模型。大模型或 OpenClaw 类路由器可通过替换
-    ``TaskGate`` 或整个 ``ResourceScheduler`` 接入。
-    """
+    """端-边-云异构资源自适应调度器。"""
 
     def __init__(
         self,
@@ -46,7 +43,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
     ) -> None:
         if gate is not None:
             self.gate = gate
-        elif use_production_router or router_path:
+        elif use_production_router or router_path or _env_use_production_router():
             self.gate = load_production_gate(
                 router_path=router_path,
                 threshold=learned_threshold,
@@ -204,15 +201,13 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         self, candidates: List[ResourceProfile], profile: TaskProfile
     ) -> Optional[ResourceProfile]:
         trusted = [
-            candidate for candidate in candidates
+            candidate
+            for candidate in candidates
             if self.trusted_policy.is_trusted(candidate.tier) and candidate.supports(profile.complexity)
         ]
         if trusted:
             return trusted[0]
-        fallback = [
-            candidate for candidate in candidates
-            if self.trusted_policy.is_trusted(candidate.tier)
-        ]
+        fallback = [candidate for candidate in candidates if self.trusted_policy.is_trusted(candidate.tier)]
         return fallback[0] if fallback else None
 
     def _requires_review(self, tier: ResourceTier, profile: TaskProfile) -> bool:
@@ -222,9 +217,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
             return False
         return not self.trusted_policy.is_trusted(tier)
 
-    def _model_split(
-        self, tier: ResourceTier, profile: TaskProfile
-    ) -> List[ModelSplitStep]:
+    def _model_split(self, tier: ResourceTier, profile: TaskProfile) -> List[ModelSplitStep]:
         steps = [
             ModelSplitStep(
                 name="local_gate",
@@ -243,17 +236,11 @@ class AdaptiveResourceScheduler(ResourceScheduler):
                 )
             )
         if tier == ResourceTier.DEVICE:
-            steps.append(
-                ModelSplitStep("local_inference", tier, "local-small-llm", "端侧完成推理")
-            )
+            steps.append(ModelSplitStep("local_inference", tier, "local-small-llm", "端侧完成推理"))
         elif tier == ResourceTier.EDGE:
-            steps.append(
-                ModelSplitStep("edge_inference", tier, "edge-medium-llm", "边缘侧完成中等复杂度推理")
-            )
+            steps.append(ModelSplitStep("edge_inference", tier, "edge-medium-llm", "边缘侧完成中等复杂度推理"))
         else:
-            steps.append(
-                ModelSplitStep("cloud_inference", tier, "cloud-large-llm", "云端处理高复杂度子任务")
-            )
+            steps.append(ModelSplitStep("cloud_inference", tier, "cloud-large-llm", "云端处理高复杂度子任务"))
         return steps
 
     def _reason_for(self, tier: ResourceTier, profile: TaskProfile) -> str:
@@ -349,3 +336,8 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         queue = status.queue_depth if status and status.queue_depth is not None else 0
         error_rate = status.error_rate if status else 0.0
         return (error_rate, load, queue, latency, resource.cost_weight)
+
+
+def _env_use_production_router() -> bool:
+    value = str(os.environ.get("USE_PRODUCTION_ROUTER", "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}

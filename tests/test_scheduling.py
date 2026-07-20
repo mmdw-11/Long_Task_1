@@ -17,6 +17,13 @@ from engine import (
 )
 from engine.hooks import HookManager, RESOURCE_ALLOCATION_KEY
 from engine.modules.scheduling import OpenAITaskGate
+from engine.modules.scheduling.production import (
+    AdvancedLearnedTaskGate,
+    DEFAULT_ROUTER_BACKEND,
+    load_production_gate,
+    resolve_default_router_path,
+    resolve_router_backend,
+)
 
 
 def test_high_complexity_public_task_prefers_cloud():
@@ -250,3 +257,25 @@ def test_scheduler_loads_trained_router_from_router_path(tmp_path):
         ResourceRequest(node="route", state={"input": "分析复杂代码架构风险并给出重构方案"})
     )
     assert allocation.metadata["decision"]["profile"]["metadata"]["router"] == "learned"
+
+
+def test_production_router_defaults_to_bge_m3_backend():
+    assert DEFAULT_ROUTER_BACKEND == "bge_m3"
+    assert resolve_router_backend() == "bge_m3"
+    path = resolve_default_router_path()
+    assert path is not None
+    assert path.name == "balanced_bge_m3"
+
+
+def test_scheduler_can_auto_enable_production_router_from_env(monkeypatch):
+    monkeypatch.setenv("USE_PRODUCTION_ROUTER", "1")
+    monkeypatch.setenv("ROUTER_MODEL_BACKEND", "bge_m3")
+    scheduler = AdaptiveResourceScheduler()
+    assert isinstance(scheduler.gate, AdvancedLearnedTaskGate)
+
+
+def test_production_router_can_switch_to_bert_full():
+    gate = load_production_gate(backend="bert_full")
+    assert isinstance(gate, AdvancedLearnedTaskGate)
+    profile = gate.evaluate(ResourceRequest(node="route", state={"input": "请分析复杂代码架构风险并给出重构方案"}))
+    assert profile.metadata["router_backend"] == "bert_full"

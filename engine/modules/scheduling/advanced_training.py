@@ -71,12 +71,28 @@ class TransformerTextRouter:
         return self._pipeline
 
     def predict(self, text: str) -> int:
+        probs = self.predict_proba(text)
+        return 1 if probs[1] >= probs[0] else 0
+
+    def predict_proba(self, text: str) -> Dict[int, float]:
         pipe = self._load()
-        output = pipe(text, top_k=1)[0]
-        label = str(output["label"]).lower()
-        if label.endswith("1") or label == "large":
-            return 1
-        return 0
+        output = pipe(text, top_k=2)
+        if isinstance(output, list) and output and isinstance(output[0], list):
+            output = output[0]
+        scores = {0: 0.0, 1: 0.0}
+        for item in output:
+            label = str(item["label"]).lower()
+            score = float(item.get("score", 0.0))
+            if label.endswith("1") or label == "large":
+                scores[1] = score
+            else:
+                scores[0] = score
+        if scores[0] == 0.0 and scores[1] == 0.0:
+            scores[self.predict(text)] = 1.0
+        total = scores[0] + scores[1]
+        if total <= 0:
+            return {0: 0.5, 1: 0.5}
+        return {0: scores[0] / total, 1: scores[1] / total}
 
     def evaluate(self, dataset: Sequence[RouteExample]) -> Dict[str, float]:
         return _evaluate_predictions([self.predict(ex.text) for ex in dataset], [int(ex.label) for ex in dataset])
@@ -105,10 +121,17 @@ class EmbeddingClassifierRouter:
         self._encoder = SentenceTransformer(encoder_name, local_files_only=True)
 
     def predict(self, text: str) -> int:
+        probs = self.predict_proba(text)
+        return 1 if probs[1] >= probs[0] else 0
+
+    def predict_proba(self, text: str) -> Dict[int, float]:
         self._load()
         vector = self._encoder.encode([text], normalize_embeddings=True)
-        pred = self._classifier.predict(vector)[0]
-        return int(pred)
+        if hasattr(self._classifier, "predict_proba"):
+            raw = self._classifier.predict_proba(vector)[0]
+            return {0: float(raw[0]), 1: float(raw[1])}
+        pred = int(self._classifier.predict(vector)[0])
+        return {0: 0.0 if pred == 1 else 1.0, 1: 1.0 if pred == 1 else 0.0}
 
     def evaluate(self, dataset: Sequence[RouteExample]) -> Dict[str, float]:
         return _evaluate_predictions([self.predict(ex.text) for ex in dataset], [int(ex.label) for ex in dataset])
