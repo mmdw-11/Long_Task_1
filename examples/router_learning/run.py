@@ -30,14 +30,17 @@ def main() -> None:
     parser.add_argument("--predict", default="")
     parser.add_argument("--threshold", type=float, default=0.35)
     parser.add_argument("--teacher", choices=["pseudo", "real", "fallback"], default="real")
+    parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args()
 
     if args.teacher == "pseudo":
         teacher = PseudoCascadeTeacher()
     elif args.teacher == "fallback":
-        teacher = FallbackCascadeTeacher()
+        teacher = FallbackCascadeTeacher(
+            primary=RealCascadeTeacher(timeout_seconds=args.timeout)
+        )
     else:
-        teacher = RealCascadeTeacher()
+        teacher = RealCascadeTeacher(timeout_seconds=args.timeout)
     dataset = build_route_dataset(default_training_texts(), teacher=teacher)
     result = train_router(dataset)
     model = result["model"]

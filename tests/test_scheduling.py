@@ -2,7 +2,9 @@ import pytest
 
 from engine import (
     AdaptiveResourceScheduler,
+    BinaryTextRouterModel,
     END,
+    LearnedTaskGate,
     RealtimeRequirement,
     ResourceProfile,
     ResourceRequest,
@@ -228,3 +230,23 @@ def _request(node, values):
         if key not in {"complexity", "sensitivity", "realtime"}
     }
     return ResourceRequest(node=node, metadata=metadata, state=state)
+
+
+def test_scheduler_loads_trained_router_from_router_path(tmp_path):
+    from engine import RouteDataset
+
+    dataset = RouteDataset()
+    dataset.add("创建明天下午三点的项目会日程", 0)
+    dataset.add("分析复杂代码架构风险并给出重构方案", 1)
+    dataset.add("总结客户邮件的要点", 0)
+    dataset.add("对长文档做全量风险评估", 1)
+    model = BinaryTextRouterModel().fit(dataset.examples)
+    model_path = model.save(tmp_path / "router.json")
+
+    scheduler = AdaptiveResourceScheduler(router_path=str(model_path))
+    assert isinstance(scheduler.gate, LearnedTaskGate)
+
+    allocation = scheduler.acquire(
+        ResourceRequest(node="route", state={"input": "分析复杂代码架构风险并给出重构方案"})
+    )
+    assert allocation.metadata["decision"]["profile"]["metadata"]["router"] == "learned"

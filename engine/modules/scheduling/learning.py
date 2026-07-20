@@ -190,6 +190,7 @@ class RealCascadeTeacher:
         client: Optional[Any] = None,
         run_large_on_promote: bool = True,
         temperature: float = 0.0,
+        timeout_seconds: float = 15.0,
     ) -> None:
         self.small_model = small_model
         self.large_model = large_model
@@ -197,6 +198,7 @@ class RealCascadeTeacher:
         self.client = client
         self.run_large_on_promote = run_large_on_promote
         self.temperature = temperature
+        self.timeout_seconds = timeout_seconds
 
     def label(self, text: str, request: Optional[ResourceRequest] = None) -> int:
         return self.annotate(text, request).label
@@ -304,6 +306,7 @@ class RealCascadeTeacher:
             api_key=settings.api_key,
             base_url=settings.base_url,
             organization=settings.organization,
+            timeout=self.timeout_seconds,
         )
         return self.client
 
@@ -315,14 +318,21 @@ class RealCascadeTeacher:
         system_prompt: str,
         user_prompt: str,
     ) -> str:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
+        payload = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=self.temperature,
-        )
+            "temperature": self.temperature,
+        }
+        try:
+            response = client.chat.completions.create(
+                **payload,
+                timeout=self.timeout_seconds,
+            )
+        except TypeError:
+            response = client.chat.completions.create(**payload)
         return str(response.choices[0].message.content or "").strip()
 
 
@@ -333,20 +343,29 @@ class FallbackCascadeTeacher:
         self,
         primary: Optional[RealCascadeTeacher] = None,
         fallback: Optional[PseudoCascadeTeacher] = None,
+        disable_primary_after_error: bool = True,
     ) -> None:
         self.primary = primary or RealCascadeTeacher()
         self.fallback = fallback or PseudoCascadeTeacher()
+        self.disable_primary_after_error = disable_primary_after_error
+        self._primary_disabled = False
 
     def label(self, text: str, request: Optional[ResourceRequest] = None) -> int:
         return self.annotate(text, request).label
 
     def annotate(self, text: str, request: Optional[ResourceRequest] = None) -> RouteExample:
         req = request or ResourceRequest(node="route_teacher", state={"input": text})
+        if self._primary_disabled:
+            example = self.fallback.annotate(text, req)
+            example.metadata["teacher_mode"] = "pseudo_fallback_disabled"
+            return example
         try:
             example = self.primary.annotate(text, req)
             example.metadata["teacher_mode"] = "real"
             return example
         except Exception as exc:
+            if self.disable_primary_after_error:
+                self._primary_disabled = True
             example = self.fallback.annotate(text, req)
             example.metadata["teacher_mode"] = "pseudo_fallback"
             example.metadata["teacher_error"] = str(exc)

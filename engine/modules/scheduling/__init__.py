@@ -44,6 +44,14 @@ from .learning import (
     save_experiment_report,
     train_router,
 )
+from .advanced_training import (
+    AdvancedTrainingResult,
+    TransformerTextRouter,
+    benchmark_transformer_router,
+    render_extended_experiment_report,
+    save_extended_experiment_report,
+    train_transformer_router,
+)
 from .monitor import (
     MutableResourceMonitor,
     NoOpResourceMonitor,
@@ -52,14 +60,17 @@ from .monitor import (
     SystemResourceMonitor,
 )
 from .policy import TrustedWorkspacePolicy
+from .production import load_production_gate, resolve_router_path
 from .scheduler import AdaptiveResourceScheduler
 
 __all__ = [
     "AdaptiveResourceScheduler",
+    "AdvancedTrainingResult",
     "HeuristicTaskGate",
     "BinaryTextRouterModel",
     "BgeM3Encoder",
     "benchmark_router",
+    "benchmark_transformer_router",
     "CascadeRouteDecision",
     "FallbackCascadeTeacher",
     "LearnedTaskGate",
@@ -82,6 +93,7 @@ __all__ = [
     "TaskComplexity",
     "TaskGate",
     "TaskProfile",
+    "TransformerTextRouter",
     "RouteDataset",
     "RouteExample",
     "RouteTeacher",
@@ -93,8 +105,13 @@ __all__ = [
     "default_training_texts",
     "evaluate_gate",
     "render_experiment_report",
+    "render_extended_experiment_report",
+    "resolve_router_path",
     "save_experiment_report",
+    "save_extended_experiment_report",
+    "load_production_gate",
     "train_router",
+    "train_transformer_router",
     "StaticResourceMonitor",
     "SystemResourceMonitor",
     "TrustedWorkspacePolicy",

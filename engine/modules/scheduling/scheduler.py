@@ -21,6 +21,7 @@ from .base import ResourceScheduler
 from .gate import HeuristicTaskGate, TaskGate
 from .monitor import NoOpResourceMonitor, ResourceMonitor
 from .policy import TrustedWorkspacePolicy
+from .production import load_production_gate
 
 
 class AdaptiveResourceScheduler(ResourceScheduler):
@@ -39,8 +40,20 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         monitor: Optional[ResourceMonitor] = None,
         trusted_policy: Optional[TrustedWorkspacePolicy] = None,
         enable_trace: bool = True,
+        router_path: Optional[str] = None,
+        learned_threshold: float = 0.35,
+        use_production_router: bool = False,
     ) -> None:
-        self.gate = gate or HeuristicTaskGate()
+        if gate is not None:
+            self.gate = gate
+        elif use_production_router or router_path:
+            self.gate = load_production_gate(
+                router_path=router_path,
+                threshold=learned_threshold,
+                fallback=HeuristicTaskGate(),
+            )
+        else:
+            self.gate = HeuristicTaskGate()
         self.trace_gate = trace_gate or HeuristicTaskGate()
         self.monitor = monitor or NoOpResourceMonitor()
         self.trusted_policy = trusted_policy or TrustedWorkspacePolicy()

@@ -150,3 +150,29 @@ def test_real_cascade_teacher_runs_true_small_judge_large_chain():
     assert example.metadata["cascade"]["promoted"] is True
     assert example.metadata["cascade"]["small_output"] == "small answer"
     assert example.metadata["cascade"]["large_output"] == "large answer"
+
+
+def test_dataset_jsonl_train_and_report_roundtrip(tmp_path):
+    dataset = build_route_dataset(
+        [
+            "总结这封邮件",
+            "创建明天下午三点的项目会日程",
+            "分析复杂代码的架构风险并给出重构方案",
+            "对长文档做多维度归纳和风险评估",
+        ],
+        teacher=PseudoCascadeTeacher(),
+    )
+    dataset_path = dataset.save_jsonl(tmp_path / "routes.jsonl")
+    loaded = type(dataset).load_jsonl(dataset_path)
+    result = train_router(loaded, train_ratio=0.5)
+    model_path = result["model"].save(tmp_path / "router.json")
+    report_path = save_experiment_report(
+        [{"method": "learned", **result["metrics"], "notes": "roundtrip"}],
+        tmp_path / "report.md",
+    )
+
+    assert dataset_path.exists()
+    assert model_path.exists()
+    assert report_path.exists()
+    assert len(loaded.examples) == 4
+    assert "f1" in result["metrics"]
