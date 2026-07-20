@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import inspect
+import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,12 +38,34 @@ class TransformerTextRouter:
     def _load(self):
         if self._pipeline is not None:
             return self._pipeline
-        from transformers import pipeline
+        import json
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            pipeline,
+        )
 
+        model_path = Path(self.model_dir)
+        tokenizer_source = self.model_dir
+        model_source: Any = self.model_dir
+
+        adapter_config = model_path / "adapter_config.json"
+        if adapter_config.exists():
+            from peft import PeftModel
+
+            config = json.loads(adapter_config.read_text(encoding="utf-8"))
+            base_model_name = str(config.get("base_model_name_or_path") or "").strip()
+            if not base_model_name:
+                raise RuntimeError("LoRA adapter is missing base_model_name_or_path")
+            tokenizer_source = base_model_name
+            base_model = AutoModelForSequenceClassification.from_pretrained(base_model_name, num_labels=2)
+            model_source = PeftModel.from_pretrained(base_model, self.model_dir)
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
         self._pipeline = pipeline(
             "text-classification",
-            model=self.model_dir,
-            tokenizer=self.model_dir,
+            model=model_source,
+            tokenizer=tokenizer,
             truncation=True,
         )
         return self._pipeline
@@ -53,6 +77,38 @@ class TransformerTextRouter:
         if label.endswith("1") or label == "large":
             return 1
         return 0
+
+    def evaluate(self, dataset: Sequence[RouteExample]) -> Dict[str, float]:
+        return _evaluate_predictions([self.predict(ex.text) for ex in dataset], [int(ex.label) for ex in dataset])
+
+
+class EmbeddingClassifierRouter:
+    """Embedding model + sklearn classifier router."""
+
+    def __init__(self, artifact_dir: str | Path) -> None:
+        self.artifact_dir = Path(artifact_dir)
+        self._encoder = None
+        self._classifier = None
+        self._config = None
+
+    def _load(self) -> None:
+        if self._classifier is not None and self._encoder is not None and self._config is not None:
+            return
+
+        self._config = json.loads((self.artifact_dir / "summary.json").read_text(encoding="utf-8"))
+        with (self.artifact_dir / "classifier.pkl").open("rb") as fh:
+            self._classifier = pickle.load(fh)
+
+        encoder_name = str(self._config["model_name"])
+        from sentence_transformers import SentenceTransformer
+
+        self._encoder = SentenceTransformer(encoder_name, local_files_only=True)
+
+    def predict(self, text: str) -> int:
+        self._load()
+        vector = self._encoder.encode([text], normalize_embeddings=True)
+        pred = self._classifier.predict(vector)[0]
+        return int(pred)
 
     def evaluate(self, dataset: Sequence[RouteExample]) -> Dict[str, float]:
         return _evaluate_predictions([self.predict(ex.text) for ex in dataset], [int(ex.label) for ex in dataset])
@@ -147,15 +203,20 @@ def train_transformer_router(
     )
 
     start = time.time()
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_ds,
-        eval_dataset=test_ds,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": args,
+        "train_dataset": train_ds,
+        "eval_dataset": test_ds,
+        "data_collator": data_collator,
+        "compute_metrics": compute_metrics,
+    }
+    trainer_signature = inspect.signature(Trainer.__init__)
+    if "tokenizer" in trainer_signature.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_signature.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    trainer = Trainer(**trainer_kwargs)
     trainer.train()
     metrics = trainer.evaluate()
     save_target = out_dir / "model"
@@ -183,6 +244,62 @@ def train_transformer_router(
         method=method,
         metrics=clean_metrics,
         artifacts={"model_dir": str(save_target), "summary": str(out_dir / "summary.json")},
+        seconds=seconds,
+        notes=model_name,
+    )
+
+
+def train_bge_router(
+    dataset: RouteDataset,
+    *,
+    model_name: str,
+    output_dir: str | Path,
+    train_ratio: float = 0.8,
+    max_iter: int = 1000,
+) -> AdvancedTrainingResult:
+    from sentence_transformers import SentenceTransformer
+    from sklearn.linear_model import LogisticRegression
+
+    train_set, test_set = dataset.split(train_ratio=train_ratio)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        encoder = SentenceTransformer(model_name, local_files_only=True)
+    except Exception as exc:
+        raise ModelDownloadUnavailableError(
+            f"Unable to load BGE model '{model_name}'. Make sure it is available in the local cache."
+        ) from exc
+
+    start = time.time()
+    train_vectors = encoder.encode([item.text for item in train_set.examples], normalize_embeddings=True)
+    test_vectors = encoder.encode([item.text for item in test_set.examples], normalize_embeddings=True)
+    classifier = LogisticRegression(max_iter=max_iter, class_weight="balanced")
+    classifier.fit(train_vectors, [int(item.label) for item in train_set.examples])
+    preds = classifier.predict(test_vectors)
+    metrics = _evaluate_predictions(list(preds), [int(item.label) for item in test_set.examples])
+    seconds = time.time() - start
+
+    with (out_dir / "classifier.pkl").open("wb") as fh:
+        pickle.dump(classifier, fh)
+    summary = {
+        "method": "bge_m3_logreg",
+        "model_name": model_name,
+        "train_size": len(train_set.examples),
+        "test_size": len(test_set.examples),
+        "seconds": seconds,
+        "metrics": metrics,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return AdvancedTrainingResult(
+        method="bge_m3_logreg",
+        metrics=metrics,
+        artifacts={
+            "artifact_dir": str(out_dir),
+            "classifier": str(out_dir / "classifier.pkl"),
+            "summary": str(out_dir / "summary.json"),
+        },
         seconds=seconds,
         notes=model_name,
     )
@@ -238,6 +355,26 @@ def benchmark_transformer_router(
         "latency_ms": per_item_ms,
         "cost": 0.0,
         "notes": notes or str(model_dir),
+    }
+
+
+def benchmark_embedding_router(
+    dataset: RouteDataset,
+    *,
+    artifact_dir: str | Path,
+    notes: str = "",
+) -> Dict[str, Any]:
+    router = EmbeddingClassifierRouter(artifact_dir)
+    start = time.time()
+    metrics = router.evaluate(dataset.examples)
+    elapsed = time.time() - start
+    per_item_ms = (elapsed / max(1, len(dataset.examples))) * 1000.0
+    return {
+        "method": "embedding_router",
+        **metrics,
+        "latency_ms": per_item_ms,
+        "cost": 0.0,
+        "notes": notes or str(artifact_dir),
     }
 
 

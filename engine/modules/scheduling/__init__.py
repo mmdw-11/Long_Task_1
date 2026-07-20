@@ -46,10 +46,13 @@ from .learning import (
 )
 from .advanced_training import (
     AdvancedTrainingResult,
+    EmbeddingClassifierRouter,
     TransformerTextRouter,
+    benchmark_embedding_router,
     benchmark_transformer_router,
     render_extended_experiment_report,
     save_extended_experiment_report,
+    train_bge_router,
     train_transformer_router,
 )
 from .monitor import (
@@ -66,10 +69,12 @@ from .scheduler import AdaptiveResourceScheduler
 __all__ = [
     "AdaptiveResourceScheduler",
     "AdvancedTrainingResult",
+    "EmbeddingClassifierRouter",
     "HeuristicTaskGate",
     "BinaryTextRouterModel",
     "BgeM3Encoder",
     "benchmark_router",
+    "benchmark_embedding_router",
     "benchmark_transformer_router",
     "CascadeRouteDecision",
     "FallbackCascadeTeacher",
@@ -111,6 +116,7 @@ __all__ = [
     "save_extended_experiment_report",
     "load_production_gate",
     "train_router",
+    "train_bge_router",
     "train_transformer_router",
     "StaticResourceMonitor",
     "SystemResourceMonitor",
