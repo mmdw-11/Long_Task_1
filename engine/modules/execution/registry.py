@@ -8,7 +8,12 @@ from engine.modules.scheduling import ResourceTier
 
 from ._types import InferenceRequest, InferenceResult
 from .base import InferenceExecutor
-from .executors import EdgeHttpExecutor, LocalEchoExecutor, OpenAICompatibleCloudExecutor
+from .executors import (
+    EdgeHttpExecutor,
+    LocalEchoExecutor,
+    LocalModelExecutor,
+    OpenAICompatibleCloudExecutor,
+)
 
 
 class ExecutorRegistry:
@@ -16,7 +21,7 @@ class ExecutorRegistry:
 
     def __init__(self, executors: Optional[Dict[ResourceTier, InferenceExecutor]] = None) -> None:
         self.executors: Dict[ResourceTier, InferenceExecutor] = executors or {
-            ResourceTier.DEVICE: LocalEchoExecutor(),
+            ResourceTier.DEVICE: LocalModelExecutor(),
             ResourceTier.EDGE: EdgeHttpExecutor(),
             ResourceTier.CLOUD: OpenAICompatibleCloudExecutor(),
         }

@@ -65,36 +65,40 @@ class AdaptiveResourceScheduler(ResourceScheduler):
 
     @staticmethod
     def default_resources() -> List[ResourceProfile]:
+        _load_dotenv()
+        device_model = os.environ.get("DEVICE_MODEL", "local-small-llm")
+        edge_model = os.environ.get("EDGE_MODEL", "edge-medium-llm")
+        cloud_model = os.environ.get("OPENAI_MODEL", "cloud-large-llm")
         return [
             ResourceProfile(
                 tier=ResourceTier.DEVICE,
-                endpoint="local",
+                endpoint=os.environ.get("DEVICE_ENDPOINT", "local"),
                 available=True,
                 trusted=True,
                 max_complexity=TaskComplexity.MEDIUM,
                 latency_ms=30,
                 cost_weight=0.2,
-                models={"small": "local-small-llm", "embedding": "local-embedding"},
+                models={"small": device_model, "embedding": "local-embedding"},
             ),
             ResourceProfile(
                 tier=ResourceTier.EDGE,
-                endpoint="edge://default",
+                endpoint=os.environ.get("EDGE_ENDPOINT", "edge://default"),
                 available=True,
                 trusted=True,
                 max_complexity=TaskComplexity.HIGH,
                 latency_ms=90,
                 cost_weight=0.6,
-                models={"medium": "edge-medium-llm", "embedding": "edge-embedding"},
+                models={"medium": edge_model, "embedding": "edge-embedding"},
             ),
             ResourceProfile(
                 tier=ResourceTier.CLOUD,
-                endpoint="cloud://default",
+                endpoint=os.environ.get("OPENAI_BASE_URL", "cloud://default"),
                 available=True,
                 trusted=False,
                 max_complexity=TaskComplexity.EXTREME,
                 latency_ms=220,
                 cost_weight=1.0,
-                models={"large": "cloud-large-llm", "vision": "cloud-vision-llm"},
+                models={"large": cloud_model, "vision": "cloud-vision-llm"},
             ),
         ]
 
@@ -166,14 +170,15 @@ class AdaptiveResourceScheduler(ResourceScheduler):
     def _ordered_candidates(
         self, request: ResourceRequest, profile: TaskProfile
     ) -> List[ResourceProfile]:
-        preferred = request.tier_preference or [
+        route_tier = _coerce_route_tier(profile.metadata.get("route_tier"))
+        preferred = [route_tier] if route_tier is not None else request.tier_preference or [
             ResourceTier.DEVICE,
             ResourceTier.EDGE,
             ResourceTier.CLOUD,
         ]
-        if profile.complexity in (TaskComplexity.HIGH, TaskComplexity.EXTREME):
+        if route_tier is None and profile.complexity in (TaskComplexity.HIGH, TaskComplexity.EXTREME):
             preferred = [ResourceTier.CLOUD, ResourceTier.EDGE, ResourceTier.DEVICE]
-        if profile.realtime == RealtimeRequirement.HARD:
+        if route_tier is None and profile.realtime == RealtimeRequirement.HARD:
             preferred = [ResourceTier.DEVICE, ResourceTier.EDGE, ResourceTier.CLOUD]
         result: List[ResourceProfile] = []
         for tier in preferred:
@@ -341,3 +346,47 @@ class AdaptiveResourceScheduler(ResourceScheduler):
 def _env_use_production_router() -> bool:
     value = str(os.environ.get("USE_PRODUCTION_ROUTER", "")).strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _coerce_route_tier(value: object) -> Optional[ResourceTier]:
+    if value is None:
+        return None
+    try:
+        return ResourceTier(str(value))
+    except ValueError:
+        return None
+
+
+def _load_dotenv() -> None:
+    if os.environ.get("AGENT_GRAPH_LOAD_DOTENV") == "0":
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+        return
+    except Exception:
+        pass
+    env_path = _find_dotenv()
+    if env_path is None:
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _find_dotenv():
+    from pathlib import Path
+
+    current = Path.cwd()
+    for path in [current, *current.parents]:
+        candidate = path / ".env"
+        if candidate.exists():
+            return candidate
+    return None

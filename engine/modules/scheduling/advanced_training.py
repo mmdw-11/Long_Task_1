@@ -122,16 +122,18 @@ class EmbeddingClassifierRouter:
 
     def predict(self, text: str) -> int:
         probs = self.predict_proba(text)
-        return 1 if probs[1] >= probs[0] else 0
+        return max(probs, key=probs.get)
 
     def predict_proba(self, text: str) -> Dict[int, float]:
         self._load()
         vector = self._encoder.encode([text], normalize_embeddings=True)
         if hasattr(self._classifier, "predict_proba"):
             raw = self._classifier.predict_proba(vector)[0]
-            return {0: float(raw[0]), 1: float(raw[1])}
+            classes = [int(label) for label in getattr(self._classifier, "classes_", range(len(raw)))]
+            return {label: float(score) for label, score in zip(classes, raw)}
         pred = int(self._classifier.predict(vector)[0])
-        return {0: 0.0 if pred == 1 else 1.0, 1: 1.0 if pred == 1 else 0.0}
+        labels = [int(label) for label in getattr(self._classifier, "classes_", [0, 1, 2])]
+        return {label: 1.0 if label == pred else 0.0 for label in labels}
 
     def evaluate(self, dataset: Sequence[RouteExample]) -> Dict[str, float]:
         return _evaluate_predictions([self.predict(ex.text) for ex in dataset], [int(ex.label) for ex in dataset])
@@ -308,6 +310,8 @@ def train_bge_router(
     summary = {
         "method": "bge_m3_logreg",
         "model_name": model_name,
+        "labels": sorted({int(item.label) for item in dataset.examples}),
+        "route_label_schema": _infer_label_schema(dataset.examples),
         "train_size": len(train_set.examples),
         "test_size": len(test_set.examples),
         "seconds": seconds,
@@ -402,6 +406,10 @@ def benchmark_embedding_router(
 
 
 def _evaluate_predictions(preds: Sequence[int], labels: Sequence[int]) -> Dict[str, float]:
+    label_set = sorted(set(int(label) for label in labels) | set(int(pred) for pred in preds))
+    if any(label not in (0, 1) for label in label_set):
+        return _evaluate_multiclass_predictions(preds, labels, label_set)
+
     tp = fp = tn = fn = 0
     for pred, label in zip(preds, labels):
         if pred == 1 and label == 1:
@@ -422,6 +430,46 @@ def _evaluate_predictions(preds: Sequence[int], labels: Sequence[int]) -> Dict[s
         "recall": recall,
         "f1": f1,
     }
+
+
+def _evaluate_multiclass_predictions(
+    preds: Sequence[int],
+    labels: Sequence[int],
+    label_set: Sequence[int],
+) -> Dict[str, float]:
+    total = max(1, len(labels))
+    accuracy = sum(1 for pred, label in zip(preds, labels) if int(pred) == int(label)) / total
+    precisions = []
+    recalls = []
+    f1s = []
+    for target in label_set:
+        tp = sum(1 for pred, label in zip(preds, labels) if int(pred) == target and int(label) == target)
+        fp = sum(1 for pred, label in zip(preds, labels) if int(pred) == target and int(label) != target)
+        fn = sum(1 for pred, label in zip(preds, labels) if int(pred) != target and int(label) == target)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+    classes = max(1, len(label_set))
+    return {
+        "accuracy": accuracy,
+        "precision": sum(precisions) / classes,
+        "recall": sum(recalls) / classes,
+        "f1": sum(f1s) / classes,
+    }
+
+
+def _infer_label_schema(dataset: Sequence[RouteExample]) -> str:
+    for item in dataset:
+        schema = str(item.metadata.get("route_label_schema") or "").strip()
+        if schema:
+            return schema
+    labels = sorted({int(item.label) for item in dataset})
+    if labels == [0, 1, 2]:
+        return "0=device,1=edge,2=cloud"
+    return "0=small,1=large"
 
 
 def _fmt(value: Any) -> str:

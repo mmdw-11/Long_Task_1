@@ -46,7 +46,9 @@ from .modules.execution import (
     InferenceRequest,
     InferenceResult,
     LocalEchoExecutor,
+    LocalModelExecutor,
     OpenAICompatibleCloudExecutor,
+    OpenAICompatibleExecutor,
     ResilientInferenceRunner,
 )
 from .modules.security import (
@@ -155,7 +157,9 @@ __all__ = [
     "InferenceRequest",
     "InferenceResult",
     "LocalEchoExecutor",
+    "LocalModelExecutor",
     "OpenAICompatibleCloudExecutor",
+    "OpenAICompatibleExecutor",
     "ResilientInferenceRunner",
     # Security
     "AuditPack",
