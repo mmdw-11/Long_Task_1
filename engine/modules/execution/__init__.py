@@ -2,7 +2,13 @@
 
 from ._types import InferenceRequest, InferenceResult
 from .base import InferenceExecutor
-from .executors import EdgeHttpExecutor, LocalEchoExecutor, OpenAICompatibleCloudExecutor
+from .executors import (
+    EdgeHttpExecutor,
+    LocalEchoExecutor,
+    LocalModelExecutor,
+    OpenAICompatibleCloudExecutor,
+    OpenAICompatibleExecutor,
+)
 from .registry import ExecutorRegistry
 from .runner import ResilientInferenceRunner
 
@@ -13,6 +19,8 @@ __all__ = [
     "InferenceRequest",
     "InferenceResult",
     "LocalEchoExecutor",
+    "LocalModelExecutor",
     "OpenAICompatibleCloudExecutor",
+    "OpenAICompatibleExecutor",
     "ResilientInferenceRunner",
 ]

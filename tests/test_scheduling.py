@@ -49,6 +49,24 @@ def test_high_complexity_public_task_prefers_cloud():
     assert "cloud_for_high_complexity" in allocation.metadata["trace"]["policy_hits"]
 
 
+def test_default_resources_read_device_edge_cloud_env(monkeypatch):
+    monkeypatch.setenv("DEVICE_ENDPOINT", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("DEVICE_MODEL", "qwen2.5-0.5b-instruct")
+    monkeypatch.setenv("EDGE_ENDPOINT", "http://127.0.0.1:8001/infer")
+    monkeypatch.setenv("EDGE_MODEL", "qwen2.5-7b-instruct")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+    monkeypatch.setenv("OPENAI_MODEL", "glm-5.2")
+
+    resources = {profile.tier: profile for profile in AdaptiveResourceScheduler.default_resources()}
+
+    assert resources[ResourceTier.DEVICE].endpoint == "http://127.0.0.1:11434/v1"
+    assert resources[ResourceTier.DEVICE].models["small"] == "qwen2.5-0.5b-instruct"
+    assert resources[ResourceTier.EDGE].endpoint == "http://127.0.0.1:8001/infer"
+    assert resources[ResourceTier.EDGE].models["medium"] == "qwen2.5-7b-instruct"
+    assert resources[ResourceTier.CLOUD].endpoint == "https://open.bigmodel.cn/api/paas/v4"
+    assert resources[ResourceTier.CLOUD].models["large"] == "glm-5.2"
+
+
 def test_openai_gate_maps_json_response_to_profile():
     gate = OpenAITaskGate()
     data = {
@@ -98,6 +116,23 @@ def test_trace_records_gate_differences():
     assert trace["heuristic_profile"]["sensitivity"] == "internal"
     assert "gate_sensitivity_diff" in trace["policy_hits"]
     assert "gate_complexity_diff" in trace["policy_hits"]
+
+
+def test_scheduler_honors_learned_route_tier_metadata():
+    class EdgeGate:
+        def evaluate(self, request):
+            from engine import TaskProfile
+
+            return TaskProfile(
+                complexity=TaskComplexity.HIGH,
+                metadata={"router": "learned", "route_tier": "edge"},
+            )
+
+    scheduler = AdaptiveResourceScheduler(gate=EdgeGate())
+    allocation = scheduler.acquire(ResourceRequest(node="route", state={"input": "medium edge task"}))
+
+    assert allocation.tier == ResourceTier.EDGE
+    assert allocation.metadata["decision"]["model_split"][-1]["tier"] == "edge"
 
 
 def test_sensitive_high_complexity_stays_in_trusted_workspace_without_review():

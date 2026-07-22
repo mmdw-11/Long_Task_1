@@ -5,11 +5,19 @@ from engine import (
     InferenceRequest,
     InferenceResult,
     LocalEchoExecutor,
+    LocalModelExecutor,
     MutableResourceMonitor,
     ResilientInferenceRunner,
     ResourceRequest,
     ResourceTier,
 )
+
+
+class FakeMulticlassClassifier:
+    classes_ = [0, 1, 2]
+
+    def predict_proba(self, vector):
+        return [[0.1, 0.7, 0.2]]
 
 
 def test_local_echo_executor_returns_observable_result():
@@ -24,6 +32,24 @@ def test_local_echo_executor_returns_observable_result():
     assert result.executor == "LocalEchoExecutor"
     assert result.model == "local-echo"
     assert "hello local" in result.text
+
+
+def test_local_model_executor_falls_back_without_device_config(monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.delenv("DEVICE_BASE_URL", raising=False)
+    monkeypatch.delenv("DEVICE_MODEL", raising=False)
+    executor = LocalModelExecutor()
+
+    result = executor.run(
+        InferenceRequest(
+            prompt="hello device",
+            allocation={"tier": "device", "endpoint": "local"},
+        )
+    )
+
+    assert result.executor == "LocalEchoExecutor"
+    assert result.metadata["fallback_reason"] == "missing DEVICE_BASE_URL or DEVICE_MODEL"
+    assert "hello device" in result.text
 
 
 def test_registry_routes_by_resource_tier():
@@ -50,7 +76,8 @@ def test_registry_routes_by_resource_tier():
     assert result.endpoint == "cloud://default"
 
 
-def test_edge_executor_falls_back_without_http_endpoint():
+def test_edge_executor_falls_back_without_http_endpoint(monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
     executor = EdgeHttpExecutor()
     result = executor.run(
         InferenceRequest(
@@ -122,3 +149,38 @@ def test_resilient_runner_reschedules_after_retryable_cloud_failure():
     assert attempts[0]["allocation"]["tier"] == "cloud"
     assert attempts[1]["allocation"]["tier"] == "edge"
     assert monitor.snapshot(scheduler.resources)[ResourceTier.CLOUD].rate_limited is True
+
+
+def test_embedding_router_maps_multiclass_classifier_probabilities(tmp_path, monkeypatch):
+    import json
+    import pickle
+
+    from engine.modules.scheduling.advanced_training import EmbeddingClassifierRouter
+
+    class FakeEncoder:
+        def encode(self, texts, normalize_embeddings=True):
+            return [[0.0, 1.0] for _ in texts]
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name, local_files_only=True):
+            self.model_name = model_name
+
+        def encode(self, texts, normalize_embeddings=True):
+            return FakeEncoder().encode(texts, normalize_embeddings=normalize_embeddings)
+
+    artifact_dir = tmp_path / "bge"
+    artifact_dir.mkdir()
+    (artifact_dir / "summary.json").write_text(json.dumps({"model_name": "fake"}), encoding="utf-8")
+    with (artifact_dir / "classifier.pkl").open("wb") as fh:
+        pickle.dump(FakeMulticlassClassifier(), fh)
+
+    import types
+    import sys
+
+    fake_module = types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    router = EmbeddingClassifierRouter(artifact_dir)
+
+    assert router.predict_proba("hello") == {0: 0.1, 1: 0.7, 2: 0.2}
+    assert router.predict("hello") == 1

@@ -1,8 +1,9 @@
-"""端、边、云推理执行器实现。"""
+"""Device, edge, and cloud inference executor implementations."""
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, Optional
 
 from ._types import InferenceRequest, InferenceResult
@@ -10,10 +11,10 @@ from .base import InferenceExecutor
 
 
 class LocalEchoExecutor(InferenceExecutor):
-    """端侧本地执行器桩。
+    """Observable local fallback executor.
 
-    当前不依赖本地 LLM，只返回可观察的本地处理结果。后续可替换成 llama.cpp、
-    Ollama 或端侧小模型。
+    This does not call a real local LLM. It returns a truncated prompt so demos
+    and tests can run without a configured device model.
     """
 
     def __init__(self, *, label: str = "device-local") -> None:
@@ -32,21 +33,109 @@ class LocalEchoExecutor(InferenceExecutor):
         )
 
 
+class OpenAICompatibleExecutor(InferenceExecutor):
+    """Configurable OpenAI-compatible chat executor.
+
+    It is used for real device/edge/cloud backends when they expose a
+    ``/chat/completions`` compatible endpoint. Missing configuration falls
+    back to the provided executor so demos and tests can still run offline.
+    """
+
+    def __init__(
+        self,
+        *,
+        env_prefix: str,
+        fallback: Optional[InferenceExecutor] = None,
+        default_endpoint: str = "",
+        default_model: str = "",
+        label: str = "openai-compatible",
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        self.env_prefix = env_prefix
+        self.fallback = fallback
+        self.default_endpoint = default_endpoint
+        self.default_model = default_model
+        self.label = label
+        self.timeout_seconds = timeout_seconds
+
+    def run(self, request: InferenceRequest) -> InferenceResult:
+        _load_dotenv()
+        endpoint = _env_or_default(f"{self.env_prefix}_BASE_URL", self.default_endpoint)
+        model = _env_or_default(f"{self.env_prefix}_MODEL", self.default_model)
+        api_key = os.environ.get(f"{self.env_prefix}_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+
+        if not endpoint or not model:
+            if self.fallback is None:
+                return InferenceResult(
+                    text="",
+                    executor=type(self).__name__,
+                    endpoint=endpoint or request.allocation.get("endpoint", ""),
+                    model=model,
+                    success=False,
+                    error=f"missing {self.env_prefix}_BASE_URL or {self.env_prefix}_MODEL",
+                    retryable=False,
+                )
+            result = self.fallback.run(request)
+            result.metadata = {
+                **result.metadata,
+                "fallback_reason": f"missing {self.env_prefix}_BASE_URL or {self.env_prefix}_MODEL",
+            }
+            return result
+
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key or "not-needed", base_url=endpoint, timeout=self.timeout_seconds)
+        system = request.system_prompt or "Answer concisely and accurately."
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": request.prompt},
+            ],
+            temperature=0,
+        )
+        text = response.choices[0].message.content or ""
+        usage = getattr(response, "usage", None)
+        usage_data = json.loads(usage.model_dump_json()) if usage is not None else {}
+        return InferenceResult(
+            text=text,
+            executor=type(self).__name__,
+            endpoint=endpoint,
+            model=model,
+            metadata={"usage": usage_data, "backend": self.label},
+        )
+
+
+class LocalModelExecutor(OpenAICompatibleExecutor):
+    """Device-side real model executor with echo fallback."""
+
+    def __init__(self, *, fallback: Optional[InferenceExecutor] = None) -> None:
+        super().__init__(
+            env_prefix="DEVICE",
+            fallback=fallback or LocalEchoExecutor(),
+            default_endpoint=os.environ.get("DEVICE_ENDPOINT", ""),
+            default_model=os.environ.get("DEVICE_MODEL", ""),
+            label="device",
+            timeout_seconds=float(os.environ.get("DEVICE_TIMEOUT_SECONDS", "60")),
+        )
+
+
 class EdgeHttpExecutor(InferenceExecutor):
-    """边缘 HTTP 执行器。
+    """Edge HTTP executor with local fallback.
 
-    期望边缘服务提供兼容的 JSON 接口：
-    request:  {"prompt": "...", "system_prompt": "...", "metadata": {...}}
-    response: {"text": "...", "model": "...", "metadata": {...}}
+    Expected request body:
+    ``{"prompt": "...", "system_prompt": "...", "metadata": {...}}``
 
-    若未配置真实 HTTP endpoint，可选择 fallback 执行器。
+    Expected response body:
+    ``{"text": "...", "model": "...", "metadata": {...}}``
     """
 
     def __init__(self, *, fallback: Optional[InferenceExecutor] = None) -> None:
         self.fallback = fallback or LocalEchoExecutor(label="edge-fallback")
 
     def run(self, request: InferenceRequest) -> InferenceResult:
-        endpoint = request.allocation.get("endpoint", "")
+        _load_dotenv()
+        endpoint = os.environ.get("EDGE_ENDPOINT") or request.allocation.get("endpoint", "")
         if not endpoint.startswith(("http://", "https://")):
             result = self.fallback.run(request)
             result.endpoint = endpoint or result.endpoint
@@ -71,7 +160,7 @@ class EdgeHttpExecutor(InferenceExecutor):
                 text=str(data.get("text", "")),
                 executor=type(self).__name__,
                 endpoint=endpoint,
-                model=str(data.get("model", "")),
+                model=str(data.get("model", os.environ.get("EDGE_MODEL", ""))),
                 metadata=dict(data.get("metadata") or {}),
             )
         except Exception as exc:  # noqa: BLE001 - edge fallback keeps workflow alive
@@ -86,10 +175,7 @@ class EdgeHttpExecutor(InferenceExecutor):
 
 
 class OpenAICompatibleCloudExecutor(InferenceExecutor):
-    """OpenAI SDK 兼容云端执行器。
-
-    支持 OpenAI 官方和 BigModel 等兼容 ``chat.completions`` 的服务。
-    """
+    """Cloud executor using project-level OpenAI-compatible settings."""
 
     def __init__(self, *, model: Optional[str] = None) -> None:
         self.model = model
@@ -105,14 +191,16 @@ class OpenAICompatibleCloudExecutor(InferenceExecutor):
             base_url=settings.base_url,
             organization=settings.organization,
         )
-        system = request.system_prompt or "你是云端高复杂度任务执行器，回答要简洁、结构化。"
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": request.prompt},
-        ]
+        system = request.system_prompt or (
+            "You are the cloud executor for complex tasks. "
+            "Answer concisely and structurally."
+        )
         response = client.chat.completions.create(
             model=self.model or settings.model,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": request.prompt},
+            ],
             temperature=0,
         )
         text = response.choices[0].message.content or ""
@@ -125,3 +213,45 @@ class OpenAICompatibleCloudExecutor(InferenceExecutor):
             model=self.model or settings.model,
             metadata={"usage": usage_data},
         )
+
+
+def _env_or_default(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def _load_dotenv() -> None:
+    if os.environ.get("AGENT_GRAPH_LOAD_DOTENV") == "0":
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+        return
+    except Exception:
+        pass
+    env_path = _find_dotenv()
+    if env_path is None:
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _find_dotenv():
+    from pathlib import Path
+
+    current = Path.cwd()
+    for path in [current, *current.parents]:
+        candidate = path / ".env"
+        if candidate.exists():
+            return candidate
+    return None

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Protocol
 
-from ._types import RealtimeRequirement, ResourceRequest, SensitivityLevel, TaskComplexity, TaskProfile
+from ._types import RealtimeRequirement, ResourceRequest, ResourceTier, SensitivityLevel, TaskComplexity, TaskProfile
 from .advanced_training import EmbeddingClassifierRouter, TransformerTextRouter
 from .gate import HeuristicTaskGate, TaskGate
 from .learning import BinaryTextRouterModel, LearnedTaskGate
@@ -49,8 +49,12 @@ class AdvancedLearnedTaskGate(TaskGate):
         text = _collect_request_text(request)
         try:
             probs = self.model.predict_proba(text)
-            score = float(probs.get(1, 0.0))
-            label = 1 if score >= self.threshold else 0
+            if any(label not in (0, 1) for label in probs):
+                label = max(probs, key=probs.get)
+                score = float(probs.get(label, 0.0))
+            else:
+                score = float(probs.get(1, 0.0))
+                label = 1 if score >= self.threshold else 0
             return _profile_from_label(
                 label=label,
                 score=score,
@@ -180,6 +184,23 @@ def _profile_from_label(
         or request.state.get("cloud_audit_approved")
     )
     task_type = str(request.metadata.get("task_type") or "general")
+    if label == 2:
+        return TaskProfile(
+            realtime=RealtimeRequirement.NORMAL,
+            sensitivity=SensitivityLevel.INTERNAL,
+            complexity=TaskComplexity.HIGH,
+            task_type=task_type,
+            requires_trusted_workspace=bool(request.metadata.get("requires_trusted_workspace")),
+            human_approved=human_approved,
+            metadata={
+                "node": request.node,
+                "router": "learned",
+                "router_backend": router_name,
+                "route": "cloud",
+                "route_tier": ResourceTier.CLOUD.value,
+                "score": score,
+            },
+        )
     if label == 1:
         return TaskProfile(
             realtime=RealtimeRequirement.NORMAL,
@@ -192,7 +213,8 @@ def _profile_from_label(
                 "node": request.node,
                 "router": "learned",
                 "router_backend": router_name,
-                "route": "large",
+                "route": "edge",
+                "route_tier": ResourceTier.EDGE.value,
                 "score": score,
             },
         )
@@ -207,7 +229,8 @@ def _profile_from_label(
             "node": request.node,
             "router": "learned",
             "router_backend": router_name,
-            "route": "small",
+            "route": "device",
+            "route_tier": ResourceTier.DEVICE.value,
             "score": score,
         },
     )
