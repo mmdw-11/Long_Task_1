@@ -18,3 +18,13 @@ dist/
 # AgentScope 运行产物
 runs/
 .memory/
+
+# huggingface 认证
+.hf_cache/token
+.hf_cache/stored_tokens
+
+# Hugging Face cache
+.hf_cache/*
+!.hf_cache/exports/
+!.hf_cache/exports/lmsys_chatbot_arena_conversations.jsonl
+
