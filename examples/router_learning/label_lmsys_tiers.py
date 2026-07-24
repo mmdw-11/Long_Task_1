@@ -146,6 +146,12 @@ def _judge_tiers(prompt: str, tier_results: Dict[str, Dict[str, Any]], threshold
     judge_prompt = {
         "task": prompt,
         "quality_threshold": threshold,
+        "contest_requirement": (
+            "The task is adaptive resource scheduling in a device-edge-cloud heterogeneous environment: "
+            "the system must adapt to heterogeneous compute resources, dynamically select the inference location "
+            "and split models according to a task's real-time requirement and data-sensitivity level, while fully "
+            "using cloud compute for high-complexity tasks."
+        ),
         "routing_requirement": (
             "This is an end-edge-cloud heterogeneous resource scheduling task. "
             "Automatically select the inference location and model tier using: "
@@ -162,7 +168,11 @@ def _judge_tiers(prompt: str, tier_results: Dict[str, Dict[str, Any]], threshold
             "faithfulness to the prompt, safety, and instruction following. An answer with an error, empty text, "
             "or failed backend must have score 0. Then choose the cheapest compliant tier that reaches quality_threshold. "
             "Return strict JSON only: {\"scores\": {\"device\": number, \"edge\": number, \"cloud\": number}, "
-            "\"selected_tier\": \"device|edge|cloud\", \"reason\": \"brief evidence-based explanation\"}."
+            "\"selected_tier\": \"device|edge|cloud\", \"routing_assessment\": {\"realtime\": \"hard|interactive|normal|batch\", "
+            "\"data_sensitivity\": \"public|internal|sensitive\", \"complexity\": \"simple|moderate|high|long_horizon\", "
+            "\"cloud_transfer_allowed\": true}, \"reason\": \"brief evidence-based explanation\"}. "
+            "A long-horizon task has at least three dependent sub-tasks, conditional branches, iterative refinement, "
+            "or persistent cross-application execution."
         ),
         "candidates": {
             tier: {
@@ -191,6 +201,7 @@ def _judge_tiers(prompt: str, tier_results: Dict[str, Dict[str, Any]], threshold
     return {
         "scores": clean_scores,
         "selected_tier": selected if selected in TIERS else "",
+        "routing_assessment": dict((data or {}).get("routing_assessment") or {}),
         "reason": str((data or {}).get("reason") or ""),
         "raw": raw,
     }
