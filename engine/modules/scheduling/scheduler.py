@@ -68,7 +68,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         _load_dotenv()
         device_model = os.environ.get("DEVICE_MODEL", "qwen2.5:0.5b")
         edge_model = os.environ.get("EDGE_MODEL", "qwen2.5:3b")
-        cloud_model = os.environ.get("OPENAI_MODEL", "deepseek-v4-flash")
+        cloud_model = os.environ.get("OPENAI_MODEL", "deepseek-chat")
         return [
             ResourceProfile(
                 tier=ResourceTier.DEVICE,
@@ -245,7 +245,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         elif tier == ResourceTier.EDGE:
             steps.append(ModelSplitStep("edge_inference", tier, os.environ.get("EDGE_MODEL", "qwen2.5:3b"), "边缘侧完成中等复杂度推理"))
         else:
-            steps.append(ModelSplitStep("cloud_inference", tier, os.environ.get("OPENAI_MODEL", "deepseek-v4-flash"), "云端处理高复杂度子任务"))
+            steps.append(ModelSplitStep("cloud_inference", tier, os.environ.get("OPENAI_MODEL", "deepseek-chat"), "云端处理高复杂度子任务"))
         return steps
 
     def _reason_for(self, tier: ResourceTier, profile: TaskProfile) -> str:

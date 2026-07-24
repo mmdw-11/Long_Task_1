@@ -101,15 +101,22 @@ def _run_executor(executor: Any, tier: str, prompt: str) -> Dict[str, Any]:
                 metadata={"tier": tier},
             )
         )
+        metadata = _compact_metadata(result.metadata)
+        simulated = bool(metadata.get("simulated") or metadata.get("edge_fallback"))
+        error = result.error
+        if simulated and not error:
+            error = "backend_fallback_or_simulation"
         return {
             "text": result.text,
             "executor": result.executor,
             "model": result.model,
             "endpoint": result.endpoint,
-            "success": bool(result.success),
-            "error": result.error,
+            # A fallback is useful for interactive demos, but is not a valid
+            # measurement when constructing real device/edge/cloud labels.
+            "success": bool(result.success) and not simulated,
+            "error": error,
             "latency_ms": round((time.time() - start) * 1000, 3),
-            "metadata": _compact_metadata(result.metadata),
+            "metadata": metadata,
         }
     except Exception as exc:  # noqa: BLE001 - labeling should keep record of failures
         return {
@@ -139,13 +146,34 @@ def _judge_tiers(prompt: str, tier_results: Dict[str, Dict[str, Any]], threshold
     judge_prompt = {
         "task": prompt,
         "quality_threshold": threshold,
-        "instruction": (
-            "Score each answer from 0 to 1 for correctness, completeness, and instruction following. "
-            "Choose the cheapest sufficient tier: device first, then edge, then cloud. "
-            "Return strict JSON with keys scores, selected_tier, reason. "
-            "scores must map device/edge/cloud to numbers."
+        "routing_requirement": (
+            "This is an end-edge-cloud heterogeneous resource scheduling task. "
+            "Automatically select the inference location and model tier using: "
+            "(1) task real-time requirement: hard/interactive latency favors device, then edge; "
+            "(2) data sensitivity: private or confidential data must remain on device/edge unless the task explicitly permits cloud transfer; "
+            "(3) task complexity and required reasoning quality: cloud is allowed and preferred only when device/edge cannot meet the quality threshold; "
+            "(4) actual backend availability and measured latency; and "
+            "(5) resource efficiency: among compliant tiers that meet quality, choose device before edge before cloud. "
+            "Do not select an unavailable tier, a failed response, or a fallback/simulated response. "
+            "Do not infer sensitivity merely because a task is difficult; only treat explicit personal, secret, financial, medical, credential, or proprietary content as sensitive."
         ),
-        "answers": {tier: tier_results[tier]["text"] for tier in TIERS},
+        "evaluation_instruction": (
+            "For every available answer, assign a quality score from 0 to 1 based on correctness, completeness, "
+            "faithfulness to the prompt, safety, and instruction following. An answer with an error, empty text, "
+            "or failed backend must have score 0. Then choose the cheapest compliant tier that reaches quality_threshold. "
+            "Return strict JSON only: {\"scores\": {\"device\": number, \"edge\": number, \"cloud\": number}, "
+            "\"selected_tier\": \"device|edge|cloud\", \"reason\": \"brief evidence-based explanation\"}."
+        ),
+        "candidates": {
+            tier: {
+                "answer": tier_results[tier]["text"],
+                "backend_success": tier_results[tier]["success"],
+                "error": tier_results[tier]["error"],
+                "latency_ms": tier_results[tier]["latency_ms"],
+                "model": tier_results[tier]["model"],
+            }
+            for tier in TIERS
+        },
     }
     response = client.chat.completions.create(
         model=os.environ.get("OPENAI_JUDGE_MODEL") or settings.model,
