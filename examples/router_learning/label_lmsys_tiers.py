@@ -148,7 +148,7 @@ def _judge_tiers(prompt: str, tier_results: Dict[str, Dict[str, Any]], threshold
         "answers": {tier: tier_results[tier]["text"] for tier in TIERS},
     }
     response = client.chat.completions.create(
-        model=settings.model,
+        model=os.environ.get("OPENAI_JUDGE_MODEL") or settings.model,
         messages=[
             {"role": "system", "content": "You are a strict model-routing evaluator. Return JSON only."},
             {"role": "user", "content": json.dumps(judge_prompt, ensure_ascii=False)},

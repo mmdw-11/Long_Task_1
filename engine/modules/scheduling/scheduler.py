@@ -66,13 +66,13 @@ class AdaptiveResourceScheduler(ResourceScheduler):
     @staticmethod
     def default_resources() -> List[ResourceProfile]:
         _load_dotenv()
-        device_model = os.environ.get("DEVICE_MODEL", "local-small-llm")
-        edge_model = os.environ.get("EDGE_MODEL", "edge-medium-llm")
-        cloud_model = os.environ.get("OPENAI_MODEL", "cloud-large-llm")
+        device_model = os.environ.get("DEVICE_MODEL", "qwen2.5:0.5b")
+        edge_model = os.environ.get("EDGE_MODEL", "qwen2.5:3b")
+        cloud_model = os.environ.get("OPENAI_MODEL", "deepseek-v4-flash")
         return [
             ResourceProfile(
                 tier=ResourceTier.DEVICE,
-                endpoint=os.environ.get("DEVICE_ENDPOINT", "local"),
+                endpoint=os.environ.get("DEVICE_ENDPOINT", "http://127.0.0.1:11434/v1"),
                 available=True,
                 trusted=True,
                 max_complexity=TaskComplexity.MEDIUM,
@@ -82,7 +82,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
             ),
             ResourceProfile(
                 tier=ResourceTier.EDGE,
-                endpoint=os.environ.get("EDGE_ENDPOINT", "edge://default"),
+                endpoint=os.environ.get("EDGE_ENDPOINT", "http://127.0.0.1:8001/infer"),
                 available=True,
                 trusted=True,
                 max_complexity=TaskComplexity.HIGH,
@@ -92,7 +92,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
             ),
             ResourceProfile(
                 tier=ResourceTier.CLOUD,
-                endpoint=os.environ.get("OPENAI_BASE_URL", "cloud://default"),
+                endpoint=os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com"),
                 available=True,
                 trusted=False,
                 max_complexity=TaskComplexity.EXTREME,
@@ -241,11 +241,11 @@ class AdaptiveResourceScheduler(ResourceScheduler):
                 )
             )
         if tier == ResourceTier.DEVICE:
-            steps.append(ModelSplitStep("local_inference", tier, "local-small-llm", "端侧完成推理"))
+            steps.append(ModelSplitStep("local_inference", tier, os.environ.get("DEVICE_MODEL", "qwen2.5:0.5b"), "端侧完成推理"))
         elif tier == ResourceTier.EDGE:
-            steps.append(ModelSplitStep("edge_inference", tier, "edge-medium-llm", "边缘侧完成中等复杂度推理"))
+            steps.append(ModelSplitStep("edge_inference", tier, os.environ.get("EDGE_MODEL", "qwen2.5:3b"), "边缘侧完成中等复杂度推理"))
         else:
-            steps.append(ModelSplitStep("cloud_inference", tier, "cloud-large-llm", "云端处理高复杂度子任务"))
+            steps.append(ModelSplitStep("cloud_inference", tier, os.environ.get("OPENAI_MODEL", "deepseek-v4-flash"), "云端处理高复杂度子任务"))
         return steps
 
     def _reason_for(self, tier: ResourceTier, profile: TaskProfile) -> str:

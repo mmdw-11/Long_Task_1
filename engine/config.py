@@ -25,8 +25,8 @@ class OpenAISettings:
     """从环境 / .env 解析出的 OpenAI 配置。"""
 
     api_key: str
-    model: str = "gpt-4o-mini"
-    base_url: Optional[str] = None
+    model: str = "deepseek-v4-flash"
+    base_url: Optional[str] = "https://api.deepseek.com"
     organization: Optional[str] = None
 
 
@@ -44,15 +44,15 @@ def load_settings(dotenv_path: Optional[str] = None) -> OpenAISettings:
         # 读取 .env 失败时，退回到已存在的环境变量。
         pass
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
     if not api_key:
         raise RuntimeError(
             "缺少 OPENAI_API_KEY，请在项目根目录的 .env 中配置（可参考 .env.example）"
         )
     return OpenAISettings(
         api_key=api_key,
-        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-        base_url=os.environ.get("OPENAI_BASE_URL") or None,
+        model=os.environ.get("OPENAI_MODEL", "deepseek-v4-flash"),
+        base_url=os.environ.get("OPENAI_BASE_URL") or "https://api.deepseek.com",
         organization=os.environ.get("OPENAI_ORG") or None,
     )
 
