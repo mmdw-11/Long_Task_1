@@ -71,8 +71,11 @@ class EdgeOllamaHandler(BaseHTTPRequestHandler):
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0,
+                    # Bound local generation so one pathological prompt cannot
+                    # block later requests in the single Ollama queue.
+                    "max_tokens": int(os.environ.get("EDGE_MAX_TOKENS", "384")),
                 },
-                timeout=float(os.environ.get("EDGE_TIMEOUT_SECONDS", "120")),
+                timeout=float(os.environ.get("EDGE_TIMEOUT_SECONDS", "150")),
             )
             response.raise_for_status()
             data = response.json()

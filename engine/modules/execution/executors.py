@@ -93,6 +93,7 @@ class OpenAICompatibleExecutor(InferenceExecutor):
                 {"role": "user", "content": request.prompt},
             ],
             temperature=0,
+            max_tokens=int(os.environ.get(f"{self.env_prefix}_MAX_TOKENS", "384")),
         )
         text = response.choices[0].message.content or ""
         usage = getattr(response, "usage", None)
@@ -152,7 +153,7 @@ class EdgeHttpExecutor(InferenceExecutor):
                     "system_prompt": request.system_prompt,
                     "metadata": request.metadata,
                 },
-                timeout=30,
+                timeout=float(os.environ.get("EDGE_REQUEST_TIMEOUT_SECONDS", "150")),
             )
             response.raise_for_status()
             data: Dict[str, Any] = response.json()

@@ -25,8 +25,8 @@ class OpenAISettings:
     """从环境 / .env 解析出的 OpenAI 配置。"""
 
     api_key: str
-    # ``deepseek-chat`` is the stable OpenAI-compatible chat model name.
-    model: str = "deepseek-chat"
+    # This project's configured DeepSeek-compatible endpoint accepts this name.
+    model: str = "deepseek-v4-flash"
     base_url: Optional[str] = "https://api.deepseek.com"
     organization: Optional[str] = None
 
@@ -52,7 +52,7 @@ def load_settings(dotenv_path: Optional[str] = None) -> OpenAISettings:
         )
     return OpenAISettings(
         api_key=api_key,
-        model=os.environ.get("OPENAI_MODEL", "deepseek-chat"),
+        model=os.environ.get("OPENAI_MODEL", "deepseek-v4-flash"),
         base_url=os.environ.get("OPENAI_BASE_URL") or "https://api.deepseek.com",
         organization=os.environ.get("OPENAI_ORG") or None,
     )

@@ -30,16 +30,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="runs/router_learning/lmsys_prompts.jsonl")
     parser.add_argument("--output", default="runs/router_learning/lmsys_tier_labeled_dataset.jsonl")
-    parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--limit", type=int, default=0, help="Maximum newly completed rows; 0 means no limit.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--quality-threshold", type=float, default=0.72)
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--max-retries", type=int, default=1)
+    parser.add_argument("--retry-backoff-seconds", type=float, default=2.0)
+    parser.add_argument("--failed-output", default="", help="Append unrecoverable samples here; they remain retryable.")
     args = parser.parse_args()
 
     _load_env_file()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    failed_output = Path(args.failed_output) if args.failed_output else output.with_suffix(".failed.jsonl")
     existing_ids = _existing_ids(output) if args.skip_existing else set()
 
     device = LocalModelExecutor()
@@ -47,7 +51,8 @@ def main() -> None:
     cloud = OpenAICompatibleCloudExecutor()
 
     written = 0
-    with output.open("a", encoding="utf-8") as out_fh:
+    failed = 0
+    with output.open("a", encoding="utf-8") as out_fh, failed_output.open("a", encoding="utf-8") as failed_fh:
         for idx, item in enumerate(_read_jsonl(args.input)):
             if idx < args.start:
                 continue
@@ -62,11 +67,43 @@ def main() -> None:
                 continue
 
             tier_results = {
-                "device": _run_executor(device, "device", text),
-                "edge": _run_executor(edge, "edge", text),
-                "cloud": _run_executor(cloud, "cloud", text),
+                "device": _run_executor_with_retry(device, "device", text, args.max_retries, args.retry_backoff_seconds),
+                "edge": _run_executor_with_retry(edge, "edge", text, args.max_retries, args.retry_backoff_seconds),
+                "cloud": _run_executor_with_retry(cloud, "cloud", text, args.max_retries, args.retry_backoff_seconds),
             }
-            judge = _judge_tiers(text, tier_results, args.quality_threshold)
+            unavailable = [tier for tier, result in tier_results.items() if not result["success"]]
+            if unavailable:
+                _write_failed(failed_fh, item, sample_id, "tier_execution_failed", {"unavailable_tiers": unavailable, "tier_results": tier_results})
+                failed += 1
+                print(
+                    json.dumps(
+                        {
+                            "id": sample_id,
+                            "status": "failed",
+                            "stage": "tier_execution_failed",
+                            "unavailable_tiers": unavailable,
+                            "errors": {tier: tier_results[tier]["error"] for tier in unavailable},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                continue
+            try:
+                judge = _judge_tiers_with_retry(
+                    text, tier_results, args.quality_threshold, args.max_retries, args.retry_backoff_seconds
+                )
+            except Exception as exc:  # Failed rows must remain eligible for the next invocation.
+                _write_failed(failed_fh, item, sample_id, "judge_failed", {"error": str(exc), "tier_results": tier_results})
+                failed += 1
+                print(
+                    json.dumps(
+                        {"id": sample_id, "status": "failed", "stage": "judge_failed", "error": str(exc)},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                continue
             selected_tier = _select_tier(judge, args.quality_threshold)
             label = TIER_LABELS[selected_tier]
             payload = {
@@ -84,11 +121,14 @@ def main() -> None:
             out_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
             out_fh.flush()
             written += 1
-            print(json.dumps({"id": sample_id, "selected_tier": selected_tier, "label": label}, ensure_ascii=False))
+            print(
+                json.dumps({"id": sample_id, "status": "completed", "selected_tier": selected_tier, "label": label}, ensure_ascii=False),
+                flush=True,
+            )
             if args.sleep_seconds:
                 time.sleep(args.sleep_seconds)
 
-    print(json.dumps({"output": str(output), "rows_written": written}, ensure_ascii=False, indent=2))
+    print(json.dumps({"output": str(output), "rows_written": written, "failed": failed, "failed_output": str(failed_output)}, ensure_ascii=False, indent=2))
 
 
 def _run_executor(executor: Any, tier: str, prompt: str) -> Dict[str, Any]:
@@ -129,6 +169,42 @@ def _run_executor(executor: Any, tier: str, prompt: str) -> Dict[str, Any]:
             "latency_ms": round((time.time() - start) * 1000, 3),
             "metadata": {},
         }
+
+
+def _run_executor_with_retry(
+    executor: Any, tier: str, prompt: str, max_retries: int, backoff_seconds: float
+) -> Dict[str, Any]:
+    attempts = max(1, max_retries + 1)
+    result: Dict[str, Any] = {}
+    for attempt in range(attempts):
+        result = _run_executor(executor, tier, prompt)
+        result["attempts"] = attempt + 1
+        if result["success"]:
+            return result
+        if attempt + 1 < attempts:
+            time.sleep(backoff_seconds * (2**attempt))
+    return result
+
+
+def _judge_tiers_with_retry(
+    prompt: str,
+    tier_results: Dict[str, Dict[str, Any]],
+    threshold: float,
+    max_retries: int,
+    backoff_seconds: float,
+) -> Dict[str, Any]:
+    attempts = max(1, max_retries + 1)
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            judge = _judge_tiers(prompt, tier_results, threshold)
+            judge["attempts"] = attempt + 1
+            return judge
+        except Exception as exc:  # noqa: BLE001 - retry transient API/network failures
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(backoff_seconds * (2**attempt))
+    raise RuntimeError(f"judge failed after {attempts} attempts: {last_error}")
 
 
 def _judge_tiers(prompt: str, tier_results: Dict[str, Dict[str, Any]], threshold: float) -> Dict[str, Any]:
@@ -252,6 +328,28 @@ def _existing_ids(path: Path) -> set[str]:
         if metadata.get("id"):
             ids.add(str(metadata["id"]))
     return ids
+
+
+def _write_failed(
+    fh: Any,
+    item: Dict[str, Any],
+    sample_id: str,
+    stage: str,
+    details: Dict[str, Any],
+) -> None:
+    fh.write(
+        json.dumps(
+            {
+                "id": sample_id,
+                "text": str(item.get("text") or ""),
+                "metadata": dict(item.get("metadata") or {}),
+                "failure": {"stage": stage, **details, "timestamp": time.time()},
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    fh.flush()
 
 
 def _compact_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
