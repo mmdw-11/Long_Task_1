@@ -26,5 +26,5 @@ runs/
 # Hugging Face cache
 .hf_cache/*
 !.hf_cache/exports/
-!.hf_cache/exports/lmsys_chatbot_arena_conversations.jsonl
-
+.hf_cache/exports/*
+!.hf_cache/exports/lmsys_chatbot_arena_conversations.jsonl.gz

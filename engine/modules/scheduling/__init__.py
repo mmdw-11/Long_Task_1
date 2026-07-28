@@ -52,6 +52,7 @@ from .advanced_training import (
     benchmark_transformer_router,
     render_extended_experiment_report,
     save_extended_experiment_report,
+    train_bge_mlp_router,
     train_bge_router,
     train_transformer_router,
 )
@@ -116,6 +117,7 @@ __all__ = [
     "save_extended_experiment_report",
     "load_production_gate",
     "train_router",
+    "train_bge_mlp_router",
     "train_bge_router",
     "train_transformer_router",
     "StaticResourceMonitor",

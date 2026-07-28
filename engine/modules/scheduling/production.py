@@ -19,7 +19,7 @@ DEFAULT_ROUTER_PATHS: Dict[str, Path] = {
     "nb": PACKAGE_ROOT / "runs/router_learning/balanced_router.json",
     "bert_full": PACKAGE_ROOT / "runs/router_learning/balanced_bert_full/model",
     "bert_lora": PACKAGE_ROOT / "runs/router_learning/balanced_bert_lora/model",
-    "bge_m3": PACKAGE_ROOT / "runs/router_learning/balanced_bge_m3",
+    "bge_m3": PACKAGE_ROOT / "runs/router_learning/final_bge_m3_mlp",
 }
 LEGACY_DEFAULT_ROUTER_PATH = PACKAGE_ROOT / "runs/router_learning/router.json"
 

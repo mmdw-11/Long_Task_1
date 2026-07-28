@@ -332,6 +332,121 @@ def train_bge_router(
     )
 
 
+def train_bge_mlp_router(
+    dataset: RouteDataset,
+    *,
+    model_name: str,
+    output_dir: str | Path,
+    train_ratio: float = 0.8,
+    hidden_layer_sizes: Sequence[int] = (512, 128),
+    max_iter: int = 300,
+    alpha: float = 0.0001,
+    learning_rate_init: float = 0.001,
+    random_state: int = 42,
+    early_stopping: bool = True,
+) -> AdvancedTrainingResult:
+    from sentence_transformers import SentenceTransformer
+    from sklearn.neural_network import MLPClassifier
+
+    train_set, test_set = dataset.split(train_ratio=train_ratio)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        encoder = SentenceTransformer(model_name, local_files_only=True)
+    except Exception as exc:
+        raise ModelDownloadUnavailableError(
+            f"Unable to load BGE model '{model_name}'. Make sure it is available in the local cache."
+        ) from exc
+
+    start = time.time()
+    train_vectors = encoder.encode([item.text for item in train_set.examples], normalize_embeddings=True)
+    test_vectors = encoder.encode([item.text for item in test_set.examples], normalize_embeddings=True)
+    train_labels = [int(item.label) for item in train_set.examples]
+    test_labels = [int(item.label) for item in test_set.examples]
+    balanced_vectors, balanced_labels = _oversample_multiclass(train_vectors, train_labels, random_state=random_state)
+    classifier = MLPClassifier(
+        hidden_layer_sizes=tuple(hidden_layer_sizes),
+        activation="relu",
+        solver="adam",
+        alpha=alpha,
+        batch_size="auto",
+        learning_rate_init=learning_rate_init,
+        max_iter=max_iter,
+        early_stopping=early_stopping,
+        random_state=random_state,
+        n_iter_no_change=20,
+    )
+    classifier.fit(balanced_vectors, balanced_labels)
+    preds = classifier.predict(test_vectors)
+    metrics = _evaluate_predictions(list(preds), test_labels)
+    seconds = time.time() - start
+
+    with (out_dir / "classifier.pkl").open("wb") as fh:
+        pickle.dump(classifier, fh)
+    summary = {
+        "method": "bge_m3_mlp",
+        "model_name": model_name,
+        "classifier": {
+            "type": "MLPClassifier",
+            "hidden_layer_sizes": list(hidden_layer_sizes),
+            "max_iter": max_iter,
+            "alpha": alpha,
+            "learning_rate_init": learning_rate_init,
+            "random_state": random_state,
+            "early_stopping": early_stopping,
+            "n_iter": int(getattr(classifier, "n_iter_", 0)),
+            "best_validation_score": float(getattr(classifier, "best_validation_score_", 0.0) or 0.0),
+            "class_balancing": "random_oversampling",
+            "balanced_train_size": int(len(balanced_labels)),
+        },
+        "labels": sorted({int(item.label) for item in dataset.examples}),
+        "route_label_schema": _infer_label_schema(dataset.examples),
+        "train_size": len(train_set.examples),
+        "test_size": len(test_set.examples),
+        "seconds": seconds,
+        "metrics": metrics,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return AdvancedTrainingResult(
+        method="bge_m3_mlp",
+        metrics=metrics,
+        artifacts={
+            "artifact_dir": str(out_dir),
+            "classifier": str(out_dir / "classifier.pkl"),
+            "summary": str(out_dir / "summary.json"),
+        },
+        seconds=seconds,
+        notes=model_name,
+    )
+
+
+def _oversample_multiclass(
+    vectors: Any,
+    labels: Sequence[int],
+    *,
+    random_state: int,
+) -> tuple[Any, List[int]]:
+    import numpy as np
+
+    labels_array = np.asarray([int(label) for label in labels])
+    vectors_array = np.asarray(vectors)
+    classes, counts = np.unique(labels_array, return_counts=True)
+    if len(classes) <= 1 or len(set(int(count) for count in counts)) == 1:
+        return vectors, [int(label) for label in labels_array.tolist()]
+
+    rng = np.random.default_rng(random_state)
+    target_count = int(max(counts))
+    indices: List[int] = []
+    for label in classes:
+        class_indices = np.flatnonzero(labels_array == label)
+        sampled = rng.choice(class_indices, size=target_count, replace=True)
+        indices.extend(int(item) for item in sampled.tolist())
+    rng.shuffle(indices)
+    return vectors_array[indices], [int(label) for label in labels_array[indices].tolist()]
+
+
 def render_extended_experiment_report(rows: Sequence[Dict[str, Any]]) -> str:
     headers = ["method", "accuracy", "precision", "recall", "f1", "latency_ms", "cost", "notes"]
     lines = [
