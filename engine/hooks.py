@@ -168,6 +168,7 @@ class HookManager(ExecutionHook):
         self.context_budget = context_budget
         self.context_injector = context_injector or ContextInjector()
         self.drift_detector = drift_detector or DriftDetector()
+        self.validation_control_enabled = context_ledger is not None or evaluator is not None
         self.evaluator = evaluator or RuleEvaluator()
         self.redactor = redactor or SensitiveDataRedactor()
         self.audit_builder = audit_builder or AuditPackBuilder()
@@ -242,6 +243,8 @@ class HookManager(ExecutionHook):
         self, ctx: NodeContext, update: Optional[Dict[str, Any]]
     ) -> Optional[List[str]]:
         evaluation_data = ctx.state.get(EVALUATION_RESULT_KEY) or {}
+        if not self.validation_control_enabled:
+            return None
         if evaluation_data.get("passed", True):
             return None
         action = evaluation_data.get("action", "pause")

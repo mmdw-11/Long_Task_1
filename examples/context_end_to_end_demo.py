@@ -147,9 +147,22 @@ async def _run_validation_reroute_and_resume() -> Dict[str, Any]:
     )
 
     resume_checkpoint = checkpoint_store.load("demo-validation-reroute", "step_0001_before")
-    resumed_state = await compiled.ainvoke(
-        run_id="demo-validation-reroute-resumed",
-        checkpoint_store=checkpoint_store,
+    resume_policy = ContextPolicy(
+        max_context_tokens=5000,
+        reserved_output_tokens=50,
+        long_text_threshold=120,
+        summary_max_chars=90,
+        repeat_node_limit=2,
+    )
+    resume_compiled = graph.compile()
+    resume_compiled.hooks = HookManager(
+        context_ledger=resume_policy.build_ledger_store(OUTPUT_ROOT / "ledger_resumed"),
+        context_budget=resume_policy.build_budget_controller(),
+        context_injector=resume_policy.build_injector(),
+        drift_detector=resume_policy.build_drift_detector(),
+    )
+    resumed_state = await resume_compiled.ainvoke(
+        checkpoint_store=GraphCheckpointStore(OUTPUT_ROOT / "graph_checkpoints_resumed"),
         resume_from=resume_checkpoint,
     )
 
@@ -192,6 +205,9 @@ async def main() -> Dict[str, Any]:
             "resumed_from_frontier": validation_resume["resumed_from"]["frontier"],
             "resumed_state_keys": sorted(validation_resume["resumed_from"]["state"].keys()),
             "memory_md": str(OUTPUT_ROOT / "ledger" / "demo-validation-reroute" / "MEMORY.md"),
+            "resumed_memory_md": str(
+                OUTPUT_ROOT / "ledger_resumed" / "demo-validation-reroute" / "MEMORY.md"
+            ),
             "checkpoint_final": str(
                 OUTPUT_ROOT
                 / "graph_checkpoints"
