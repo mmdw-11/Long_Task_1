@@ -29,6 +29,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 from .constants import END, START
 from .failure import FAILURES_KEY, FailureRecord
 from .hooks import ExecutionHook, NodeContext
+from .modules.context import (
+    CONTEXT_INJECTION_KEY,
+    CONTEXT_INJECTION_TEXT_KEY,
+    CONTEXT_LEDGER_KEY,
+)
+from .modules.context import RUN_STATUS_KEY
 from .modules.flow import FlowDecision
 from .node import Node, NodeCallable, NodeType
 from .state import GraphState, Reducer
@@ -298,6 +304,9 @@ class CompiledGraph:
 
             snapshot = state.snapshot()
             self.hooks.on_step_start(step, list(frontier), snapshot)
+            if snapshot.get(RUN_STATUS_KEY):
+                state.update(snapshot)
+                break
 
             # 流控：逐节点决定 执行 / 跳过 / 延迟。
             decisions: Dict[str, FlowDecision] = {}
@@ -353,13 +362,35 @@ class CompiledGraph:
                     yield {"type": "node_end", "node": name, "update": {FAILURES_KEY: [rec.to_dict()]}}
                     continue
                 state.update(update)
+                end_state = state.snapshot()
+                for key in (
+                    CONTEXT_LEDGER_KEY,
+                    CONTEXT_INJECTION_KEY,
+                    CONTEXT_INJECTION_TEXT_KEY,
+                    "__context_drift__",
+                    "__evaluation__",
+                ):
+                    if key in node_snapshots.get(name, {}):
+                        end_state[key] = node_snapshots[name][key]
                 end_ctx = NodeContext(
                     node=name,
                     step=step,
-                    state=state.snapshot(),
+                    state=end_state,
                     metadata=dict(self.nodes[name].metadata),
                 )
                 self.hooks.on_node_end(end_ctx, update)
+                runtime_context_update = {}
+                for key in (
+                    CONTEXT_LEDGER_KEY,
+                    CONTEXT_INJECTION_KEY,
+                    CONTEXT_INJECTION_TEXT_KEY,
+                    "__context_drift__",
+                    "__evaluation__",
+                ):
+                    if key in end_ctx.state:
+                        runtime_context_update[key] = end_ctx.state[key]
+                if runtime_context_update:
+                    state.update(runtime_context_update)
                 executed_ok.append(name)
                 yield {"type": "node_end", "node": name, "update": update or {}}
 

@@ -18,6 +18,21 @@ from typing import Any, Dict, List, Optional
 
 from .failure import FAILURES_KEY, FailureRecord, FailureTrace
 from .modules.flow import FlowController, FlowDecision, NoOpFlowController
+from .modules.evaluation import Evaluator, EvaluationResult, RuleEvaluator
+from .modules.context import (
+    BUDGET_PAUSED,
+    CONTEXT_INJECTION_KEY,
+    CONTEXT_INJECTION_TEXT_KEY,
+    CONTEXT_LEDGER_KEY,
+    DRIFT_RESULT_KEY,
+    PAUSE_REASON_KEY,
+    RUN_STATUS_KEY,
+    ContextBudgetController,
+    ContextInjector,
+    ContextLedgerStore,
+    DriftDetector,
+    FailureSummary,
+)
 from .modules.memory import (
     MemoryContext,
     MemoryItem,
@@ -54,6 +69,7 @@ MEMORY_CONTEXT_TEXT_KEY = "__memory_context_text__"
 RESOURCE_ALLOCATION_KEY = "__resource_allocation__"
 REDACTION_RESULT_KEY = "__redaction__"
 AUDIT_PACK_KEY = "__audit_pack__"
+EVALUATION_RESULT_KEY = "__evaluation__"
 
 
 @dataclass
@@ -122,6 +138,11 @@ class HookManager(ExecutionHook):
         flow_controller: Optional[FlowController] = None,
         recovery_strategy: Optional[RecoveryStrategy] = None,
         scheduler: Optional[ResourceScheduler] = None,
+        context_ledger: Optional[ContextLedgerStore] = None,
+        context_budget: Optional[ContextBudgetController] = None,
+        context_injector: Optional[ContextInjector] = None,
+        drift_detector: Optional[DriftDetector] = None,
+        evaluator: Optional[Evaluator] = None,
         redactor: Optional[SensitiveDataRedactor] = None,
         audit_builder: Optional[AuditPackBuilder] = None,
         project_rules: Optional[Dict[str, Any]] = None,
@@ -136,6 +157,11 @@ class HookManager(ExecutionHook):
         self.flow_controller = flow_controller or NoOpFlowController()
         self.recovery_strategy = recovery_strategy or NoOpRecoveryStrategy()
         self.scheduler = scheduler or NoOpResourceScheduler()
+        self.context_ledger = context_ledger
+        self.context_budget = context_budget
+        self.context_injector = context_injector or ContextInjector()
+        self.drift_detector = drift_detector or DriftDetector()
+        self.evaluator = evaluator or RuleEvaluator()
         self.redactor = redactor or SensitiveDataRedactor()
         self.audit_builder = audit_builder or AuditPackBuilder()
         self.project_rules = project_rules or {}
@@ -148,6 +174,8 @@ class HookManager(ExecutionHook):
     # 扩展点实现（桥接到各模块）
     # ------------------------------------------------------------------ #
     def on_step_start(self, step: int, frontier: List[str], state: Dict[str, Any]) -> None:
+        self._update_context_on_step_start(step, frontier, state)
+        self._check_context_budget(state)
         for h in self.extra_hooks:
             h.on_step_start(step, frontier, state)
 
@@ -182,6 +210,14 @@ class HookManager(ExecutionHook):
             self.scheduler.release(allocation)
 
     def on_node_end(self, ctx: NodeContext, update: Optional[Dict[str, Any]]) -> None:
+        evaluation = self.evaluator.evaluate_node(
+            node=ctx.node,
+            update=update,
+            state=ctx.state,
+            metadata={**ctx.metadata, **self._node_metadata(ctx.node)},
+        )
+        ctx.state[EVALUATION_RESULT_KEY] = evaluation.to_dict()
+        self._update_context_on_node_end(ctx, update, evaluation)
         # 将节点产出写入记忆（NoOp 桩会丢弃）。
         if update:
             self.memory.append(
@@ -203,6 +239,9 @@ class HookManager(ExecutionHook):
         )
         for h in self.extra_hooks:
             h.on_node_error(ctx, error)
+        self._update_context_on_node_error(
+            ctx, error, recoverable=not plan.should_abort
+        )
         if plan.should_abort:
             return None
         if plan.action == RecoveryAction.RETRY:
@@ -280,6 +319,109 @@ class HookManager(ExecutionHook):
         }
         ctx.state[MEMORY_CONTEXT_ITEMS_KEY] = [item.to_dict() for item in items]
         ctx.state[MEMORY_CONTEXT_TEXT_KEY] = context_text
+        self._inject_context_ledger(ctx)
+
+    def _update_context_on_step_start(
+        self, step: int, frontier: List[str], state: Dict[str, Any]
+    ) -> None:
+        if self.context_ledger is None:
+            return
+        run_id = self._run_id_from_state(state)
+        ledger = self.context_ledger.on_step_start(
+            run_id=run_id,
+            step=step,
+            frontier=list(frontier),
+            state=state,
+        )
+        state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+
+    def _check_context_budget(self, state: Dict[str, Any]) -> None:
+        if self.context_budget is None:
+            return
+        decision = self.context_budget.check(state)
+        if self.context_ledger is not None:
+            run_id = self._run_id_from_state(state)
+            ledger = self.context_ledger.load_or_create(run_id, state)
+            ledger.budget = self.context_budget.budget_from_decision(decision)
+            self.context_ledger.save(ledger)
+            state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+        if not decision.allowed:
+            state[RUN_STATUS_KEY] = BUDGET_PAUSED
+            state[PAUSE_REASON_KEY] = decision.pause_reason
+
+    def _update_context_on_node_end(
+        self,
+        ctx: NodeContext,
+        update: Optional[Dict[str, Any]],
+        evaluation: EvaluationResult,
+    ) -> None:
+        if self.context_ledger is None:
+            return
+        run_id = self._run_id_from_state(ctx.state)
+        ledger = self.context_ledger.on_node_end(
+            run_id=run_id,
+            node=ctx.node,
+            step=ctx.step,
+            update=update,
+            state=ctx.state,
+            verified=evaluation.passed,
+        )
+        if not evaluation.passed:
+            message = "; ".join(evaluation.findings) or "post-execution validation failed"
+            ledger.failure_summaries.append(
+                FailureSummary(
+                    node=ctx.node,
+                    step=ctx.step,
+                    error_type="EvaluationFailed",
+                    message=message,
+                    recoverable=evaluation.retryable,
+                )
+            )
+            self.context_ledger.save(ledger)
+        drift = self.drift_detector.detect(ledger, current_node=ctx.node)
+        ctx.state[DRIFT_RESULT_KEY] = drift.to_dict()
+        if drift.drifted:
+            ledger.failure_summaries.append(
+                FailureSummary(
+                    node=ctx.node,
+                    step=ctx.step,
+                    error_type="ContextDrift",
+                    message="; ".join(drift.reasons),
+                    recoverable=True,
+                )
+            )
+            self.context_ledger.save(ledger)
+        ctx.state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+
+    def _update_context_on_node_error(
+        self, ctx: NodeContext, error: BaseException, *, recoverable: bool
+    ) -> None:
+        if self.context_ledger is None:
+            return
+        run_id = self._run_id_from_state(ctx.state)
+        ledger = self.context_ledger.on_node_error(
+            run_id=run_id,
+            node=ctx.node,
+            step=ctx.step,
+            error=error,
+            state=ctx.state,
+            recoverable=recoverable,
+        )
+        ctx.state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+
+    def _inject_context_ledger(self, ctx: NodeContext) -> None:
+        if self.context_ledger is None:
+            return
+        run_id = self._run_id_from_state(ctx.state)
+        ledger = self.context_ledger.load_or_create(run_id, ctx.state)
+        ctx.state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+        injection = self.context_injector.build(
+            ledger=ledger,
+            node=ctx.node,
+            metadata={**ctx.metadata, **self._node_metadata(ctx.node)},
+        )
+        ctx.state[CONTEXT_INJECTION_KEY] = injection.to_dict()
+        ctx.state[CONTEXT_INJECTION_TEXT_KEY] = injection.to_text()
 
     def _memory_context(self, ctx: NodeContext) -> MemoryContext:
         return self._memory_context_from_state(ctx.state, node=ctx.node, step=ctx.step)
@@ -313,6 +455,17 @@ class HookManager(ExecutionHook):
             task_id=str(task_id),
             project_id=str(project_id),
             global_id=str(global_id),
+        )
+
+    def _run_id_from_state(self, state: Dict[str, Any]) -> str:
+        existing = state.get(CONTEXT_LEDGER_KEY) or {}
+        return str(
+            state.get("run_id")
+            or state.get("task_id")
+            or existing.get("run_id")
+            or self.project_rules.get("run_id")
+            or self.project_rules.get("task_id")
+            or "default-run"
         )
 
     def _memory_query(self, ctx: NodeContext) -> str:

@@ -10,6 +10,33 @@
 """
 
 from .memory import MemoryScope, MemoryContext, MemoryItem, MemoryStore, NoOpMemoryStore
+from .context import (
+    CONTEXT_LEDGER_KEY,
+    CONTEXT_INJECTION_KEY,
+    CONTEXT_INJECTION_TEXT_KEY,
+    DRIFT_RESULT_KEY,
+    BUDGET_PAUSED,
+    PAUSE_REASON_KEY,
+    RUN_STATUS_KEY,
+    BudgetDecision,
+    ContextBudget,
+    ContextBudgetController,
+    ContextCheckpoint,
+    ContextCheckpointStore,
+    ContextPolicy,
+    ContextCompressor,
+    ContextFact,
+    ContextInjection,
+    ContextInjector,
+    DriftDetector,
+    DriftResult,
+    ContextLedger,
+    ContextLedgerRenderer,
+    ContextLedgerStore,
+    FailureSummary,
+    ToolSummary,
+    rough_token_count,
+)
 from .routing import (
     RoutingDecision,
     Router,
@@ -18,6 +45,7 @@ from .routing import (
     PassthroughRoutingPolicy,
 )
 from .flow import FlowDecision, ActivationCondition, FlowController, NoOpFlowController
+from .evaluation import EvaluationResult, Evaluator, RuleEvaluator
 from .execution import (
     EdgeHttpExecutor,
     ExecutorRegistry,
@@ -64,6 +92,31 @@ from .scheduling import (
 
 __all__ = [
     # memory
+    "CONTEXT_LEDGER_KEY",
+    "CONTEXT_INJECTION_KEY",
+    "CONTEXT_INJECTION_TEXT_KEY",
+    "DRIFT_RESULT_KEY",
+    "BUDGET_PAUSED",
+    "PAUSE_REASON_KEY",
+    "RUN_STATUS_KEY",
+    "BudgetDecision",
+    "ContextBudget",
+    "ContextBudgetController",
+    "ContextCheckpoint",
+    "ContextCheckpointStore",
+    "ContextPolicy",
+    "ContextCompressor",
+    "ContextFact",
+    "ContextInjection",
+    "ContextInjector",
+    "DriftDetector",
+    "DriftResult",
+    "ContextLedger",
+    "ContextLedgerRenderer",
+    "ContextLedgerStore",
+    "FailureSummary",
+    "ToolSummary",
+    "rough_token_count",
     "MemoryScope",
     "MemoryContext",
     "MemoryItem",
@@ -76,6 +129,9 @@ __all__ = [
     "RoutingPolicy",
     "PassthroughRoutingPolicy",
     # flow
+    "EvaluationResult",
+    "Evaluator",
+    "RuleEvaluator",
     "FlowDecision",
     "ActivationCondition",
     "FlowController",

@@ -28,6 +28,15 @@ from .constants import END, START
 from .failure import FAILURES_KEY
 from .graph import CompiledGraph, StateGraph
 from .hooks import MEMORY_CONTEXT_TEXT_KEY, HookManager
+from .modules.evaluation import Evaluator
+from .modules.context import (
+    CONTEXT_INJECTION_TEXT_KEY,
+    ContextBudgetController,
+    DriftDetector,
+    ContextInjector,
+    ContextLedgerStore,
+    ContextPolicy,
+)
 from .modules.flow import FlowController
 from .modules.memory import MemoryStore
 from .modules.recovery import RecoveryStrategy
@@ -97,7 +106,10 @@ def echo_node_factory(spec: AgentSpec) -> Node:
     async def _echo(state: Dict[str, Any]) -> Dict[str, Any]:
         incoming = state.get("input")
         memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
+        context_injection = state.get(CONTEXT_INJECTION_TEXT_KEY)
         text = f"[{spec.name}] 收到: {incoming}"
+        if context_injection:
+            text = f"{text}\n\n{context_injection}"
         if memory_context:
             text = f"{text}\n\n{memory_context}"
         return {
@@ -115,6 +127,7 @@ def echo_node_factory(spec: AgentSpec) -> Node:
             "model": spec.model,
             "description": spec.description,
             "sys_prompt": spec.sys_prompt,
+            "children": list(spec.children),
             **spec.config,
         },
     )
@@ -139,6 +152,11 @@ class Orchestrator:
         self._flow_controller: Optional[FlowController] = None
         self._recovery_strategy: Optional[RecoveryStrategy] = None
         self._scheduler: Optional[ResourceScheduler] = None
+        self._context_ledger: Optional[ContextLedgerStore] = None
+        self._context_budget: Optional[ContextBudgetController] = None
+        self._context_injector: Optional[ContextInjector] = None
+        self._drift_detector: Optional[DriftDetector] = None
+        self._evaluator: Optional[Evaluator] = None
         self._project_rules: Dict[str, Any] = {}
         self._memory_top_k: int = 5
         self._wakeup_level: int | str = 1
@@ -176,6 +194,39 @@ class Orchestrator:
     def set_scheduler(self, scheduler: ResourceScheduler) -> None:
         """注入端边云资源调度模块。"""
         self._scheduler = scheduler
+
+    def set_context_ledger(self, store: ContextLedgerStore) -> None:
+        """注入运行期上下文账本。"""
+        self._context_ledger = store
+
+    def set_context_budget(self, controller: ContextBudgetController) -> None:
+        """注入上下文预算控制器。"""
+        self._context_budget = controller
+
+    def set_context_injector(self, injector: ContextInjector) -> None:
+        """注入上下文提示词构造器。"""
+        self._context_injector = injector
+
+    def set_drift_detector(self, detector: DriftDetector) -> None:
+        """注入上下文漂移检测器。"""
+        self._drift_detector = detector
+
+    def set_evaluator(self, evaluator: Evaluator) -> None:
+        """注入节点后置验证器。"""
+        self._evaluator = evaluator
+
+    def set_context_policy(
+        self,
+        policy: ContextPolicy,
+        *,
+        ledger_root: str = "runs/context",
+    ) -> None:
+        """Apply a context-management policy."""
+        self._context_ledger = policy.build_ledger_store(ledger_root)
+        self._context_budget = policy.build_budget_controller()
+        self._context_injector = policy.build_injector()
+        self._drift_detector = policy.build_drift_detector()
+        self._memory_top_k = policy.memory_top_k
 
     def set_project_rules(self, rules: Dict[str, Any]) -> None:
         """设置项目规则（供动态路由策略读取）。"""
@@ -351,7 +402,14 @@ class Orchestrator:
         # 以 agent 名字作为图节点名（名称唯一由 create_agent 保证）。
         id_to_name = {aid: spec.name for aid, spec in self._agents.items()}
         for spec in self._agents.values():
-            graph.add_node_object(factory(spec))
+            node = factory(spec)
+            parent_id = self._parent_id_for(spec.id)
+            if parent_id is not None:
+                node.metadata.setdefault("parent_id", parent_id)
+                node.metadata.setdefault("parent_name", id_to_name[parent_id])
+                node.metadata.setdefault("is_sub_agent", True)
+                node.metadata.setdefault("requires_parent_validation", True)
+            graph.add_node_object(node)
 
         graph.set_entry_point(id_to_name[entry])
 
@@ -400,6 +458,12 @@ class Orchestrator:
             return candidates[0]
         # 退而求其次：返回第一个创建的 agent。
         return next(iter(self._agents), None)
+
+    def _parent_id_for(self, agent_id: str) -> Optional[str]:
+        for parent_id, spec in self._agents.items():
+            if agent_id in spec.children:
+                return parent_id
+        return None
 
     # ------------------------------------------------------------------ #
     # 序列化（前端可视化）
@@ -462,6 +526,16 @@ class Orchestrator:
             kwargs["recovery_strategy"] = self._recovery_strategy
         if self._scheduler is not None:
             kwargs["scheduler"] = self._scheduler
+        if self._context_ledger is not None:
+            kwargs["context_ledger"] = self._context_ledger
+        if self._context_budget is not None:
+            kwargs["context_budget"] = self._context_budget
+        if self._context_injector is not None:
+            kwargs["context_injector"] = self._context_injector
+        if self._drift_detector is not None:
+            kwargs["drift_detector"] = self._drift_detector
+        if self._evaluator is not None:
+            kwargs["evaluator"] = self._evaluator
         return HookManager(**kwargs)
 
     def _require(self, agent_id: str) -> None:
