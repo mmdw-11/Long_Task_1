@@ -106,6 +106,12 @@ class ExecutionHook:
         """节点执行成功后调用（默认 no-op）。"""
         return None
 
+    def handle_validation_failure(
+        self, ctx: NodeContext, update: Optional[Dict[str, Any]]
+    ) -> Optional[List[str]]:
+        """处理后置验证失败（默认不介入，保持兼容的记录语义）。"""
+        return None
+
     def on_node_error(self, ctx: NodeContext, error: BaseException) -> Optional[List[str]]:
         """节点执行失败时调用。
 
@@ -241,10 +247,12 @@ class HookManager(ExecutionHook):
         action = evaluation_data.get("action", "pause")
         if action == "record":
             return None
+        if action == "reroute":
+            ctx.state.pop(RUN_STATUS_KEY, None)
+            ctx.state[PAUSE_REASON_KEY] = "; ".join(evaluation_data.get("findings") or [])
+            return [str(item) for item in evaluation_data.get("targets") or []]
         ctx.state[RUN_STATUS_KEY] = VALIDATION_FAILED_STATUS
         ctx.state[PAUSE_REASON_KEY] = "; ".join(evaluation_data.get("findings") or [])
-        if action == "reroute":
-            return [str(item) for item in evaluation_data.get("targets") or []]
         return []
 
     def on_node_error(self, ctx: NodeContext, error: BaseException) -> Optional[List[str]]:

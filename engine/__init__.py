@@ -19,6 +19,7 @@ from .constants import START, END
 from .state import GraphState, add_messages, append_reducer, replace_reducer
 from .node import Node, NodeType
 from .graph import StateGraph, CompiledGraph, GraphExecutionError
+from .checkpoint import GraphCheckpoint, GraphCheckpointStore
 from .orchestrator import Orchestrator, AgentSpec
 from .failure import FailureRecord, FailureTrace, FAILURES_KEY
 from .hooks import ExecutionHook, HookManager, NodeContext
@@ -155,6 +156,8 @@ __all__ = [
     "StateGraph",
     "CompiledGraph",
     "GraphExecutionError",
+    "GraphCheckpoint",
+    "GraphCheckpointStore",
     "Orchestrator",
     "AgentSpec",
     # 失败轨迹

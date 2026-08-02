@@ -316,6 +316,8 @@ def test_post_execution_validation_marks_unverified_and_records_failure(tmp_path
 
     assert state["__evaluation__"]["passed"] is False
     assert "missing required update key: final_answer" in state["__evaluation__"]["findings"]
+    assert "result" not in state
+    assert state["__run_status__"] == "validation_failed"
 
     persisted = json.loads(store.path_for("validation-run").read_text(encoding="utf-8"))
     assert persisted["key_facts"][0]["verified"] is False
@@ -347,6 +349,38 @@ def test_post_execution_validation_marks_valid_fact_verified(tmp_path):
     persisted = json.loads(store.path_for("validation-ok").read_text(encoding="utf-8"))
     assert persisted["key_facts"][0]["verified"] is True
     assert persisted["failure_summaries"] == []
+
+
+def test_post_execution_validation_can_reroute_without_merging_bad_update(tmp_path):
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def worker(state):
+        return {"bad_result": "should not enter state"}
+
+    async def repair(state):
+        return {"fixed": True}
+
+    graph.add_node(
+        "worker",
+        worker,
+        metadata={
+            "required_update_keys": ["final_answer"],
+            "validation_failure_action": "reroute",
+            "validation_failure_targets": ["repair"],
+        },
+    )
+    graph.add_node("repair", repair)
+    graph.set_entry_point("worker")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(context_ledger=store)
+
+    state = asyncio.run(
+        compiled.ainvoke({"run_id": "validation-reroute", "goal": "repair bad output"})
+    )
+
+    assert "bad_result" not in state
+    assert state["fixed"] is True
 
 
 def test_drift_detector_records_repeated_node_pattern(tmp_path):

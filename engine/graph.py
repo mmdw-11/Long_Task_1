@@ -27,6 +27,7 @@ import inspect
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from .constants import END, START
+from .checkpoint import GraphCheckpoint, GraphCheckpointStore
 from .failure import FAILURES_KEY, FailureRecord
 from .hooks import ExecutionHook, NodeContext
 from .modules.context import (
@@ -261,10 +262,20 @@ class CompiledGraph:
         self,
         input: Optional[Dict[str, Any]] = None,
         recursion_limit: Optional[int] = None,
+        *,
+        run_id: Optional[str] = None,
+        checkpoint_store: Optional[GraphCheckpointStore] = None,
+        resume_from: Optional[GraphCheckpoint | str] = None,
     ) -> Dict[str, Any]:
         """异步执行整张图，返回最终状态字典。"""
         final_state: Dict[str, Any] = {}
-        async for event in self.astream(input, recursion_limit):
+        async for event in self.astream(
+            input,
+            recursion_limit,
+            run_id=run_id,
+            checkpoint_store=checkpoint_store,
+            resume_from=resume_from,
+        ):
             if event.get("type") == "final":
                 final_state = event["state"]
         return final_state
@@ -281,6 +292,10 @@ class CompiledGraph:
         self,
         input: Optional[Dict[str, Any]] = None,
         recursion_limit: Optional[int] = None,
+        *,
+        run_id: Optional[str] = None,
+        checkpoint_store: Optional[GraphCheckpointStore] = None,
+        resume_from: Optional[GraphCheckpoint | str] = None,
     ):
         """流式执行，逐个产出事件（供前端实时展示执行过程）。
 
@@ -290,12 +305,33 @@ class CompiledGraph:
         - ``{"type": "final", "state": {...}}``
         """
         limit = recursion_limit or self.recursion_limit
-        state = GraphState(self._builder.schema, input or {})
-
-        # 初始前沿：START 的所有静态目标。
-        frontier = self._normalize_targets(self.edges.get(START, []))
-        step = 0
+        if resume_from is not None:
+            checkpoint = (
+                checkpoint_store.load(str(run_id or (input or {}).get("run_id")), str(resume_from))
+                if isinstance(resume_from, str) and checkpoint_store is not None
+                else resume_from
+            )
+            if not isinstance(checkpoint, GraphCheckpoint):
+                raise GraphExecutionError("resume_from requires GraphCheckpoint or checkpoint id with store")
+            state = GraphState(self._builder.schema, checkpoint.state)
+            frontier = self._normalize_targets(checkpoint.frontier)
+            step = int(checkpoint.step)
+            run_id = checkpoint.run_id
+        else:
+            state = GraphState(self._builder.schema, input or {})
+            frontier = self._normalize_targets(self.edges.get(START, []))
+            step = 0
+            run_id = run_id or str((input or {}).get("run_id") or (input or {}).get("task_id") or "default-run")
         while frontier:
+            if checkpoint_store is not None:
+                checkpoint_store.save(
+                    run_id=str(run_id),
+                    step=step,
+                    frontier=list(frontier),
+                    state=state.snapshot(),
+                    status="running",
+                    checkpoint_id=f"step_{step:04d}_before",
+                )
             step += 1
             if step > limit:
                 raise GraphExecutionError(
@@ -361,8 +397,8 @@ class CompiledGraph:
                             recovery_targets.append(tgt)
                     yield {"type": "node_end", "node": name, "update": {FAILURES_KEY: [rec.to_dict()]}}
                     continue
-                state.update(update)
-                end_state = state.snapshot()
+                pre_update_state = state.snapshot()
+                end_state = copy.deepcopy(pre_update_state)
                 for key in (
                     CONTEXT_LEDGER_KEY,
                     CONTEXT_INJECTION_KEY,
@@ -379,6 +415,7 @@ class CompiledGraph:
                     metadata=dict(self.nodes[name].metadata),
                 )
                 self.hooks.on_node_end(end_ctx, update)
+                validation_targets = self.hooks.handle_validation_failure(end_ctx, update)
                 runtime_context_update = {}
                 for key in (
                     CONTEXT_LEDGER_KEY,
@@ -391,7 +428,6 @@ class CompiledGraph:
                         runtime_context_update[key] = end_ctx.state[key]
                 if runtime_context_update:
                     state.update(runtime_context_update)
-                validation_targets = self.hooks.handle_validation_failure(end_ctx, update)
                 if validation_targets is not None:
                     state.update(
                         {
@@ -404,10 +440,13 @@ class CompiledGraph:
                         for tgt in validation_targets:
                             if tgt != END and tgt not in recovery_targets:
                                 recovery_targets.append(tgt)
+                        yield {"type": "node_end", "node": name, "update": runtime_context_update}
+                        continue
                     else:
                         frontier = []
                         next_frontier = []
                         break
+                state.update(update)
                 executed_ok.append(name)
                 yield {"type": "node_end", "node": name, "update": update or {}}
 
@@ -440,6 +479,15 @@ class CompiledGraph:
                     next_frontier.append(tgt)
             frontier = next_frontier
 
+        if checkpoint_store is not None:
+            checkpoint_store.save(
+                run_id=str(run_id),
+                step=step,
+                frontier=[],
+                state=state.snapshot(),
+                status="completed",
+                checkpoint_id="final",
+            )
         yield {"type": "final", "state": state.to_dict()}
 
     async def _run_node(
