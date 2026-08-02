@@ -102,7 +102,11 @@ class EmbeddingClassifierRouter:
     """Embedding model + sklearn classifier router."""
 
     def __init__(self, artifact_dir: str | Path) -> None:
-        self.artifact_dir = Path(artifact_dir)
+        path = Path(artifact_dir)
+        # Contrastive runs store the classifier under root/router and the
+        # fine-tuned sentence-transformer encoder under root/encoder. The router
+        # summary written by train_bge_mlp_router points model_name at encoder.
+        self.artifact_dir = path / "router" if (path / "router").exists() else path
         self._encoder = None
         self._classifier = None
         self._config = None

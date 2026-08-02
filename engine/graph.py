@@ -391,6 +391,23 @@ class CompiledGraph:
                         runtime_context_update[key] = end_ctx.state[key]
                 if runtime_context_update:
                     state.update(runtime_context_update)
+                validation_targets = self.hooks.handle_validation_failure(end_ctx, update)
+                if validation_targets is not None:
+                    state.update(
+                        {
+                            key: value
+                            for key, value in end_ctx.state.items()
+                            if key.startswith("__")
+                        }
+                    )
+                    if validation_targets:
+                        for tgt in validation_targets:
+                            if tgt != END and tgt not in recovery_targets:
+                                recovery_targets.append(tgt)
+                    else:
+                        frontier = []
+                        next_frontier = []
+                        break
                 executed_ok.append(name)
                 yield {"type": "node_end", "node": name, "update": update or {}}
 

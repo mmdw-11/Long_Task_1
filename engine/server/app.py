@@ -28,6 +28,7 @@ Agent 管理
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 try:
@@ -39,6 +40,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
     ) from exc
 
 from ..constants import END
+from ..modules.context import ContextPolicy
 from ..orchestrator import Orchestrator
 
 
@@ -90,9 +92,19 @@ def _resolve_target(target: str) -> Any:
     return END if target == "END" else target
 
 
-def create_app(orchestrator: Optional[Orchestrator] = None) -> "FastAPI":
+def create_app(
+    orchestrator: Optional[Orchestrator] = None,
+    *,
+    context_policy: Optional[ContextPolicy] = None,
+    context_policy_path: Optional[str] = None,
+    context_ledger_root: Optional[str] = None,
+) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
+    policy = context_policy or _load_context_policy(context_policy_path)
+    ledger_root = context_ledger_root or os.environ.get("CONTEXT_LEDGER_ROOT") or "runs/context"
+    if policy is not None:
+        orch.set_context_policy(policy, ledger_root=ledger_root)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
 
     # ------------------------- Agent 管理 ------------------------- #
@@ -200,9 +212,18 @@ def create_app(orchestrator: Optional[Orchestrator] = None) -> "FastAPI":
         # nonlocal 重绑定会更新所有闭包共享的同一变量，后续接口即读取新实例。
         nonlocal orch
         orch = Orchestrator.from_dict(data)
+        if policy is not None:
+            orch.set_context_policy(policy, ledger_root=ledger_root)
         return {"ok": True, "agents": len(data.get("agents", []))}
 
     return app
+
+
+def _load_context_policy(context_policy_path: Optional[str]) -> Optional[ContextPolicy]:
+    path = context_policy_path or os.environ.get("CONTEXT_POLICY_PATH")
+    if not path:
+        return None
+    return ContextPolicy.from_file(path)
 
 
 # 便于 `uvicorn engine.server.app:app` 直接启动。

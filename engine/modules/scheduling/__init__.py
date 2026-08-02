@@ -64,7 +64,12 @@ from .monitor import (
     SystemResourceMonitor,
 )
 from .policy import TrustedWorkspacePolicy
-from .production import load_production_gate, resolve_router_path
+from .production import (
+    desired_router_path,
+    load_production_gate,
+    resolve_router_path,
+    router_artifact_status,
+)
 from .scheduler import AdaptiveResourceScheduler
 
 __all__ = [
@@ -116,6 +121,8 @@ __all__ = [
     "save_experiment_report",
     "save_extended_experiment_report",
     "load_production_gate",
+    "desired_router_path",
+    "router_artifact_status",
     "train_router",
     "train_bge_mlp_router",
     "train_bge_router",

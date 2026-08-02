@@ -70,6 +70,7 @@ RESOURCE_ALLOCATION_KEY = "__resource_allocation__"
 REDACTION_RESULT_KEY = "__redaction__"
 AUDIT_PACK_KEY = "__audit_pack__"
 EVALUATION_RESULT_KEY = "__evaluation__"
+VALIDATION_FAILED_STATUS = "validation_failed"
 
 
 @dataclass
@@ -230,6 +231,21 @@ class HookManager(ExecutionHook):
             )
         for h in self.extra_hooks:
             h.on_node_end(ctx, update)
+
+    def handle_validation_failure(
+        self, ctx: NodeContext, update: Optional[Dict[str, Any]]
+    ) -> Optional[List[str]]:
+        evaluation_data = ctx.state.get(EVALUATION_RESULT_KEY) or {}
+        if evaluation_data.get("passed", True):
+            return None
+        action = evaluation_data.get("action", "pause")
+        if action == "record":
+            return None
+        ctx.state[RUN_STATUS_KEY] = VALIDATION_FAILED_STATUS
+        ctx.state[PAUSE_REASON_KEY] = "; ".join(evaluation_data.get("findings") or [])
+        if action == "reroute":
+            return [str(item) for item in evaluation_data.get("targets") or []]
+        return []
 
     def on_node_error(self, ctx: NodeContext, error: BaseException) -> Optional[List[str]]:
         trace = FailureTrace.from_state(ctx.state)

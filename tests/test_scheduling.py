@@ -20,9 +20,11 @@ from engine.modules.scheduling import OpenAITaskGate
 from engine.modules.scheduling.production import (
     AdvancedLearnedTaskGate,
     DEFAULT_ROUTER_BACKEND,
+    desired_router_path,
     load_production_gate,
     resolve_default_router_path,
     resolve_router_backend,
+    router_artifact_status,
 )
 
 
@@ -297,9 +299,14 @@ def test_scheduler_loads_trained_router_from_router_path(tmp_path):
 def test_production_router_defaults_to_bge_m3_backend():
     assert DEFAULT_ROUTER_BACKEND == "bge_m3"
     assert resolve_router_backend() == "bge_m3"
+    desired = desired_router_path()
+    assert desired is not None
+    assert desired.name == "final_bge_m3_contrastive_epoch12"
+    desired_status = router_artifact_status(desired, backend="bge_m3")
+    assert desired_status["ready"] or any("encoder" in item for item in desired_status["missing"])
     path = resolve_default_router_path()
     assert path is not None
-    assert path.name == "balanced_bge_m3"
+    assert path.name in {"final_bge_m3_contrastive_epoch12", "final_bge_m3_mlp"}
 
 
 def test_scheduler_can_auto_enable_production_router_from_env(monkeypatch):

@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+
+class ValidationFailureAction(str, enum.Enum):
+    """What the graph should do after post-execution validation fails."""
+
+    RECORD = "record"
+    PAUSE = "pause"
+    REROUTE = "reroute"
 
 
 @dataclass
@@ -16,6 +25,8 @@ class EvaluationResult:
     findings: List[str] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
     retryable: bool = False
+    action: ValidationFailureAction = ValidationFailureAction.RECORD
+    targets: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -24,6 +35,8 @@ class EvaluationResult:
             "findings": list(self.findings),
             "metrics": dict(self.metrics),
             "retryable": self.retryable,
+            "action": self.action.value,
+            "targets": list(self.targets),
         }
 
 
@@ -74,11 +87,15 @@ class RuleEvaluator(Evaluator):
             path = Path(raw_path)
             if not path.exists():
                 findings.append(f"required file does not exist: {raw_path}")
+        action = ValidationFailureAction(str(metadata.get("validation_failure_action") or "pause"))
+        targets = _list_value(metadata.get("validation_failure_targets"))
         return EvaluationResult(
             passed=not findings,
             score=0.0 if findings else 1.0,
             findings=findings,
             retryable=bool(findings),
+            action=action if findings else ValidationFailureAction.RECORD,
+            targets=targets,
         )
 
 

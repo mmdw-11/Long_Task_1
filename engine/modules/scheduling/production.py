@@ -19,6 +19,9 @@ DEFAULT_ROUTER_PATHS: Dict[str, Path] = {
     "nb": PACKAGE_ROOT / "runs/router_learning/balanced_router.json",
     "bert_full": PACKAGE_ROOT / "runs/router_learning/balanced_bert_full/model",
     "bert_lora": PACKAGE_ROOT / "runs/router_learning/balanced_bert_lora/model",
+    "bge_m3": PACKAGE_ROOT / "runs/router_learning/final_bge_m3_contrastive_epoch12",
+}
+FALLBACK_ROUTER_PATHS: Dict[str, Path] = {
     "bge_m3": PACKAGE_ROOT / "runs/router_learning/final_bge_m3_mlp",
 }
 LEGACY_DEFAULT_ROUTER_PATH = PACKAGE_ROOT / "runs/router_learning/router.json"
@@ -102,8 +105,11 @@ def resolve_router_path(
 
     backend_name = resolve_router_backend(backend)
     default_path = DEFAULT_ROUTER_PATHS.get(backend_name)
-    if default_path and default_path.exists():
+    if default_path and _router_artifact_ready(backend_name, default_path):
         return default_path
+    fallback_path = FALLBACK_ROUTER_PATHS.get(backend_name)
+    if fallback_path and _router_artifact_ready(backend_name, fallback_path):
+        return fallback_path
     if LEGACY_DEFAULT_ROUTER_PATH.exists():
         return LEGACY_DEFAULT_ROUTER_PATH
     return None
@@ -245,3 +251,46 @@ def read_router_summary(router_path: str | Path) -> Dict[str, Any]:
         return json.loads(summary_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def desired_router_path(*, backend: Optional[str] = None) -> Optional[Path]:
+    """Return the preferred path even if the artifact is not complete."""
+    return DEFAULT_ROUTER_PATHS.get(resolve_router_backend(backend))
+
+
+def router_artifact_status(path: str | Path, *, backend: Optional[str] = None) -> Dict[str, Any]:
+    backend_name = resolve_router_backend(backend or infer_router_backend_from_path(path))
+    path_obj = Path(path)
+    required = _required_files(backend_name, path_obj)
+    missing = [str(item) for item in required if not item.exists()]
+    return {
+        "backend": backend_name,
+        "path": str(path_obj),
+        "exists": path_obj.exists(),
+        "ready": path_obj.exists() and not missing,
+        "missing": missing,
+    }
+
+
+def _router_artifact_ready(backend: str, path: Path) -> bool:
+    if not path.exists():
+        return False
+    return all(item.exists() for item in _required_files(backend, path))
+
+
+def _required_files(backend: str, path: Path) -> list[Path]:
+    if backend == "nb":
+        return [path]
+    if backend in {"bert_full", "bert_lora"}:
+        return [path / "config.json"]
+    if backend == "bge_m3":
+        # Preferred contrastive artifact layout: root/encoder + root/router.
+        if "contrastive" in path.name.lower() or (path / "encoder").exists() or (path / "router").exists():
+            return [
+                path / "encoder" / "modules.json",
+                path / "router" / "classifier.pkl",
+                path / "router" / "summary.json",
+            ]
+        # Legacy/fallback non-contrastive MLP layout.
+        return [path / "classifier.pkl", path / "summary.json"]
+    return [path]
