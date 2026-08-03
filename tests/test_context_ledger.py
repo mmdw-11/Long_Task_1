@@ -453,6 +453,96 @@ def test_drift_detector_records_semantically_repeated_attempts(tmp_path):
     )
 
 
+def test_drift_detector_records_repeated_file_operation_pattern(tmp_path):
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def edit_a(state):
+        return {"result": "modify src/app.py with patch attempt A"}
+
+    async def edit_b(state):
+        return {"result": "update src/app.py with patch attempt B"}
+
+    async def edit_c(state):
+        return {"result": "edit src/app.py with patch attempt C"}
+
+    graph.add_node("edit_a", edit_a)
+    graph.add_node("edit_b", edit_b)
+    graph.add_node("edit_c", edit_c)
+    graph.set_entry_point("edit_a")
+    graph.add_edge("edit_a", "edit_b")
+    graph.add_edge("edit_b", "edit_c")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            repeated_file_operation_limit=3,
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke({"run_id": "file-drift-run", "goal": "detect repeated file edits"})
+    )
+
+    assert state["__context_drift__"]["drifted"] is True
+    assert any(
+        "similar file operation repeated 3 times: modify:src/app.py" in reason
+        for reason in state["__context_drift__"]["reasons"]
+    )
+
+
+def test_drift_detector_records_embedding_goal_divergence(tmp_path):
+    class TinyEmbedding:
+        def embed(self, text):
+            lower = text.lower()
+            return [
+                1.0 if any(word in lower for word in ("test", "pytest", "bug", "fix")) else 0.0,
+                1.0 if any(word in lower for word in ("travel", "hotel", "recipe", "food")) else 0.0,
+            ]
+
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def wander_a(state):
+        return {"result": "draft travel hotel itinerary for a weekend"}
+
+    async def wander_b(state):
+        return {"result": "write food recipe recommendations for dinner"}
+
+    graph.add_node("wander_a", wander_a)
+    graph.add_node("wander_b", wander_b)
+    graph.set_entry_point("wander_a")
+    graph.add_edge("wander_a", "wander_b")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            goal_similarity_threshold=0.5,
+            goal_drift_window=2,
+            embedding_model=TinyEmbedding(),
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {
+                "run_id": "goal-drift-run",
+                "goal": "fix pytest failures and repair the bug in context tests",
+            }
+        )
+    )
+
+    assert state["__context_drift__"]["drifted"] is True
+    assert any(
+        "semantic drift from original goal" in reason
+        for reason in state["__context_drift__"]["reasons"]
+    )
+
+
 def test_sub_agent_output_is_isolated_until_parent_validation(tmp_path):
     store = ContextLedgerStore(tmp_path)
     orch = Orchestrator()

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from ._types import ContextLedger, ToolSummary
 
 
 DRIFT_RESULT_KEY = "__context_drift__"
+
+
+class EmbeddingModel(Protocol):
+    def embed(self, text: str) -> List[float]:
+        raise NotImplementedError
 
 
 @dataclass
@@ -45,6 +50,10 @@ class DriftDetector:
         repeated_summary_limit: int = 3,
         repeated_resource_limit: int = 3,
         repeated_tool_limit: int = 0,
+        repeated_file_operation_limit: int = 3,
+        goal_similarity_threshold: float = 0.0,
+        goal_drift_window: int = 2,
+        embedding_model: Optional[EmbeddingModel] = None,
     ) -> None:
         self.repeat_node_limit = repeat_node_limit
         self.pending_step_limit = pending_step_limit
@@ -52,6 +61,10 @@ class DriftDetector:
         self.repeated_summary_limit = repeated_summary_limit
         self.repeated_resource_limit = repeated_resource_limit
         self.repeated_tool_limit = repeated_tool_limit
+        self.repeated_file_operation_limit = repeated_file_operation_limit
+        self.goal_similarity_threshold = goal_similarity_threshold
+        self.goal_drift_window = goal_drift_window
+        self.embedding_model = embedding_model
 
     def detect(self, ledger: ContextLedger, *, current_node: str = "") -> DriftResult:
         reasons: List[str] = []
@@ -99,6 +112,28 @@ class DriftDetector:
                 reasons.append(
                     f"tool {repeated_tool} repeated {self.repeated_tool_limit} times"
                 )
+        if self.repeated_file_operation_limit > 1:
+            repeated_file = _recent_repeated_file_operation(
+                ledger.tool_summaries,
+                limit=self.repeated_file_operation_limit,
+            )
+            if repeated_file:
+                reasons.append(
+                    f"similar file operation repeated {self.repeated_file_operation_limit} times: {repeated_file}"
+                )
+        if (
+            self.embedding_model is not None
+            and self.goal_similarity_threshold > 0
+            and ledger.original_goal.strip()
+        ):
+            goal_drift = _goal_embedding_drift(
+                ledger,
+                embedding_model=self.embedding_model,
+                threshold=self.goal_similarity_threshold,
+                window=self.goal_drift_window,
+            )
+            if goal_drift:
+                reasons.append(goal_drift)
         severity = "none"
         if reasons:
             severity = "medium" if len(reasons) == 1 else "high"
@@ -133,10 +168,95 @@ def _recent_repeated_tool(summaries: List[ToolSummary], *, limit: int) -> str:
     return ""
 
 
+def _recent_repeated_file_operation(summaries: List[ToolSummary], *, limit: int) -> str:
+    recent = [
+        _file_operation_fingerprint(item.short_summary)
+        for item in summaries[-limit:]
+        if item.short_summary.strip()
+    ]
+    recent = [item for item in recent if item]
+    if len(recent) < limit:
+        return ""
+    if all(item == recent[0] for item in recent):
+        return recent[0]
+    return ""
+
+
+def _goal_embedding_drift(
+    ledger: ContextLedger,
+    *,
+    embedding_model: EmbeddingModel,
+    threshold: float,
+    window: int,
+) -> str:
+    candidates = _recent_goal_candidates(ledger, window=max(1, window))
+    if len(candidates) < max(1, window):
+        return ""
+    goal_vector = embedding_model.embed(ledger.original_goal)
+    similarities = [
+        _cosine_similarity(goal_vector, embedding_model.embed(candidate))
+        for candidate in candidates[-window:]
+        if candidate.strip()
+    ]
+    if len(similarities) < window:
+        return ""
+    if all(score < threshold for score in similarities):
+        score_text = ", ".join(f"{score:.3f}" for score in similarities)
+        return (
+            "semantic drift from original goal: "
+            f"recent similarity scores [{score_text}] below threshold {threshold:.3f}"
+        )
+    return ""
+
+
+def _recent_goal_candidates(ledger: ContextLedger, *, window: int) -> List[str]:
+    candidates: List[str] = []
+    for summary in ledger.tool_summaries[-window:]:
+        if summary.short_summary.strip():
+            candidates.append(summary.short_summary)
+    if len(candidates) < window and ledger.next_action.strip():
+        candidates.append(ledger.next_action)
+    if len(candidates) < window:
+        candidates.extend(ledger.pending_steps[-(window - len(candidates)) :])
+    return candidates
+
+
 def _summary_fingerprint(text: str) -> str:
     normalized = re.sub(r"\d+", "<num>", text.lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized[:240]
+
+
+def _file_operation_fingerprint(text: str) -> str:
+    paths = _extract_paths(text)
+    if not paths:
+        return ""
+    action = "write"
+    lowered = text.lower()
+    if any(word in lowered for word in ("delete", "remove", "删除")):
+        action = "delete"
+    elif any(word in lowered for word in ("read", "open", "读取")):
+        action = "read"
+    elif any(word in lowered for word in ("modify", "update", "patch", "edit", "修改", "更新")):
+        action = "modify"
+    return f"{action}:{paths[0].lower()}"
+
+
+def _extract_paths(text: str) -> List[str]:
+    pattern = r"(?:[A-Za-z]:\\)?[\w.-]+(?:[\\/][\w.@()-]+)+(?:\.[A-Za-z0-9_]+)?"
+    return re.findall(pattern, text)
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if not left or not right:
+        return 0.0
+    size = min(len(left), len(right))
+    dot = sum(float(left[idx]) * float(right[idx]) for idx in range(size))
+    left_norm = sum(float(left[idx]) ** 2 for idx in range(size)) ** 0.5
+    right_norm = sum(float(right[idx]) ** 2 for idx in range(size)) ** 0.5
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 def _clip(text: str, limit: int = 120) -> str:

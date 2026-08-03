@@ -29,6 +29,12 @@ class ContextPolicy:
     repeat_node_limit: int = 3
     pending_step_limit: int = 10
     no_progress_step_limit: int = 0
+    repeated_summary_limit: int = 3
+    repeated_resource_limit: int = 3
+    repeated_tool_limit: int = 0
+    repeated_file_operation_limit: int = 3
+    goal_similarity_threshold: float = 0.0
+    goal_drift_window: int = 2
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ContextPolicy":
@@ -56,6 +62,12 @@ class ContextPolicy:
             "repeat_node_limit": self.repeat_node_limit,
             "pending_step_limit": self.pending_step_limit,
             "no_progress_step_limit": self.no_progress_step_limit,
+            "repeated_summary_limit": self.repeated_summary_limit,
+            "repeated_resource_limit": self.repeated_resource_limit,
+            "repeated_tool_limit": self.repeated_tool_limit,
+            "repeated_file_operation_limit": self.repeated_file_operation_limit,
+            "goal_similarity_threshold": self.goal_similarity_threshold,
+            "goal_drift_window": self.goal_drift_window,
         }
 
     def build_ledger_store(self, root_dir: str | Path) -> ContextLedgerStore:
@@ -84,6 +96,12 @@ class ContextPolicy:
             repeat_node_limit=self.repeat_node_limit,
             pending_step_limit=self.pending_step_limit,
             no_progress_step_limit=self.no_progress_step_limit,
+            repeated_summary_limit=self.repeated_summary_limit,
+            repeated_resource_limit=self.repeated_resource_limit,
+            repeated_tool_limit=self.repeated_tool_limit,
+            repeated_file_operation_limit=self.repeated_file_operation_limit,
+            goal_similarity_threshold=self.goal_similarity_threshold,
+            goal_drift_window=self.goal_drift_window,
         )
 
 
@@ -103,6 +121,8 @@ def _coerce_scalar(value: str) -> Any:
     if value.lower() in {"true", "false"}:
         return value.lower() == "true"
     try:
+        if "." in value:
+            return float(value)
         return int(value)
     except ValueError:
         return value.strip('"').strip("'")
