@@ -76,8 +76,10 @@ class RuleEvaluator(Evaluator):
         if update is not None and not isinstance(update, dict):
             findings.append(f"node {node} returned non-dict update")
         update_dict = update if isinstance(update, dict) else {}
-        if metadata.get("requires_parent_validation") and not update_dict.get(
-            "__parent_validated__"
+        if metadata.get("requires_parent_validation") and not _has_parent_validation(
+            node=node,
+            state=state,
+            metadata=metadata,
         ):
             findings.append("sub-agent output requires parent validation")
         for key in _list_value(metadata.get("required_update_keys")):
@@ -107,3 +109,43 @@ def _list_value(value: Any) -> List[str]:
     if isinstance(value, Iterable):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _has_parent_validation(
+    *,
+    node: str,
+    state: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> bool:
+    """Return whether parent/orchestrator approved this sub-agent output.
+
+    The child node's own update is intentionally ignored. A sub-agent must not
+    be able to promote its own output by returning ``__parent_validated__``.
+    """
+    validation = state.get("__parent_validation__") or state.get("__parent_validations__")
+    parent_id = str(metadata.get("parent_id") or "")
+    parent_name = str(metadata.get("parent_name") or "")
+    keys = [node]
+    if parent_id:
+        keys.append(parent_id)
+    if parent_name:
+        keys.append(parent_name)
+
+    if isinstance(validation, dict):
+        for key in keys:
+            if key not in validation:
+                continue
+            value = validation[key]
+            if value is True:
+                return True
+            if isinstance(value, dict) and value.get("approved") is True:
+                return True
+        return False
+
+    approved_nodes = state.get("__parent_validated_nodes__")
+    if isinstance(approved_nodes, str):
+        return approved_nodes in keys
+    if isinstance(approved_nodes, Iterable):
+        return any(str(item) in keys for item in approved_nodes)
+
+    return False

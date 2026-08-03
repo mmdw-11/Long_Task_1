@@ -78,6 +78,27 @@ class ContextLedgerStore:
     def memory_path_for(self, run_id: str) -> Path:
         return self.root_dir / _safe_id(run_id) / self.memory_filename
 
+    def raw_refs_for_run(self, run_id: str) -> List[str]:
+        """Return archived raw payload refs for a run."""
+        return self.compressor.raw_refs_for_run(run_id)
+
+    def read_raw_ref(self, raw_ref: str) -> str:
+        """Read a raw payload by the ``raw_ref`` stored in MEMORY/ledger."""
+        return self.compressor.read_raw_ref(raw_ref)
+
+    def read_raw_summary(self, run_id: str, index: int) -> str:
+        """Read raw payload by tool-summary index in a run ledger.
+
+        This is the recovery path for compressed memory: the ledger keeps a
+        small summary plus ``raw_ref``; callers can use the summary index to
+        retrieve the original raw output when needed.
+        """
+        ledger = self.load_or_create(run_id)
+        summaries = [item for item in ledger.tool_summaries if item.raw_ref]
+        if index < 0 or index >= len(summaries):
+            raise IndexError(f"raw summary index out of range: {index}")
+        return self.read_raw_ref(summaries[index].raw_ref)
+
     def on_step_start(
         self,
         *,

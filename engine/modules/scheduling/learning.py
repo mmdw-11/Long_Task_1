@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence
 
+from ..bge_local import resolve_bge_m3_cache_dir, resolve_bge_m3_model_path
 from ._types import RealtimeRequirement, ResourceRequest, SensitivityLevel, TaskComplexity, TaskProfile
 from .gate import HeuristicTaskGate, TaskGate
 
@@ -431,8 +432,9 @@ class BgeM3Encoder:
     without extra packages.
     """
 
-    def __init__(self, model_name: str = "BAAI/bge-m3") -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str = "BAAI/bge-m3", cache_dir: Optional[str] = None) -> None:
+        self.model_name = resolve_bge_m3_model_path(model_name)
+        self.cache_dir = resolve_bge_m3_cache_dir(cache_dir)
         self._model = None
 
     def _load(self) -> Any:
@@ -444,7 +446,13 @@ class BgeM3Encoder:
             raise ImportError(
                 "BGE-M3 encoder requires FlagEmbedding. Install it before use."
             ) from exc
-        self._model = BGEM3FlagModel(self.model_name)
+        try:
+            self._model = BGEM3FlagModel(self.model_name, cache_dir=self.cache_dir)
+        except Exception as exc:  # pragma: no cover - depends on model cache/network
+            raise RuntimeError(
+                f"Unable to load BGE-M3 encoder '{self.model_name}'. "
+                f"Ensure the model is available and the cache directory is writable: {self.cache_dir}"
+            ) from exc
         return self._model
 
     def encode(self, text: str) -> Dict[str, float]:

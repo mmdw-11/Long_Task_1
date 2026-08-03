@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import List, Optional, Protocol
 
+from ..bge_local import resolve_bge_m3_cache_dir, resolve_bge_m3_model_path
 from ._utils import _normalize, _tokenize
 
 
@@ -54,6 +55,7 @@ class BGEM3EmbeddingModel:
         model_name: str = "BAAI/bge-m3",
         device: Optional[str] = None,
         batch_size: int = 32,
+        cache_dir: Optional[str] = None,
     ) -> None:
         try:
             from FlagEmbedding import BGEM3FlagModel  # type: ignore
@@ -64,13 +66,21 @@ class BGEM3EmbeddingModel:
                 "或安装本项目的 memory 可选依赖组：\n"
                 "  pip install -e '.[memory]'"
             )
-        self.model_name = model_name
-        self._model = BGEM3FlagModel(
-            model_name,
-            use_fp16=True,
-            device=device,
-            batch_size=batch_size,
-        )
+        self.model_name = resolve_bge_m3_model_path(model_name)
+        self.cache_dir = resolve_bge_m3_cache_dir(cache_dir)
+        try:
+            self._model = BGEM3FlagModel(
+                self.model_name,
+                use_fp16=True,
+                devices=device,
+                batch_size=batch_size,
+                cache_dir=self.cache_dir,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to load BGE-M3 model '{self.model_name}'. "
+                f"Ensure the model is available and the cache directory is writable: {self.cache_dir}"
+            ) from exc
 
     def embed(self, text: str) -> List[float]:
         """生成文本的 1024 维稠密向量（已归一化）。"""

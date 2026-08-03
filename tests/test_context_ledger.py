@@ -414,6 +414,45 @@ def test_drift_detector_records_repeated_node_pattern(tmp_path):
     )
 
 
+def test_drift_detector_records_semantically_repeated_attempts(tmp_path):
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def edit_a(state):
+        return {"result": "retry edit src/app.py with same patch failure 1"}
+
+    async def edit_b(state):
+        return {"result": "retry edit src/app.py with same patch failure 2"}
+
+    async def edit_c(state):
+        return {"result": "retry edit src/app.py with same patch failure 3"}
+
+    graph.add_node("edit_a", edit_a)
+    graph.add_node("edit_b", edit_b)
+    graph.add_node("edit_c", edit_c)
+    graph.set_entry_point("edit_a")
+    graph.add_edge("edit_a", "edit_b")
+    graph.add_edge("edit_b", "edit_c")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=3,
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke({"run_id": "semantic-drift-run", "goal": "detect repeated attempts"})
+    )
+
+    assert state["__context_drift__"]["drifted"] is True
+    assert any(
+        "similar output summary repeated 3 times" in reason
+        for reason in state["__context_drift__"]["reasons"]
+    )
+
+
 def test_sub_agent_output_is_isolated_until_parent_validation(tmp_path):
     store = ContextLedgerStore(tmp_path)
     orch = Orchestrator()
@@ -438,7 +477,7 @@ def test_sub_agent_output_is_isolated_until_parent_validation(tmp_path):
     assert all(item["verified"] is False for item in child_facts)
 
 
-def test_sub_agent_output_can_be_promoted_with_parent_validation(tmp_path):
+def test_sub_agent_cannot_self_promote_with_parent_validation_flag(tmp_path):
     store = ContextLedgerStore(tmp_path)
     graph = StateGraph()
 
@@ -455,10 +494,41 @@ def test_sub_agent_output_can_be_promoted_with_parent_validation(tmp_path):
     compiled.hooks = HookManager(context_ledger=store)
 
     state = asyncio.run(
-        compiled.ainvoke({"run_id": "validated-child-run", "goal": "promote child"})
+        compiled.ainvoke({"run_id": "self-promote-child-run", "goal": "promote child"})
+    )
+
+    assert state["__evaluation__"]["passed"] is False
+    assert "result" not in state
+
+
+def test_sub_agent_output_can_be_promoted_with_external_parent_validation(tmp_path):
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def child(state):
+        return {"result": "validated child result", "__parent_validated__": True}
+
+    graph.add_node(
+        "child",
+        child,
+        metadata={"is_sub_agent": True, "requires_parent_validation": True},
+    )
+    graph.set_entry_point("child")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(context_ledger=store)
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {
+                "run_id": "validated-child-run",
+                "goal": "promote child",
+                "__parent_validation__": {"child": {"approved": True}},
+            }
+        )
     )
 
     assert state["__evaluation__"]["passed"] is True
+    assert state["result"] == "validated child result"
     persisted = json.loads(store.path_for("validated-child-run").read_text(encoding="utf-8"))
     assert persisted["key_facts"][0]["verified"] is True
 
@@ -502,6 +572,25 @@ def test_context_checkpoint_create_and_restore(tmp_path):
     raw_path = tmp_path / checkpoint.raw_refs[0]
     assert raw_path.exists()
     assert "checkpoint raw" in raw_path.read_text(encoding="utf-8")
+
+
+def test_compressed_memory_raw_ref_can_restore_original_payload(tmp_path):
+    store = ContextLedgerStore(tmp_path, long_text_threshold=80, summary_max_chars=40)
+    original = "compressed memory original payload " + ("x" * 200)
+    store.on_node_end(
+        run_id="raw-restore-run",
+        node="browser",
+        step=1,
+        update={"result": original},
+        state={"run_id": "raw-restore-run", "goal": "restore raw"},
+        verified=True,
+    )
+
+    refs = store.raw_refs_for_run("raw-restore-run")
+
+    assert refs
+    assert original in store.read_raw_ref(refs[0])
+    assert original in store.read_raw_summary("raw-restore-run", 0)
 
 
 def test_context_policy_loads_flat_yaml_and_builds_components(tmp_path):

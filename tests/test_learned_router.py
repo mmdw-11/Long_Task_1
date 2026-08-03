@@ -1,3 +1,5 @@
+import builtins
+
 from engine import (
     AdaptiveResourceScheduler,
     BinaryTextRouterModel,
@@ -89,7 +91,15 @@ def test_render_experiment_report_and_save(tmp_path):
     assert path.exists()
 
 
-def test_bge_m3_encoder_has_clear_missing_dependency_error():
+def test_bge_m3_encoder_has_clear_missing_dependency_error(monkeypatch):
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "FlagEmbedding":
+            raise ImportError("missing FlagEmbedding")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
     encoder = BgeM3Encoder()
     try:
         encoder.encode("hello")

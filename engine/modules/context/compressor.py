@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 
 class ContextCompressor:
@@ -41,6 +41,34 @@ class ContextCompressor:
             "token_count_raw": _rough_token_count(raw),
             "token_count_summary": _rough_token_count(self._summarize(update)),
         }
+
+    def read_raw_ref(self, raw_ref: str) -> str:
+        """Read archived raw payload by the ledger ``raw_ref`` value."""
+        path = self.resolve_raw_ref(raw_ref)
+        return path.read_text(encoding="utf-8")
+
+    def resolve_raw_ref(self, raw_ref: str) -> Path:
+        """Resolve a ledger ``raw_ref`` into a safe archive path."""
+        if not raw_ref:
+            raise ValueError("raw_ref is required")
+        root = self.archive_dir.parent.resolve()
+        path = (root / raw_ref).resolve()
+        if not _is_relative_to(path, root):
+            raise ValueError(f"raw_ref escapes archive root: {raw_ref}")
+        if not path.exists():
+            raise FileNotFoundError(raw_ref)
+        return path
+
+    def raw_refs_for_run(self, run_id: str) -> List[str]:
+        """List archived raw refs for a run."""
+        run_dir = self.archive_dir / _safe_name(run_id)
+        if not run_dir.exists():
+            return []
+        root = self.archive_dir.parent
+        return [
+            str(path.relative_to(root))
+            for path in sorted(run_dir.glob("*.json"))
+        ]
 
     def _archive(self, *, run_id: str, node: str, step: int, raw: str) -> str:
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
@@ -87,3 +115,11 @@ def _rough_token_count(text: str) -> int:
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value) or "item"
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
