@@ -12,6 +12,7 @@ from engine import (
     ContextLedgerStore,
     ContextPolicy,
     DriftDetector,
+    TaskDriftJudgeResult,
     Orchestrator,
 )
 from engine import StateGraph
@@ -502,6 +503,13 @@ def test_drift_detector_records_embedding_goal_divergence(tmp_path):
                 1.0 if any(word in lower for word in ("travel", "hotel", "recipe", "food")) else 0.0,
             ]
 
+    class DriftJudge:
+        def judge(self, original_global_goal, task_plan_list, current_step_content):
+            return TaskDriftJudgeResult(
+                is_task_drift=True,
+                reason="current action is travel planning, not bug fixing",
+            )
+
     store = ContextLedgerStore(tmp_path)
     graph = StateGraph()
 
@@ -521,9 +529,11 @@ def test_drift_detector_records_embedding_goal_divergence(tmp_path):
         drift_detector=DriftDetector(
             repeat_node_limit=0,
             repeated_summary_limit=0,
-            goal_similarity_threshold=0.5,
+            semantic_drift_mode="hybrid",
+            goal_similarity_high_threshold=0.95,
             goal_drift_window=2,
             embedding_model=TinyEmbedding(),
+            task_drift_judge=DriftJudge(),
         ),
     )
 
@@ -538,9 +548,159 @@ def test_drift_detector_records_embedding_goal_divergence(tmp_path):
 
     assert state["__context_drift__"]["drifted"] is True
     assert any(
-        "semantic drift from original goal" in reason
+        "current action is travel planning, not bug fixing" in reason
         for reason in state["__context_drift__"]["reasons"]
     )
+
+
+def test_drift_detector_accepts_legitimate_subtask_from_llm_judge(tmp_path):
+    class OnTaskJudge:
+        def judge(self, original_global_goal, task_plan_list, current_step_content):
+            assert "完成项目代码改造和文档" in original_global_goal
+            assert task_plan_list == ["更新 drift.py", "补充测试", "新增 8.4 文档"]
+            assert "更新 drift.py" in current_step_content
+            return TaskDriftJudgeResult(
+                is_task_drift=False,
+                reason="current action is an expected implementation subtask",
+            )
+
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def update_drift(state):
+        return {"result": "更新 drift.py 中的语义漂移判断逻辑"}
+
+    graph.add_node("update_drift", update_drift)
+    graph.set_entry_point("update_drift")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            semantic_drift_mode="llm",
+            task_drift_judge=OnTaskJudge(),
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {
+                "run_id": "legitimate-subtask-run",
+                "goal": "完成项目代码改造和文档",
+                "current_plan": ["更新 drift.py", "补充测试", "新增 8.4 文档"],
+            }
+        )
+    )
+
+    assert state["__context_drift__"]["drifted"] is False
+
+
+def test_drift_detector_records_llm_task_goal_drift(tmp_path):
+    class OffTaskJudge:
+        def judge(self, original_global_goal, task_plan_list, current_step_content):
+            return TaskDriftJudgeResult(
+                is_task_drift=True,
+                reason="current action is unrelated travel chat",
+            )
+
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def wander(state):
+        return {"result": "写一份周末旅行攻略并闲聊餐厅推荐"}
+
+    graph.add_node("wander", wander)
+    graph.set_entry_point("wander")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            semantic_drift_mode="llm",
+            task_drift_judge=OffTaskJudge(),
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {
+                "run_id": "llm-goal-drift-run",
+                "goal": "修复上下文漂移检测并补充测试",
+                "current_plan": ["改造 drift detector", "补充测试"],
+            }
+        )
+    )
+
+    assert state["__context_drift__"]["drifted"] is True
+    assert any(
+        "current action is unrelated travel chat" in reason
+        for reason in state["__context_drift__"]["reasons"]
+    )
+    persisted = json.loads(store.path_for("llm-goal-drift-run").read_text(encoding="utf-8"))
+    assert any(
+        item["error_type"] == "ContextDrift"
+        for item in persisted["failure_summaries"]
+    )
+
+
+def test_drift_detector_hybrid_high_similarity_skips_llm_judge(tmp_path):
+    class SameEmbedding:
+        def embed(self, text):
+            return [1.0, 0.0]
+
+    class CountingJudge:
+        def __init__(self):
+            self.calls = 0
+
+        def judge(self, original_global_goal, task_plan_list, current_step_content):
+            self.calls += 1
+            return TaskDriftJudgeResult(
+                is_task_drift=True,
+                reason="should not be called",
+            )
+
+    judge = CountingJudge()
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def worker(state):
+        return {"result": "修复上下文漂移检测测试"}
+
+    graph.add_node("worker", worker)
+    graph.set_entry_point("worker")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            semantic_drift_mode="hybrid",
+            goal_similarity_high_threshold=0.85,
+            embedding_model=SameEmbedding(),
+            task_drift_judge=judge,
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {"run_id": "hybrid-high-sim-run", "goal": "修复上下文漂移检测测试"}
+        )
+    )
+
+    assert state["__context_drift__"]["drifted"] is False
+    assert judge.calls == 0
+
+
+def test_task_drift_judge_invalid_json_is_not_drift():
+    from engine.modules.context.drift import _parse_task_drift_judge_result
+
+    result = _parse_task_drift_judge_result("not json")
+
+    assert result.is_task_drift is False
+    assert "invalid JSON" in result.reason
+    assert result.raw == "not json"
 
 
 def test_sub_agent_output_is_isolated_until_parent_validation(tmp_path):
@@ -694,6 +854,10 @@ def test_context_policy_loads_flat_yaml_and_builds_components(tmp_path):
                 "long_text_threshold: 80",
                 "summary_max_chars: 40",
                 "repeat_node_limit: 2",
+                "semantic_drift_mode: hybrid",
+                "goal_similarity_high_threshold: 0.9",
+                "goal_similarity_low_threshold: 0.2",
+                "semantic_drift_cache_enabled: false",
             ]
         ),
         encoding="utf-8",
@@ -703,6 +867,15 @@ def test_context_policy_loads_flat_yaml_and_builds_components(tmp_path):
     assert policy.max_context_tokens == 20
     assert policy.memory_top_k == 2
     assert policy.repeat_node_limit == 2
+    assert policy.semantic_drift_mode == "hybrid"
+    assert policy.goal_similarity_high_threshold == 0.9
+    assert policy.goal_similarity_low_threshold == 0.2
+    assert policy.semantic_drift_cache_enabled is False
+    detector = policy.build_drift_detector()
+    assert detector.semantic_drift_mode == "hybrid"
+    assert detector.goal_similarity_high_threshold == 0.9
+    assert detector.goal_similarity_low_threshold == 0.2
+    assert detector.semantic_drift_cache_enabled is False
 
     orch = Orchestrator()
     orch.set_context_policy(policy, ledger_root=str(tmp_path / "context"))
@@ -719,3 +892,40 @@ def test_context_policy_loads_flat_yaml_and_builds_components(tmp_path):
     )
 
     assert state[RUN_STATUS_KEY] == BUDGET_PAUSED
+
+
+def test_orchestrator_context_policy_auto_wires_task_drift_judge(monkeypatch, tmp_path):
+    import engine.orchestrator as orchestrator_module
+
+    class FakeOpenAITaskDriftJudge:
+        pass
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "OpenAITaskDriftJudge",
+        FakeOpenAITaskDriftJudge,
+    )
+    monkeypatch.setenv("TASK_DRIFT_BASE_URL", "http://127.0.0.1:8000/v1")
+    policy = ContextPolicy(semantic_drift_mode="llm")
+
+    orch = Orchestrator()
+    orch.set_context_policy(policy, ledger_root=str(tmp_path / "context"))
+
+    assert isinstance(orch._drift_detector.task_drift_judge, FakeOpenAITaskDriftJudge)
+
+
+def test_orchestrator_context_policy_leaves_task_drift_judge_unset_without_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    for key in (
+        "TASK_DRIFT_API_KEY",
+        "TASK_DRIFT_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    policy = ContextPolicy(semantic_drift_mode="llm")
+
+    orch = Orchestrator()
+    orch.set_context_policy(policy, ledger_root=str(tmp_path / "context"))
+
+    assert orch._drift_detector.task_drift_judge is None

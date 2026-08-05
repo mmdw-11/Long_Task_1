@@ -25,7 +25,14 @@ from .injector import (
     ContextInjection,
     ContextInjector,
 )
-from .drift import DRIFT_RESULT_KEY, DriftDetector, DriftResult
+from .drift import (
+    DRIFT_RESULT_KEY,
+    DriftDetector,
+    DriftResult,
+    OpenAITaskDriftJudge,
+    TaskDriftJudge,
+    TaskDriftJudgeResult,
+)
 from .checkpoint import ContextCheckpoint, ContextCheckpointStore
 from .policy import ContextPolicy
 
@@ -52,6 +59,9 @@ __all__ = [
     "DRIFT_RESULT_KEY",
     "DriftDetector",
     "DriftResult",
+    "OpenAITaskDriftJudge",
+    "TaskDriftJudge",
+    "TaskDriftJudgeResult",
     "ContextCheckpoint",
     "ContextCheckpointStore",
     "ContextPolicy",

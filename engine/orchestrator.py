@@ -20,8 +20,10 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .constants import END, START
@@ -36,6 +38,7 @@ from .modules.context import (
     ContextInjector,
     ContextLedgerStore,
     ContextPolicy,
+    OpenAITaskDriftJudge,
 )
 from .modules.flow import FlowController
 from .modules.memory import MemoryStore
@@ -95,6 +98,39 @@ class Connection:
 
 # 节点工厂签名：依据 AgentSpec 生成图节点可调用体。
 NodeFactory = Callable[[AgentSpec], Node]
+
+
+def _load_dotenv_for_context_policy() -> None:
+    if os.environ.get("AGENT_GRAPH_LOAD_DOTENV") == "0":
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+        return
+    except Exception:
+        pass
+    env_path = _find_dotenv()
+    if env_path is None:
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _find_dotenv() -> Optional[Path]:
+    current = Path.cwd()
+    for path in [current, *current.parents]:
+        candidate = path / ".env"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def echo_node_factory(spec: AgentSpec) -> Node:
@@ -222,10 +258,13 @@ class Orchestrator:
         ledger_root: str = "runs/context",
     ) -> None:
         """Apply a context-management policy."""
+        _load_dotenv_for_context_policy()
         self._context_ledger = policy.build_ledger_store(ledger_root)
         self._context_budget = policy.build_budget_controller()
         self._context_injector = policy.build_injector()
-        self._drift_detector = policy.build_drift_detector()
+        self._drift_detector = policy.build_drift_detector(
+            task_drift_judge=self._build_task_drift_judge(policy)
+        )
         self._memory_top_k = policy.memory_top_k
 
     def set_project_rules(self, rules: Dict[str, Any]) -> None:
@@ -537,6 +576,21 @@ class Orchestrator:
         if self._evaluator is not None:
             kwargs["evaluator"] = self._evaluator
         return HookManager(**kwargs)
+
+    @staticmethod
+    def _build_task_drift_judge(policy: ContextPolicy):
+        mode = (policy.semantic_drift_mode or "off").lower()
+        if mode not in {"llm", "hybrid"}:
+            return None
+        config_keys = (
+            "TASK_DRIFT_API_KEY",
+            "TASK_DRIFT_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+        )
+        if not any(os.environ.get(key) for key in config_keys):
+            return None
+        return OpenAITaskDriftJudge()
 
     def _require(self, agent_id: str) -> None:
         if agent_id not in self._agents:

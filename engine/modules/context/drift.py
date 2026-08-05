@@ -1,7 +1,10 @@
-"""Rule-based context drift detection."""
+"""Rule and LLM-assisted context drift detection."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass, field
 import re
 from typing import Any, Dict, List, Optional, Protocol, Sequence
@@ -18,18 +21,112 @@ class EmbeddingModel(Protocol):
 
 
 @dataclass
+class TaskDriftJudgeResult:
+    """LLM decision for whether the current action has left the task goal."""
+
+    is_task_drift: bool
+    reason: str
+    raw: str = ""
+
+
+class TaskDriftJudge(Protocol):
+    """Protocol for model-based task-goal drift judges."""
+
+    def judge(
+        self,
+        original_global_goal: str,
+        task_plan_list: List[str],
+        current_step_content: str,
+    ) -> TaskDriftJudgeResult:
+        raise NotImplementedError
+
+
+class OpenAITaskDriftJudge:
+    """OpenAI-compatible LLM judge for task-goal semantic drift."""
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> None:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "Using OpenAITaskDriftJudge requires openai. Install with: pip install openai"
+            ) from exc
+
+        resolved_api_key = (
+            api_key
+            or os.environ.get("TASK_DRIFT_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        resolved_base_url = (
+            base_url
+            or os.environ.get("TASK_DRIFT_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        )
+        if not resolved_api_key and resolved_base_url:
+            resolved_api_key = "not-needed"
+        self._client = OpenAI(
+            api_key=resolved_api_key,
+            base_url=resolved_base_url,
+        )
+        self._model = (
+            model
+            or os.environ.get("TASK_DRIFT_MODEL")
+            or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        )
+        self._temperature = temperature
+
+    def judge(
+        self,
+        original_global_goal: str,
+        task_plan_list: List[str],
+        current_step_content: str,
+    ) -> TaskDriftJudgeResult:
+        prompt = _build_task_drift_prompt(
+            original_global_goal=original_global_goal,
+            task_plan_list=task_plan_list,
+            current_step_content=current_step_content,
+        )
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You judge whether an agent action is off-task. "
+                        "Return only a JSON object."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=self._temperature,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content or ""
+        return _parse_task_drift_judge_result(content)
+
+
+@dataclass
 class DriftResult:
     """Detected drift state for a run."""
 
     drifted: bool
     reasons: List[str] = field(default_factory=list)
     severity: str = "none"
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "drifted": self.drifted,
             "reasons": list(self.reasons),
             "severity": self.severity,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -52,8 +149,13 @@ class DriftDetector:
         repeated_tool_limit: int = 0,
         repeated_file_operation_limit: int = 3,
         goal_similarity_threshold: float = 0.0,
+        goal_similarity_high_threshold: float = 0.85,
+        goal_similarity_low_threshold: float = 0.35,
         goal_drift_window: int = 2,
+        semantic_drift_mode: str = "off",
+        semantic_drift_cache_enabled: bool = True,
         embedding_model: Optional[EmbeddingModel] = None,
+        task_drift_judge: Optional[TaskDriftJudge] = None,
     ) -> None:
         self.repeat_node_limit = repeat_node_limit
         self.pending_step_limit = pending_step_limit
@@ -63,11 +165,18 @@ class DriftDetector:
         self.repeated_tool_limit = repeated_tool_limit
         self.repeated_file_operation_limit = repeated_file_operation_limit
         self.goal_similarity_threshold = goal_similarity_threshold
+        self.goal_similarity_high_threshold = goal_similarity_high_threshold
+        self.goal_similarity_low_threshold = goal_similarity_low_threshold
         self.goal_drift_window = goal_drift_window
+        self.semantic_drift_mode = semantic_drift_mode
+        self.semantic_drift_cache_enabled = semantic_drift_cache_enabled
         self.embedding_model = embedding_model
+        self.task_drift_judge = task_drift_judge
+        self._semantic_cache: Dict[str, TaskDriftJudgeResult] = {}
 
     def detect(self, ledger: ContextLedger, *, current_node: str = "") -> DriftResult:
         reasons: List[str] = []
+        metadata: Dict[str, Any] = {}
         if current_node and self.repeat_node_limit > 0:
             recent = ledger.completed_steps[-self.repeat_node_limit :]
             recent_nodes = [item.split(":", 1)[1] for item in recent if ":" in item]
@@ -121,23 +230,104 @@ class DriftDetector:
                 reasons.append(
                     f"similar file operation repeated {self.repeated_file_operation_limit} times: {repeated_file}"
                 )
-        if (
-            self.embedding_model is not None
-            and self.goal_similarity_threshold > 0
-            and ledger.original_goal.strip()
-        ):
-            goal_drift = _goal_embedding_drift(
+        goal_drift = self._detect_task_goal_drift(ledger, metadata=metadata)
+        if goal_drift:
+            reasons.append(goal_drift)
+        severity = "none"
+        if reasons:
+            severity = "medium" if len(reasons) == 1 else "high"
+        return DriftResult(
+            drifted=bool(reasons),
+            reasons=reasons,
+            severity=severity,
+            metadata=metadata,
+        )
+
+    def _detect_task_goal_drift(
+        self,
+        ledger: ContextLedger,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        metadata = metadata if metadata is not None else {}
+        mode = (self.semantic_drift_mode or "off").lower()
+        metadata["semantic_drift_mode"] = mode
+        metadata["task_drift_judge"] = (
+            type(self.task_drift_judge).__name__ if self.task_drift_judge is not None else None
+        )
+        if mode == "off" or not ledger.original_goal.strip():
+            return ""
+
+        if mode == "embedding":
+            if self.embedding_model is None or self.goal_similarity_threshold <= 0:
+                return ""
+            return _goal_embedding_drift(
                 ledger,
                 embedding_model=self.embedding_model,
                 threshold=self.goal_similarity_threshold,
                 window=self.goal_drift_window,
             )
-            if goal_drift:
-                reasons.append(goal_drift)
-        severity = "none"
-        if reasons:
-            severity = "medium" if len(reasons) == 1 else "high"
-        return DriftResult(drifted=bool(reasons), reasons=reasons, severity=severity)
+
+        current_step_content = _current_step_content(ledger, window=self.goal_drift_window)
+        metadata["current_step_content"] = _clip(current_step_content, limit=240)
+        if not current_step_content.strip():
+            return ""
+
+        if mode == "hybrid" and self.embedding_model is not None:
+            score = _best_goal_similarity(
+                ledger.original_goal,
+                current_step_content,
+                embedding_model=self.embedding_model,
+            )
+            metadata["goal_similarity_score"] = score
+            if score >= self.goal_similarity_high_threshold:
+                return ""
+
+        if mode not in {"llm", "hybrid"} or self.task_drift_judge is None:
+            return ""
+
+        result = self._judge_task_drift(
+            original_global_goal=ledger.original_goal,
+            task_plan_list=list(ledger.current_plan),
+            current_step_content=current_step_content,
+        )
+        metadata["task_drift_judge_result"] = {
+            "is_task_drift": result.is_task_drift,
+            "reason": result.reason,
+        }
+        if result.is_task_drift:
+            reason = _clip(result.reason or "LLM judged current action off task")
+            return f"semantic drift from task goal: {reason}"
+        return ""
+
+    def _judge_task_drift(
+        self,
+        *,
+        original_global_goal: str,
+        task_plan_list: List[str],
+        current_step_content: str,
+    ) -> TaskDriftJudgeResult:
+        cache_key = _semantic_cache_key(
+            original_global_goal,
+            task_plan_list,
+            current_step_content,
+        )
+        if self.semantic_drift_cache_enabled and cache_key in self._semantic_cache:
+            return self._semantic_cache[cache_key]
+        try:
+            result = self.task_drift_judge.judge(
+                original_global_goal,
+                task_plan_list,
+                current_step_content,
+            )
+        except Exception as exc:  # noqa: BLE001 - drift detection must not kill the run
+            result = TaskDriftJudgeResult(
+                is_task_drift=False,
+                reason=f"task drift judge failed: {exc}",
+            )
+        if self.semantic_drift_cache_enabled:
+            self._semantic_cache[cache_key] = result
+        return result
 
 
 def _recent_repeated_summary(summaries: List[ToolSummary], *, limit: int) -> str:
@@ -209,6 +399,23 @@ def _goal_embedding_drift(
     return ""
 
 
+def _best_goal_similarity(
+    goal: str,
+    current_step_content: str,
+    *,
+    embedding_model: EmbeddingModel,
+) -> float:
+    goal_vector = embedding_model.embed(goal)
+    return _cosine_similarity(goal_vector, embedding_model.embed(current_step_content))
+
+
+def _current_step_content(ledger: ContextLedger, *, window: int) -> str:
+    candidates = _recent_goal_candidates(ledger, window=max(1, window))
+    if not candidates:
+        return ""
+    return "\n".join(item for item in candidates if item.strip())
+
+
 def _recent_goal_candidates(ledger: ContextLedger, *, window: int) -> List[str]:
     candidates: List[str] = []
     for summary in ledger.tool_summaries[-window:]:
@@ -219,6 +426,75 @@ def _recent_goal_candidates(ledger: ContextLedger, *, window: int) -> List[str]:
     if len(candidates) < window:
         candidates.extend(ledger.pending_steps[-(window - len(candidates)) :])
     return candidates
+
+
+def _build_task_drift_prompt(
+    *,
+    original_global_goal: str,
+    task_plan_list: List[str],
+    current_step_content: str,
+) -> str:
+    plan_text = "\n".join(f"- {item}" for item in task_plan_list) or "- None"
+    return (
+        "【整体顶层任务目标】\n"
+        f"{original_global_goal}\n"
+        "【前期整体任务拆解规划步骤】\n"
+        f"{plan_text}\n"
+        "【当前Agent正在执行的动作、输出内容】\n"
+        f"{current_step_content}\n\n"
+        "请你只输出JSON格式：\n"
+        '{"is_task_drift": bool, "reason": "简短原因说明"}\n'
+        "规则：\n"
+        "1. 如果当前动作属于整体规划内的子步骤、正常任务拆解工作，is_task_drift=false\n"
+        "2. 如果当前动作完全脱离主线目标、开始做无关工作、发散闲聊、偏离业务主线，is_task_drift=true\n"
+        "3. 只判断是否脱离任务主线，不判断细节实现是否正确\n"
+    )
+
+
+def _parse_task_drift_judge_result(text: str) -> TaskDriftJudgeResult:
+    try:
+        data = _parse_json_object(text)
+    except json.JSONDecodeError:
+        return TaskDriftJudgeResult(
+            is_task_drift=False,
+            reason="task drift judge returned invalid JSON",
+            raw=text,
+        )
+    return TaskDriftJudgeResult(
+        is_task_drift=bool(data.get("is_task_drift", False)),
+        reason=str(data.get("reason", "")),
+        raw=text,
+    )
+
+
+def _parse_json_object(text: str) -> Dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end >= start:
+        stripped = stripped[start : end + 1]
+    return json.loads(stripped or "{}")
+
+
+def _semantic_cache_key(
+    original_global_goal: str,
+    task_plan_list: List[str],
+    current_step_content: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "goal": original_global_goal,
+            "plan": task_plan_list,
+            "current": current_step_content,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _summary_fingerprint(text: str) -> str:

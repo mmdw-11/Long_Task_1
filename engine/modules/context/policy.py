@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .budget import ContextBudgetController
-from .drift import DriftDetector
+from .drift import DriftDetector, EmbeddingModel, TaskDriftJudge
 from .injector import ContextInjector
 from .ledger import ContextLedgerStore
 
@@ -34,7 +34,11 @@ class ContextPolicy:
     repeated_tool_limit: int = 0
     repeated_file_operation_limit: int = 3
     goal_similarity_threshold: float = 0.0
+    goal_similarity_high_threshold: float = 0.85
+    goal_similarity_low_threshold: float = 0.35
     goal_drift_window: int = 2
+    semantic_drift_mode: str = "off"
+    semantic_drift_cache_enabled: bool = True
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ContextPolicy":
@@ -67,7 +71,11 @@ class ContextPolicy:
             "repeated_tool_limit": self.repeated_tool_limit,
             "repeated_file_operation_limit": self.repeated_file_operation_limit,
             "goal_similarity_threshold": self.goal_similarity_threshold,
+            "goal_similarity_high_threshold": self.goal_similarity_high_threshold,
+            "goal_similarity_low_threshold": self.goal_similarity_low_threshold,
             "goal_drift_window": self.goal_drift_window,
+            "semantic_drift_mode": self.semantic_drift_mode,
+            "semantic_drift_cache_enabled": self.semantic_drift_cache_enabled,
         }
 
     def build_ledger_store(self, root_dir: str | Path) -> ContextLedgerStore:
@@ -91,7 +99,12 @@ class ContextPolicy:
             max_unverified=self.max_unverified,
         )
 
-    def build_drift_detector(self) -> DriftDetector:
+    def build_drift_detector(
+        self,
+        *,
+        embedding_model: Optional[EmbeddingModel] = None,
+        task_drift_judge: Optional[TaskDriftJudge] = None,
+    ) -> DriftDetector:
         return DriftDetector(
             repeat_node_limit=self.repeat_node_limit,
             pending_step_limit=self.pending_step_limit,
@@ -101,7 +114,13 @@ class ContextPolicy:
             repeated_tool_limit=self.repeated_tool_limit,
             repeated_file_operation_limit=self.repeated_file_operation_limit,
             goal_similarity_threshold=self.goal_similarity_threshold,
+            goal_similarity_high_threshold=self.goal_similarity_high_threshold,
+            goal_similarity_low_threshold=self.goal_similarity_low_threshold,
             goal_drift_window=self.goal_drift_window,
+            semantic_drift_mode=self.semantic_drift_mode,
+            semantic_drift_cache_enabled=self.semantic_drift_cache_enabled,
+            embedding_model=embedding_model,
+            task_drift_judge=task_drift_judge,
         )
 
 
