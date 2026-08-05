@@ -397,6 +397,7 @@ class CompiledGraph:
                             recovery_targets.append(tgt)
                     yield {"type": "node_end", "node": name, "update": {FAILURES_KEY: [rec.to_dict()]}}
                     continue
+                update = _sanitize_node_update(update)
                 pre_update_state = state.snapshot()
                 end_state = copy.deepcopy(pre_update_state)
                 for key in (
@@ -537,3 +538,14 @@ class CompiledGraph:
 
     def to_dict(self) -> Dict[str, Any]:
         return self._builder.to_dict()
+
+
+def _sanitize_node_update(update: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Drop deprecated self-attested validation markers from node output."""
+    if not isinstance(update, dict):
+        return update
+    if "__parent_validated__" not in update:
+        return update
+    sanitized = dict(update)
+    sanitized.pop("__parent_validated__", None)
+    return sanitized

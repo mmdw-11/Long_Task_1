@@ -958,6 +958,7 @@ def test_sub_agent_output_can_be_promoted_with_external_parent_validation(tmp_pa
 
     assert state["__evaluation__"]["passed"] is True
     assert state["result"] == "validated child result"
+    assert "__parent_validated__" not in state
     persisted = json.loads(store.path_for("validated-child-run").read_text(encoding="utf-8"))
     assert persisted["key_facts"][0]["verified"] is True
 
