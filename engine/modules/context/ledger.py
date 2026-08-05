@@ -16,6 +16,7 @@ from ._types import (
 )
 from .renderer import ContextLedgerRenderer
 from .compressor import ContextCompressor
+from .todo import TodoManager
 
 
 class ContextLedgerStore:
@@ -34,6 +35,7 @@ class ContextLedgerStore:
         max_key_facts: int = 200,
         max_tool_summaries: int = 200,
         max_failures: int = 100,
+        max_todo_events: int = 100,
         long_text_threshold: int = 2000,
         summary_max_chars: int = 600,
         memory_filename: str = "MEMORY.md",
@@ -45,6 +47,7 @@ class ContextLedgerStore:
         self.max_key_facts = max_key_facts
         self.max_tool_summaries = max_tool_summaries
         self.max_failures = max_failures
+        self.max_todo_events = max_todo_events
         self.summary_max_chars = summary_max_chars
         self.memory_filename = memory_filename
         self.renderer = renderer or ContextLedgerRenderer()
@@ -57,12 +60,15 @@ class ContextLedgerStore:
     def load_or_create(self, run_id: str, initial_state: Optional[Dict[str, Any]] = None) -> ContextLedger:
         path = self.path_for(run_id)
         if path.exists():
-            return ContextLedger.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            ledger = ContextLedger.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            TodoManager(ledger).ensure_initialized()
+            return ledger
         ledger = self._new_ledger(run_id, initial_state or {})
         self.save(ledger)
         return ledger
 
     def save(self, ledger: ContextLedger) -> None:
+        TodoManager(ledger).ensure_initialized()
         ledger.touch()
         path = self.path_for(ledger.run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +114,7 @@ class ContextLedgerStore:
         state: Dict[str, Any],
     ) -> ContextLedger:
         ledger = self.load_or_create(run_id, state)
+        TodoManager(ledger).ensure_initialized()
         ledger.next_action = f"step {step}: execute {', '.join(frontier)}"
         existing_pending = set(ledger.pending_steps)
         for node in frontier:
@@ -128,6 +135,7 @@ class ContextLedgerStore:
         verified: bool = False,
     ) -> ContextLedger:
         ledger = self.load_or_create(run_id, state)
+        TodoManager(ledger).ensure_initialized()
         label = f"{step}:{node}"
         if label not in ledger.completed_steps:
             ledger.completed_steps.append(label)
@@ -179,6 +187,7 @@ class ContextLedgerStore:
         recoverable: bool = False,
     ) -> ContextLedger:
         ledger = self.load_or_create(run_id, state)
+        TodoManager(ledger).ensure_initialized()
         ledger.failure_summaries.append(
             FailureSummary(
                 node=node,
@@ -202,12 +211,14 @@ class ContextLedgerStore:
             or []
         )
         plan = _coerce_str_list(state.get("current_plan") or state.get("plan") or [])
-        return ContextLedger(
+        ledger = ContextLedger(
             run_id=run_id,
             original_goal=self._clip(self._stringify(goal)) if goal is not None else "",
             hard_constraints=constraints,
             current_plan=plan,
         )
+        TodoManager(ledger).ensure_initialized()
+        return ledger
 
     def _append_unique_fact(self, ledger: ContextLedger, fact: ContextFact) -> None:
         seen = {(item.text, item.node, item.step) for item in ledger.key_facts}
@@ -221,6 +232,7 @@ class ContextLedgerStore:
         ledger.key_facts = ledger.key_facts[-self.max_key_facts :]
         ledger.tool_summaries = ledger.tool_summaries[-self.max_tool_summaries :]
         ledger.failure_summaries = ledger.failure_summaries[-self.max_failures :]
+        ledger.todo_events = ledger.todo_events[-self.max_todo_events :]
 
     def _clip(self, text: str) -> str:
         if len(text) <= self.summary_max_chars:

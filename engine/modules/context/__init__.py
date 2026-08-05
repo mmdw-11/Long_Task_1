@@ -6,9 +6,12 @@ from ._types import (
     ContextFact,
     ContextLedger,
     FailureSummary,
+    TodoEvent,
+    TodoItem,
     ToolSummary,
 )
 from .ledger import ContextLedgerStore
+from .todo import TodoManager
 from .renderer import ContextLedgerRenderer
 from .budget import (
     BUDGET_PAUSED,
@@ -44,6 +47,9 @@ __all__ = [
     "ContextLedgerStore",
     "ContextLedgerRenderer",
     "FailureSummary",
+    "TodoEvent",
+    "TodoItem",
+    "TodoManager",
     "ToolSummary",
     "BUDGET_PAUSED",
     "PAUSE_REASON_KEY",

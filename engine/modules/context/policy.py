@@ -39,6 +39,7 @@ class ContextPolicy:
     goal_drift_window: int = 2
     semantic_drift_mode: str = "off"
     semantic_drift_cache_enabled: bool = True
+    todo_update_mode: str = "suggest"
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ContextPolicy":
@@ -76,6 +77,7 @@ class ContextPolicy:
             "goal_drift_window": self.goal_drift_window,
             "semantic_drift_mode": self.semantic_drift_mode,
             "semantic_drift_cache_enabled": self.semantic_drift_cache_enabled,
+            "todo_update_mode": self.todo_update_mode,
         }
 
     def build_ledger_store(self, root_dir: str | Path) -> ContextLedgerStore:
@@ -119,6 +121,7 @@ class ContextPolicy:
             goal_drift_window=self.goal_drift_window,
             semantic_drift_mode=self.semantic_drift_mode,
             semantic_drift_cache_enabled=self.semantic_drift_cache_enabled,
+            todo_update_mode=self.todo_update_mode,
             embedding_model=embedding_model,
             task_drift_judge=task_drift_judge,
         )

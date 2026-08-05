@@ -13,6 +13,7 @@ from engine import (
     ContextPolicy,
     DriftDetector,
     TaskDriftJudgeResult,
+    TodoManager,
     Orchestrator,
 )
 from engine import StateGraph
@@ -36,11 +37,74 @@ def test_context_ledger_initializes_from_run_state(tmp_path):
     assert ledger.original_goal == "finish the long task"
     assert ledger.hard_constraints == ["do not leak secrets"]
     assert ledger.current_plan == ["step one", "step two"]
+    assert [item.content for item in ledger.todo_items] == ["step one", "step two"]
+    assert ledger.todo_items[0].status == "in_progress"
+    assert ledger.active_todo_id == "todo-1"
     assert store.path_for("run-1").exists()
     memory_text = store.memory_path_for("run-1").read_text(encoding="utf-8")
     assert "## Original Goal" in memory_text
+    assert "## Todos" in memory_text
     assert "finish the long task" in memory_text
     assert "do not leak secrets" in memory_text
+
+
+def test_todo_manager_mutates_todos_with_audit(tmp_path):
+    store = ContextLedgerStore(tmp_path)
+    ledger = store.load_or_create(
+        "todo-run",
+        {
+            "goal": "ship feature",
+            "current_plan": ["inspect code", "implement change"],
+        },
+    )
+    manager = TodoManager(ledger)
+
+    manager.insert_todo("write tests", after_id="todo-1", reason="coverage needed")
+    manager.replace_todo("todo-2", "write focused tests", reason="be specific")
+    manager.update_todo_status("todo-1", "completed", evidence="inspection done")
+    manager.select_active_todo("todo-2", reason="test next")
+    manager.cancel_todo("todo-3", reason="covered elsewhere")
+
+    assert ledger.todo_revision == 5
+    assert ledger.active_todo_id == "todo-2"
+    assert ledger.todo_items[0].status == "completed"
+    by_id = {item.id: item for item in ledger.todo_items}
+    assert by_id["todo-2"].content == "write focused tests"
+    assert by_id["todo-3"].status == "cancelled"
+    assert len(ledger.todo_events) == 5
+    assert "write focused tests" in ledger.current_plan
+
+
+def test_todo_manager_rejects_invalid_updates_and_normalizes_active(tmp_path):
+    store = ContextLedgerStore(tmp_path)
+    ledger = store.load_or_create(
+        "todo-invalid-run",
+        {
+            "goal": "ship feature",
+            "current_plan": ["inspect code", "implement change"],
+        },
+    )
+    manager = TodoManager(ledger)
+
+    try:
+        manager.update_todo_status("todo-1", "unknown")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid status should fail")
+
+    try:
+        manager.replace_todo("missing", "new content")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("unknown todo id should fail")
+
+    ledger.todo_items[1].status = "in_progress"
+    manager.select_active_todo("todo-1")
+
+    assert ledger.active_todo_id == "todo-1"
+    assert [item.status for item in ledger.todo_items].count("in_progress") == 1
 
 
 def test_context_ledger_records_node_completion_and_facts(tmp_path):
@@ -246,6 +310,7 @@ def test_context_injector_adds_goal_constraints_and_fact_boundaries(tmp_path):
         {
             "goal": "complete the report",
             "hard_constraints": ["never omit tests"],
+            "current_plan": ["draft final section", "run review"],
         },
     )
     ledger.key_facts.append(
@@ -289,6 +354,9 @@ def test_context_injector_adds_goal_constraints_and_fact_boundaries(tmp_path):
     assert injection["current_node_role"] == "writer node"
     assert injection["current_step_objective"] == "draft final section"
     assert injection["expected_output_contract"] == "return markdown"
+    assert injection["active_todo"] == "todo-1 [in_progress] draft final section"
+    assert "todo-2 [pending] run review" in injection["adjacent_todos"]
+    assert "Work on the active todo" in injection["todo_policy"]
     assert injection["verified_facts"] == ["database migration passed"]
     assert injection["things_not_to_assume"] == ["browser result may be stale"]
     assert "Original Goal: complete the report" in state["worker"]
@@ -645,6 +713,117 @@ def test_drift_detector_records_llm_task_goal_drift(tmp_path):
     )
 
 
+def test_todo_update_needed_records_suggestion_without_drift(tmp_path):
+    class UpdateNeededJudge:
+        def judge(self, original_global_goal, task_plan_list, current_step_content):
+            assert any("[ACTIVE]" in item for item in task_plan_list)
+            return TaskDriftJudgeResult(
+                is_task_drift=False,
+                reason="plan needs a missing test step",
+                decision="todo_update_needed",
+                todo_updates=[
+                    {
+                        "action": "insert",
+                        "todo_id": "todo-1",
+                        "content": "write tests",
+                        "reason": "coverage gap",
+                    }
+                ],
+            )
+
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def worker(state):
+        return {"result": "noticed missing tests before implementation"}
+
+    graph.add_node("worker", worker)
+    graph.set_entry_point("worker")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            semantic_drift_mode="llm",
+            task_drift_judge=UpdateNeededJudge(),
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {
+                "run_id": "todo-suggest-run",
+                "goal": "ship the feature safely",
+                "current_plan": ["inspect code", "implement change"],
+            }
+        )
+    )
+
+    assert state["__context_drift__"]["drifted"] is False
+    assert state["__context_drift__"]["metadata"]["task_drift_judge_result"]["decision"] == "todo_update_needed"
+    persisted = json.loads(store.path_for("todo-suggest-run").read_text(encoding="utf-8"))
+    assert any("TodoUpdateSuggested" in item for item in persisted["open_questions"])
+    assert [item["content"] for item in persisted["todo_items"]] == ["inspect code", "implement change"]
+
+
+def test_todo_update_auto_applies_restricted_updates(tmp_path):
+    class AutoUpdateJudge:
+        def judge(self, original_global_goal, task_plan_list, current_step_content):
+            return TaskDriftJudgeResult(
+                is_task_drift=False,
+                reason="tests should be inserted before implementation",
+                decision="todo_update_needed",
+                todo_updates=[
+                    {
+                        "action": "insert",
+                        "todo_id": "todo-1",
+                        "content": "write tests",
+                        "reason": "coverage gap",
+                    }
+                ],
+            )
+
+    store = ContextLedgerStore(tmp_path)
+    graph = StateGraph()
+
+    async def worker(state):
+        return {"result": "noticed missing tests before implementation"}
+
+    graph.add_node("worker", worker)
+    graph.set_entry_point("worker")
+    compiled = graph.compile()
+    compiled.hooks = HookManager(
+        context_ledger=store,
+        drift_detector=DriftDetector(
+            repeat_node_limit=0,
+            repeated_summary_limit=0,
+            semantic_drift_mode="llm",
+            todo_update_mode="auto",
+            task_drift_judge=AutoUpdateJudge(),
+        ),
+    )
+
+    state = asyncio.run(
+        compiled.ainvoke(
+            {
+                "run_id": "todo-auto-run",
+                "goal": "ship the feature safely",
+                "current_plan": ["inspect code", "implement change"],
+            }
+        )
+    )
+
+    assert state["__context_drift__"]["drifted"] is False
+    persisted = json.loads(store.path_for("todo-auto-run").read_text(encoding="utf-8"))
+    assert [item["content"] for item in persisted["todo_items"]] == [
+        "inspect code",
+        "write tests",
+        "implement change",
+    ]
+    assert persisted["todo_events"][-1]["action"] == "insert"
+
+
 def test_drift_detector_hybrid_high_similarity_skips_llm_judge(tmp_path):
     class SameEmbedding:
         def embed(self, text):
@@ -858,6 +1037,7 @@ def test_context_policy_loads_flat_yaml_and_builds_components(tmp_path):
                 "goal_similarity_high_threshold: 0.9",
                 "goal_similarity_low_threshold: 0.2",
                 "semantic_drift_cache_enabled: false",
+                "todo_update_mode: auto",
             ]
         ),
         encoding="utf-8",
@@ -871,11 +1051,13 @@ def test_context_policy_loads_flat_yaml_and_builds_components(tmp_path):
     assert policy.goal_similarity_high_threshold == 0.9
     assert policy.goal_similarity_low_threshold == 0.2
     assert policy.semantic_drift_cache_enabled is False
+    assert policy.todo_update_mode == "auto"
     detector = policy.build_drift_detector()
     assert detector.semantic_drift_mode == "hybrid"
     assert detector.goal_similarity_high_threshold == 0.9
     assert detector.goal_similarity_low_threshold == 0.2
     assert detector.semantic_drift_cache_enabled is False
+    assert detector.todo_update_mode == "auto"
 
     orch = Orchestrator()
     orch.set_context_policy(policy, ledger_root=str(tmp_path / "context"))

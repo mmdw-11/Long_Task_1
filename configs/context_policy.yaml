@@ -7,3 +7,4 @@ repeated_tool_limit: 0
 repeated_file_operation_limit: 3
 semantic_drift_mode: llm
 semantic_drift_cache_enabled: true
+todo_update_mode: suggest

@@ -27,6 +27,15 @@ class TaskDriftJudgeResult:
     is_task_drift: bool
     reason: str
     raw: str = ""
+    decision: str = ""
+    todo_updates: List[Dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.decision:
+            self.decision = "drifted" if self.is_task_drift else "on_track"
+        if self.decision not in {"on_track", "todo_update_needed", "drifted"}:
+            self.decision = "drifted" if self.is_task_drift else "on_track"
+        self.is_task_drift = self.decision == "drifted"
 
 
 class TaskDriftJudge(Protocol):
@@ -154,6 +163,7 @@ class DriftDetector:
         goal_drift_window: int = 2,
         semantic_drift_mode: str = "off",
         semantic_drift_cache_enabled: bool = True,
+        todo_update_mode: str = "suggest",
         embedding_model: Optional[EmbeddingModel] = None,
         task_drift_judge: Optional[TaskDriftJudge] = None,
     ) -> None:
@@ -170,6 +180,7 @@ class DriftDetector:
         self.goal_drift_window = goal_drift_window
         self.semantic_drift_mode = semantic_drift_mode
         self.semantic_drift_cache_enabled = semantic_drift_cache_enabled
+        self.todo_update_mode = todo_update_mode
         self.embedding_model = embedding_model
         self.task_drift_judge = task_drift_judge
         self._semantic_cache: Dict[str, TaskDriftJudgeResult] = {}
@@ -288,13 +299,18 @@ class DriftDetector:
 
         result = self._judge_task_drift(
             original_global_goal=ledger.original_goal,
-            task_plan_list=list(ledger.current_plan),
+            task_plan_list=_todo_plan_context(ledger),
             current_step_content=current_step_content,
         )
         metadata["task_drift_judge_result"] = {
             "is_task_drift": result.is_task_drift,
+            "decision": result.decision,
             "reason": result.reason,
+            "todo_updates": list(result.todo_updates),
         }
+        metadata["todo_update_mode"] = self.todo_update_mode
+        if result.decision == "todo_update_needed":
+            return ""
         if result.is_task_drift:
             reason = _clip(result.reason or "LLM judged current action off task")
             return f"semantic drift from task goal: {reason}"
@@ -460,10 +476,17 @@ def _parse_task_drift_judge_result(text: str) -> TaskDriftJudgeResult:
             reason="task drift judge returned invalid JSON",
             raw=text,
         )
+    decision = str(data.get("decision", "")).strip()
+    is_task_drift = bool(data.get("is_task_drift", False))
+    if not decision:
+        decision = "drifted" if is_task_drift else "on_track"
+    updates = data.get("todo_updates") or []
     return TaskDriftJudgeResult(
-        is_task_drift=bool(data.get("is_task_drift", False)),
+        is_task_drift=is_task_drift,
         reason=str(data.get("reason", "")),
         raw=text,
+        decision=decision,
+        todo_updates=[item for item in updates if isinstance(item, dict)],
     )
 
 
@@ -495,6 +518,43 @@ def _semantic_cache_key(
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _todo_plan_context(ledger: ContextLedger) -> List[str]:
+    if not ledger.todo_items:
+        return list(ledger.current_plan)
+    result: List[str] = []
+    for item in ledger.todo_items:
+        marker = "ACTIVE" if item.id == ledger.active_todo_id else item.status
+        result.append(f"{item.id} [{marker}] {item.content}")
+    return result
+
+
+def _build_task_drift_prompt(
+    *,
+    original_global_goal: str,
+    task_plan_list: List[str],
+    current_step_content: str,
+) -> str:
+    plan_text = "\n".join(f"- {item}" for item in task_plan_list) or "- None"
+    return (
+        "【整体顶层任务目标】\n"
+        f"{original_global_goal}\n"
+        "【结构化待办 / 顶层任务拆解】\n"
+        f"{plan_text}\n"
+        "【当前 Agent 正在执行的动作、输出内容】\n"
+        f"{current_step_content}\n\n"
+        "请你只输出 JSON 对象：\n"
+        '{"decision": "on_track|todo_update_needed|drifted", '
+        '"is_task_drift": bool, "reason": "简短原因", '
+        '"todo_updates": [{"action": "insert|replace|cancel|complete|select", '
+        '"todo_id": "可选", "content": "可选", "reason": "可选"}]}\n'
+        "判断规则：\n"
+        "1. 当前动作服务于 active todo、相邻 todo 或整体待办主线，decision=on_track。\n"
+        "2. 当前动作是在合理维护计划，例如补充缺失步骤、修正过期步骤、切换到更合适的下一步，decision=todo_update_needed。\n"
+        "3. 当前动作既不服务于当前/相邻待办，也不是合理修改待办，而是在做无关工作，decision=drifted。\n"
+        "4. 只判断是否脱离任务主线，不判断细节实现是否正确。\n"
+    )
 
 
 def _summary_fingerprint(text: str) -> str:
