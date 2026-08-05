@@ -119,6 +119,89 @@ class FailureSummary:
         )
 
 
+TODO_STATUSES = {"pending", "in_progress", "completed", "blocked", "cancelled"}
+
+
+@dataclass
+class TodoItem:
+    """Structured task-plan item tracked during a run."""
+
+    id: str
+    content: str
+    status: str = "pending"
+    source: str = "current_plan"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    evidence: str = ""
+    revision: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "content": self.content,
+            "status": self.status,
+            "source": self.source,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "evidence": self.evidence,
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TodoItem":
+        status = str(data.get("status", "pending"))
+        if status not in TODO_STATUSES:
+            status = "pending"
+        return cls(
+            id=str(data.get("id", "")),
+            content=str(data.get("content", "")),
+            status=status,
+            source=str(data.get("source", "current_plan")),
+            created_at=float(data.get("created_at", time.time())),
+            updated_at=float(data.get("updated_at", time.time())),
+            evidence=str(data.get("evidence", "")),
+            revision=int(data.get("revision", 0)),
+        )
+
+
+@dataclass
+class TodoEvent:
+    """Auditable todo-list mutation record."""
+
+    revision: int
+    action: str
+    todo_id: str = ""
+    before: Dict[str, Any] | None = None
+    after: Dict[str, Any] | None = None
+    reason: str = ""
+    ts: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "revision": self.revision,
+            "action": self.action,
+            "todo_id": self.todo_id,
+            "before": dict(self.before or {}),
+            "after": dict(self.after or {}),
+            "reason": self.reason,
+            "ts": self.ts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TodoEvent":
+        before = data.get("before")
+        after = data.get("after")
+        return cls(
+            revision=int(data.get("revision", 0)),
+            action=str(data.get("action", "")),
+            todo_id=str(data.get("todo_id", "")),
+            before=dict(before) if isinstance(before, dict) else {},
+            after=dict(after) if isinstance(after, dict) else {},
+            reason=str(data.get("reason", "")),
+            ts=float(data.get("ts", time.time())),
+        )
+
+
 @dataclass
 class ContextBudget:
     """Observed budget fields for the first ledger implementation.
@@ -174,6 +257,10 @@ class ContextLedger:
     current_plan: List[str] = field(default_factory=list)
     completed_steps: List[str] = field(default_factory=list)
     pending_steps: List[str] = field(default_factory=list)
+    todo_items: List[TodoItem] = field(default_factory=list)
+    active_todo_id: str = ""
+    todo_revision: int = 0
+    todo_events: List[TodoEvent] = field(default_factory=list)
     key_facts: List[ContextFact] = field(default_factory=list)
     open_questions: List[str] = field(default_factory=list)
     tool_summaries: List[ToolSummary] = field(default_factory=list)
@@ -193,6 +280,10 @@ class ContextLedger:
             "current_plan": list(self.current_plan),
             "completed_steps": list(self.completed_steps),
             "pending_steps": list(self.pending_steps),
+            "todo_items": [item.to_dict() for item in self.todo_items],
+            "active_todo_id": self.active_todo_id,
+            "todo_revision": self.todo_revision,
+            "todo_events": [event.to_dict() for event in self.todo_events],
             "key_facts": [fact.to_dict() for fact in self.key_facts],
             "open_questions": list(self.open_questions),
             "tool_summaries": [summary.to_dict() for summary in self.tool_summaries],
@@ -213,6 +304,18 @@ class ContextLedger:
             current_plan=[str(item) for item in data.get("current_plan", [])],
             completed_steps=[str(item) for item in data.get("completed_steps", [])],
             pending_steps=[str(item) for item in data.get("pending_steps", [])],
+            todo_items=[
+                TodoItem.from_dict(item)
+                for item in data.get("todo_items", [])
+                if isinstance(item, dict)
+            ],
+            active_todo_id=str(data.get("active_todo_id", "")),
+            todo_revision=int(data.get("todo_revision", 0)),
+            todo_events=[
+                TodoEvent.from_dict(item)
+                for item in data.get("todo_events", [])
+                if isinstance(item, dict)
+            ],
             key_facts=[
                 ContextFact.from_dict(item)
                 for item in data.get("key_facts", [])

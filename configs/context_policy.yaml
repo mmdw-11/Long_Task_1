@@ -1,0 +1,10 @@
+repeat_node_limit: 3
+pending_step_limit: 10
+no_progress_step_limit: 0
+repeated_summary_limit: 3
+repeated_resource_limit: 3
+repeated_tool_limit: 0
+repeated_file_operation_limit: 3
+semantic_drift_mode: llm
+semantic_drift_cache_enabled: true
+todo_update_mode: suggest

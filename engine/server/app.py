@@ -41,7 +41,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 
 from ..constants import END
 from ..modules.context import ContextPolicy
-from ..orchestrator import Orchestrator
+from ..orchestrator import Orchestrator, _load_dotenv_for_context_policy
 
 
 # ---------------------------------------------------------------------- #
@@ -220,6 +220,7 @@ def create_app(
 
 
 def _load_context_policy(context_policy_path: Optional[str]) -> Optional[ContextPolicy]:
+    _load_dotenv_for_context_policy()
     path = context_policy_path or os.environ.get("CONTEXT_POLICY_PATH")
     if not path:
         return None

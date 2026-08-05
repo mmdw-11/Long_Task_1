@@ -32,6 +32,7 @@ from .modules.context import (
     ContextLedgerStore,
     DriftDetector,
     FailureSummary,
+    TodoManager,
 )
 from .modules.memory import (
     MemoryContext,
@@ -407,6 +408,7 @@ class HookManager(ExecutionHook):
             self.context_ledger.save(ledger)
         drift = self.drift_detector.detect(ledger, current_node=ctx.node)
         ctx.state[DRIFT_RESULT_KEY] = drift.to_dict()
+        self._record_todo_update_suggestion(ledger, drift)
         if drift.drifted:
             ledger.failure_summaries.append(
                 FailureSummary(
@@ -419,6 +421,55 @@ class HookManager(ExecutionHook):
             )
             self.context_ledger.save(ledger)
         ctx.state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+
+    def _record_todo_update_suggestion(self, ledger, drift) -> None:
+        judge_data = drift.metadata.get("task_drift_judge_result") or {}
+        if judge_data.get("decision") != "todo_update_needed":
+            return
+        reason = str(judge_data.get("reason") or "todo update suggested")
+        updates = judge_data.get("todo_updates") or []
+        if getattr(self.drift_detector, "todo_update_mode", "suggest") == "auto":
+            applied = self._apply_todo_updates(ledger, updates, reason=reason)
+            if applied and self.context_ledger is not None:
+                self.context_ledger.save(ledger)
+            return
+        message = f"TodoUpdateSuggested: {reason}"
+        if updates:
+            message = f"{message} updates={json.dumps(updates, ensure_ascii=False, default=str)}"
+        if message not in ledger.open_questions:
+            ledger.open_questions.append(message)
+            if self.context_ledger is not None:
+                self.context_ledger.save(ledger)
+
+    def _apply_todo_updates(self, ledger, updates, *, reason: str) -> bool:
+        manager = TodoManager(ledger)
+        applied = False
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            action = str(update.get("action", "")).lower()
+            todo_id = str(update.get("todo_id", ""))
+            content = str(update.get("content", ""))
+            update_reason = str(update.get("reason") or reason)
+            try:
+                if action == "insert" and content:
+                    manager.insert_todo(content, after_id=todo_id, reason=update_reason)
+                    applied = True
+                elif action == "replace" and todo_id and content:
+                    manager.replace_todo(todo_id, content, reason=update_reason)
+                    applied = True
+                elif action == "cancel" and todo_id:
+                    manager.cancel_todo(todo_id, reason=update_reason)
+                    applied = True
+                elif action == "complete" and todo_id:
+                    manager.update_todo_status(todo_id, "completed", reason=update_reason)
+                    applied = True
+                elif action == "select" and todo_id:
+                    manager.select_active_todo(todo_id, reason=update_reason)
+                    applied = True
+            except (KeyError, ValueError) as exc:
+                ledger.open_questions.append(f"TodoUpdateFailed: {exc}")
+        return applied
 
     def _update_context_on_node_error(
         self, ctx: NodeContext, error: BaseException, *, recoverable: bool
