@@ -37,6 +37,7 @@ from .modules.context import (
 )
 from .modules.context import RUN_STATUS_KEY
 from .modules.flow import FlowDecision
+from .modules.skills import SKILL_CONTEXT_KEY, SKILL_CONTEXT_TEXT_KEY
 from .node import Node, NodeCallable, NodeType
 from .state import GraphState, Reducer
 
@@ -403,6 +404,8 @@ class CompiledGraph:
                     CONTEXT_LEDGER_KEY,
                     CONTEXT_INJECTION_KEY,
                     CONTEXT_INJECTION_TEXT_KEY,
+                    SKILL_CONTEXT_KEY,
+                    SKILL_CONTEXT_TEXT_KEY,
                     "__context_drift__",
                     "__evaluation__",
                 ):
@@ -421,6 +424,8 @@ class CompiledGraph:
                     CONTEXT_LEDGER_KEY,
                     CONTEXT_INJECTION_KEY,
                     CONTEXT_INJECTION_TEXT_KEY,
+                    SKILL_CONTEXT_KEY,
+                    SKILL_CONTEXT_TEXT_KEY,
                     "__context_drift__",
                     "__evaluation__",
                 ):
