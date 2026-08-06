@@ -136,7 +136,9 @@ class EdgeHttpExecutor(InferenceExecutor):
 
     def run(self, request: InferenceRequest) -> InferenceResult:
         _load_dotenv()
-        endpoint = os.environ.get("EDGE_ENDPOINT") or request.allocation.get("endpoint", "")
+        endpoint = request.allocation.get("endpoint", "")
+        if os.environ.get("AGENT_GRAPH_LOAD_DOTENV") != "0":
+            endpoint = os.environ.get("EDGE_ENDPOINT") or endpoint
         if not endpoint.startswith(("http://", "https://")):
             result = self.fallback.run(request)
             result.endpoint = endpoint or result.endpoint

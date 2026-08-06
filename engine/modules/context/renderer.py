@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from ._types import ContextFact, ContextLedger, FailureSummary, ToolSummary
+from ._types import ContextFact, ContextLedger, FailureSummary, TodoEvent, TodoItem, ToolSummary
 
 
 class ContextLedgerRenderer:
@@ -16,6 +16,8 @@ class ContextLedgerRenderer:
         self._section(lines, "Original Goal", [ledger.original_goal] if ledger.original_goal else [])
         self._section(lines, "Hard Constraints", ledger.hard_constraints)
         self._section(lines, "Current Plan", ledger.current_plan)
+        self._section(lines, "Todos", self._todos(ledger.todo_items, active_id=ledger.active_todo_id))
+        self._section(lines, "Todo Events", self._todo_events(ledger.todo_events))
         self._section(lines, "Completed", ledger.completed_steps)
         self._section(lines, "Pending", ledger.pending_steps)
         self._section(lines, "Verified Facts", self._facts(ledger.key_facts, verified=True))
@@ -60,6 +62,22 @@ class ContextLedgerRenderer:
             if summary.raw_ref:
                 result.append(f"{summary.tool_name}: {summary.raw_ref}")
         return result
+
+    def _todos(self, todos: List[TodoItem], *, active_id: str) -> List[str]:
+        result: List[str] = []
+        for item in todos:
+            marker = "active" if item.id == active_id else item.status
+            detail = f"{item.id} [{marker}] {item.content}"
+            if item.evidence:
+                detail = f"{detail} (evidence={item.evidence})"
+            result.append(detail)
+        return result
+
+    def _todo_events(self, events: List[TodoEvent]) -> List[str]:
+        return [
+            f"r{event.revision} {event.action} {event.todo_id} {event.reason}".strip()
+            for event in events[-20:]
+        ]
 
     def _failures(self, failures: List[FailureSummary]) -> List[str]:
         return [

@@ -23,6 +23,10 @@ class ContextInjection:
     verified_facts: List[str] | None = None
     things_not_to_assume: List[str] | None = None
     expected_output_contract: str = ""
+    active_todo: str = ""
+    adjacent_todos: List[str] | None = None
+    completed_todos: List[str] | None = None
+    todo_policy: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -33,6 +37,10 @@ class ContextInjection:
             "verified_facts": list(self.verified_facts or []),
             "things_not_to_assume": list(self.things_not_to_assume or []),
             "expected_output_contract": self.expected_output_contract,
+            "active_todo": self.active_todo,
+            "adjacent_todos": list(self.adjacent_todos or []),
+            "completed_todos": list(self.completed_todos or []),
+            "todo_policy": self.todo_policy,
         }
 
     def to_text(self) -> str:
@@ -57,6 +65,18 @@ class ContextInjection:
                 lines.append(f"- {item}")
         if self.expected_output_contract:
             lines.append(f"Expected Output Contract: {self.expected_output_contract}")
+        if self.active_todo:
+            lines.append(f"Active Todo: {self.active_todo}")
+        if self.adjacent_todos:
+            lines.append("Nearby Todos:")
+            for item in self.adjacent_todos:
+                lines.append(f"- {item}")
+        if self.completed_todos:
+            lines.append("Completed Todos:")
+            for item in self.completed_todos:
+                lines.append(f"- {item}")
+        if self.todo_policy:
+            lines.append(f"Todo Policy: {self.todo_policy}")
         return "\n".join(lines)
 
 
@@ -97,6 +117,13 @@ class ContextInjector:
             for fact in ledger.key_facts
             if not fact.verified
         ][-self.max_unverified :]
+        active_todo = _active_todo_text(ledger)
+        adjacent_todos = _adjacent_todo_text(ledger)
+        completed_todos = [
+            f"{item.id}: {item.content}"
+            for item in ledger.todo_items
+            if item.status == "completed"
+        ][-5:]
         return ContextInjection(
             original_goal=ledger.original_goal,
             hard_constraints=list(ledger.hard_constraints),
@@ -105,4 +132,40 @@ class ContextInjector:
             verified_facts=verified,
             things_not_to_assume=unverified,
             expected_output_contract=output_contract,
+            active_todo=active_todo,
+            adjacent_todos=adjacent_todos,
+            completed_todos=completed_todos,
+            todo_policy=(
+                "Work on the active todo. If the plan is incomplete or stale, "
+                "suggest a todo update instead of silently changing direction."
+            ),
         )
+
+
+def _active_todo_text(ledger: ContextLedger) -> str:
+    for item in ledger.todo_items:
+        if item.id == ledger.active_todo_id:
+            return f"{item.id} [{item.status}] {item.content}"
+    return ""
+
+
+def _adjacent_todo_text(ledger: ContextLedger) -> List[str]:
+    if not ledger.todo_items:
+        return []
+    active_index = -1
+    for idx, item in enumerate(ledger.todo_items):
+        if item.id == ledger.active_todo_id:
+            active_index = idx
+            break
+    if active_index < 0:
+        return [
+            f"{item.id} [{item.status}] {item.content}"
+            for item in ledger.todo_items[:3]
+        ]
+    start = max(0, active_index - 1)
+    end = min(len(ledger.todo_items), active_index + 2)
+    return [
+        f"{item.id} [{item.status}] {item.content}"
+        for item in ledger.todo_items[start:end]
+        if item.id != ledger.active_todo_id
+    ]

@@ -6,9 +6,12 @@ from ._types import (
     ContextFact,
     ContextLedger,
     FailureSummary,
+    TodoEvent,
+    TodoItem,
     ToolSummary,
 )
 from .ledger import ContextLedgerStore
+from .todo import TodoManager
 from .renderer import ContextLedgerRenderer
 from .budget import (
     BUDGET_PAUSED,
@@ -25,7 +28,14 @@ from .injector import (
     ContextInjection,
     ContextInjector,
 )
-from .drift import DRIFT_RESULT_KEY, DriftDetector, DriftResult
+from .drift import (
+    DRIFT_RESULT_KEY,
+    DriftDetector,
+    DriftResult,
+    OpenAITaskDriftJudge,
+    TaskDriftJudge,
+    TaskDriftJudgeResult,
+)
 from .checkpoint import ContextCheckpoint, ContextCheckpointStore
 from .policy import ContextPolicy
 
@@ -37,6 +47,9 @@ __all__ = [
     "ContextLedgerStore",
     "ContextLedgerRenderer",
     "FailureSummary",
+    "TodoEvent",
+    "TodoItem",
+    "TodoManager",
     "ToolSummary",
     "BUDGET_PAUSED",
     "PAUSE_REASON_KEY",
@@ -52,6 +65,9 @@ __all__ = [
     "DRIFT_RESULT_KEY",
     "DriftDetector",
     "DriftResult",
+    "OpenAITaskDriftJudge",
+    "TaskDriftJudge",
+    "TaskDriftJudgeResult",
     "ContextCheckpoint",
     "ContextCheckpointStore",
     "ContextPolicy",
