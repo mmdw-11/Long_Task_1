@@ -33,7 +33,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 try:
-    from fastapi import BackgroundTasks, FastAPI, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel, Field
 except Exception as exc:  # pragma: no cover - 取决于运行环境
     raise ImportError(
@@ -44,6 +45,7 @@ from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.context import ContextPolicy
 from ..modules.product_ops import ProductStatusService, ToolCatalogStore, ToolRecord
+from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
     SkillRepository,
@@ -189,6 +191,7 @@ def create_app(
     skill_trace_store: Optional[SkillTraceStore] = None,
     node_factory: Optional[NodeFactory] = None,
     tool_catalog_store: Optional[ToolCatalogStore] = None,
+    api_audit_store: Optional[ApiAuditStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -204,6 +207,9 @@ def create_app(
     tools = tool_catalog_store or ToolCatalogStore(
         os.environ.get("TOOL_CATALOG_ROOT") or "runs/tool_catalog"
     )
+    api_audit = api_audit_store or ApiAuditStore(
+        os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
+    )
     skill_traces = skill_trace_store or SkillTraceStore(
         os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
     )
@@ -214,6 +220,7 @@ def create_app(
         trace_store=skill_traces,
     )
     runtime_factory = node_factory or AgentRuntimeFactory()
+    admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
         run_root=str(runs.root_dir),
@@ -225,6 +232,42 @@ def create_app(
     orch.set_skill_retriever(skill_retriever)
     orch.set_skill_trace_store(skill_traces)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
+
+    @app.middleware("http")
+    async def admin_guard_and_audit(request: Request, call_next):
+        # 仅对写接口启用最小保护；读接口保留无密钥可访问能力。
+        requires_admin = (
+            request.method.upper() in {"POST", "PUT", "DELETE"}
+            and request.url.path.startswith("/api/")
+        )
+        actor = request.headers.get("X-Actor", "")
+        provided_key = request.headers.get("X-Admin-Key", "")
+        if requires_admin and admin_api_key and provided_key != admin_api_key:
+            api_audit.append(
+                ApiAuditRecord(
+                    ts=utc_now(),
+                    method=request.method.upper(),
+                    path=request.url.path,
+                    status_code=401,
+                    actor=actor,
+                    authorized=False,
+                    detail="invalid admin key",
+                )
+            )
+            return JSONResponse(status_code=401, content={"detail": "invalid admin key"})
+        response = await call_next(request)
+        if requires_admin:
+            api_audit.append(
+                ApiAuditRecord(
+                    ts=utc_now(),
+                    method=request.method.upper(),
+                    path=request.url.path,
+                    status_code=int(response.status_code),
+                    actor=actor,
+                    authorized=True,
+                )
+            )
+        return response
 
     def _apply_policy(target: Orchestrator) -> None:
         if policy is not None:
@@ -289,7 +332,17 @@ def create_app(
 
     @app.get("/api/system/status")
     def get_system_status() -> Dict[str, Any]:
-        return system_status.snapshot()
+        snapshot = system_status.snapshot()
+        snapshot["security"] = {
+            "admin_key_enabled": bool(admin_api_key),
+            "audit_log_path": str(api_audit.path),
+        }
+        return snapshot
+
+    @app.get("/api/system/audit-logs")
+    def get_api_audit_logs(limit: int = 100) -> Dict[str, Any]:
+        bounded_limit = max(1, min(limit, 500))
+        return {"records": [item.to_dict() for item in api_audit.list(limit=bounded_limit)]}
 
     @app.get("/api/agents/{agent_id}")
     def get_agent(agent_id: str) -> Dict[str, Any]:
