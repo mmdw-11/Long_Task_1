@@ -106,6 +106,10 @@ class CreateRunReq(BaseModel):
     workflow_id: Optional[str] = None
 
 
+class CancelRunReq(BaseModel):
+    reason: str = ""
+
+
 class SaveWorkflowReq(BaseModel):
     name: str
     description: str = ""
@@ -298,6 +302,15 @@ def create_app(
                 record.recursion_limit,
                 run_id=record.id,
             ):
+                # 长任务取消采用协作式检查，避免强杀执行线程导致状态文件损坏。
+                latest = runs.get(record.id)
+                if latest.status == "cancel_requested":
+                    record.status = "canceled"
+                    record.canceled_at = latest.canceled_at or _utc_now()
+                    record.finished_at = record.canceled_at
+                    record.metadata = latest.metadata
+                    runs.save(record)
+                    return
                 record.events.append(event)
                 if event.get("type") == "final":
                     record.state = dict(event.get("state") or {})
@@ -456,6 +469,33 @@ def create_app(
             return runs.get(run_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/runs/{run_id}/cancel")
+    def cancel_run(run_id: str, req: CancelRunReq) -> Dict[str, Any]:
+        try:
+            return runs.mark_cancel_requested(run_id, reason=req.reason).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/runs/{run_id}/retry")
+    async def retry_run(run_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+        try:
+            record = runs.retry(run_id)
+            record.status = "queued"
+            runs.save(record)
+            background_tasks.add_task(_execute_run, record)
+            return record.to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/system/metrics")
+    def get_system_metrics() -> Dict[str, Any]:
+        return {
+            "runs": runs.metrics(),
+            "workflows": {"total": len(workflows.list())},
+            "skills": {"total": len(skills.list())},
+            "tools": {"total": len(tools.list())},
+        }
 
     @app.get("/api/export")
     def export() -> Dict[str, Any]:

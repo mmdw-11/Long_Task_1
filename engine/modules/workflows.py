@@ -1,7 +1,7 @@
-"""Backend persistence primitives for saved workflows and execution runs.
+"""工作流与运行记录的文件型持久化模块。
 
-This module keeps product-facing state outside the in-memory Orchestrator so
-the REST service can support save/load/list flows before a database is added.
+该模块把面向产品的状态从内存 Orchestrator 中拆出来，先用 JSON 文件提供稳定
+存储接口，后续迁移数据库时可以尽量不改 REST 和业务调用层。
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ class WorkflowRecord:
 
 @dataclass
 class RunRecord:
-    """Persisted execution lifecycle data for polling and later evaluation."""
+    """持久化的运行生命周期记录，用于轮询、重试、取消和评估。"""
 
     id: str
     workflow_id: Optional[str]
@@ -81,9 +81,13 @@ class RunRecord:
     state: Dict[str, Any] = field(default_factory=dict)
     events: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    retry_count: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: _utc_now())
     updated_at: str = field(default_factory=lambda: _utc_now())
     finished_at: Optional[str] = None
+    canceled_at: Optional[str] = None
     version: int = RUN_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -96,9 +100,13 @@ class RunRecord:
             "state": self.state,
             "events": list(self.events),
             "error": self.error,
+            "parent_run_id": self.parent_run_id,
+            "retry_count": self.retry_count,
+            "metadata": dict(self.metadata),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "finished_at": self.finished_at,
+            "canceled_at": self.canceled_at,
             "version": self.version,
         }
 
@@ -118,9 +126,13 @@ class RunRecord:
             state=dict(data.get("state") or {}),
             events=list(data.get("events") or []),
             error=data.get("error"),
+            parent_run_id=data.get("parent_run_id"),
+            retry_count=int(data.get("retry_count") or 0),
+            metadata=dict(data.get("metadata") or {}),
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
             finished_at=data.get("finished_at"),
+            canceled_at=data.get("canceled_at"),
             version=int(data.get("version") or RUN_SCHEMA_VERSION),
         )
 
@@ -206,6 +218,9 @@ class RunStore:
         recursion_limit: int,
         workflow_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        retry_count: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> RunRecord:
         record = RunRecord(
             id=_clean_id(run_id or "") or f"run-{uuid.uuid4().hex[:12]}",
@@ -213,6 +228,9 @@ class RunStore:
             status="created",
             input=dict(input or {}),
             recursion_limit=recursion_limit,
+            parent_run_id=parent_run_id,
+            retry_count=retry_count,
+            metadata=dict(metadata or {}),
         )
         return self.save(record)
 
@@ -235,6 +253,38 @@ class RunStore:
         if workflow_id is not None:
             records = [item for item in records if item.workflow_id == workflow_id]
         return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+    def mark_cancel_requested(self, run_id: str, *, reason: str = "") -> RunRecord:
+        record = self.get(run_id)
+        if record.status in {"succeeded", "failed", "canceled"}:
+            return record
+        record.status = "cancel_requested" if record.status == "running" else "canceled"
+        record.canceled_at = _utc_now()
+        record.finished_at = record.finished_at or record.canceled_at
+        record.metadata = {**record.metadata, "cancel_reason": reason}
+        return self.save(record)
+
+    def retry(self, run_id: str) -> RunRecord:
+        source = self.get(run_id)
+        return self.create(
+            input=source.input,
+            recursion_limit=source.recursion_limit,
+            workflow_id=source.workflow_id,
+            parent_run_id=source.id,
+            retry_count=source.retry_count + 1,
+            metadata={"retry_from": source.id},
+        )
+
+    def metrics(self) -> Dict[str, Any]:
+        records = self.list()
+        status_counts: Dict[str, int] = {}
+        for record in records:
+            status_counts[record.status] = status_counts.get(record.status, 0) + 1
+        return {
+            "total": len(records),
+            "status_counts": status_counts,
+            "latest_run_id": records[0].id if records else None,
+        }
 
     def _path(self, run_id: str) -> Path:
         clean = _clean_id(run_id)
