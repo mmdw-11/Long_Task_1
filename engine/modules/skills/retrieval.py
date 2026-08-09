@@ -1,7 +1,7 @@
-"""Deterministic retrieval for published procedural skills.
+"""过程性技能检索与上下文注入。
 
-The retriever uses lightweight token overlap today and keeps the interface ready
-for a future BGE-M3 vector index without changing callers.
+当前使用轻量关键词重叠检索，并在检索阶段接入灰度发布判断。
+后续替换为 BGE-M3 向量检索时，调用方接口保持不变。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from .repository import SkillRepository
 
 
 class SkillRetriever:
-    """Retrieve published Markdown skills for the current node execution."""
+    """为当前节点执行检索已发布且命中灰度策略的 Markdown 技能。"""
 
     def __init__(self, repository: SkillRepository, *, top_k: int = 3) -> None:
         self.repository = repository
@@ -34,6 +34,9 @@ class SkillRetriever:
             return []
         matches: List[SkillMatch] = []
         for skill in self.repository.list(status=SkillStatus.PUBLISHED):
+            # 灰度比例由仓库统一判断，检索器只负责过滤不可生效的技能。
+            if not self.repository.is_rollout_enabled(skill, query=query, node=node):
+                continue
             skill_terms = _terms(
                 " ".join([skill.name, skill.description, " ".join(skill.tags), skill.content])
             )
@@ -79,7 +82,18 @@ def render_skill_context(matches: List[SkillMatch]) -> str:
 
 
 def _terms(text: str) -> set[str]:
-    return {item.lower() for item in re.findall(r"[\w\u4e00-\u9fff]{2,}", text or "")}
+    terms: set[str] = set()
+    for item in re.findall(r"[\w\u4e00-\u9fff]{2,}", text or ""):
+        token = item.lower()
+        terms.add(token)
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", token)
+        if len(chinese_chars) >= 2:
+            # 中文没有天然空格，补充二字滑窗能显著提升短语匹配稳定性。
+            terms.update(
+                "".join(chinese_chars[index : index + 2])
+                for index in range(len(chinese_chars) - 1)
+            )
+    return terms
 
 
 def _metadata_text(metadata: Dict[str, Any]) -> str:

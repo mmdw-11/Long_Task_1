@@ -1,11 +1,12 @@
-"""File-backed repository for Markdown procedural skills.
+"""过程性技能文件仓库。
 
-Each skill has a JSON metadata record and a Markdown body. Keeping the body as
-Markdown makes review, approval, rollback, and future migration straightforward.
+本模块负责把 Markdown 技能、生命周期状态、版本历史和灰度发布策略落到本地文件。
+当前版本保持原有 metadata/markdown 结构，历史版本额外归档到 versions/，方便审计与回滚。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -16,14 +17,16 @@ from ._types import SkillRecord, SkillStatus
 
 
 class SkillRepository:
-    """Persist and transition skill records with simple lifecycle guards."""
+    """持久化技能记录，并提供状态流转、版本回滚和灰度发布能力。"""
 
     def __init__(self, root_dir: str | Path = "runs/skills") -> None:
         self.root_dir = Path(root_dir)
         self.meta_dir = self.root_dir / "metadata"
         self.body_dir = self.root_dir / "markdown"
+        self.version_dir = self.root_dir / "versions"
         self.meta_dir.mkdir(parents=True, exist_ok=True)
         self.body_dir.mkdir(parents=True, exist_ok=True)
+        self.version_dir.mkdir(parents=True, exist_ok=True)
 
     def create(
         self,
@@ -55,6 +58,7 @@ class SkillRepository:
         now = _utc_now()
         existing = self.get(record.id) if record.id and self.exists(record.id) else None
         if existing is not None:
+            self._archive_version(existing)
             record.created_at = existing.created_at
             record.version = existing.version + 1
         else:
@@ -87,6 +91,87 @@ class SkillRepository:
             wanted = status if isinstance(status, SkillStatus) else SkillStatus(str(status))
             records = [item for item in records if item.status == wanted]
         return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+    def list_versions(self, skill_id: str) -> List[SkillRecord]:
+        """列出某个技能的全部版本，包含当前版本和已归档历史版本。"""
+        if not self.exists(skill_id):
+            raise KeyError(f"skill {skill_id!r} not found")
+        records = []
+        for path in sorted(self._version_root(skill_id).glob("v*.json")):
+            records.append(SkillRecord.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+        records.append(self.get(skill_id))
+        return sorted(records, key=lambda item: item.version, reverse=True)
+
+    def get_version(self, skill_id: str, version: int) -> SkillRecord:
+        """读取指定技能版本；当前版本和历史版本使用同一个返回结构。"""
+        current = self.get(skill_id)
+        if current.version == version:
+            return current
+        path = self._version_path(skill_id, version)
+        if not path.exists():
+            raise KeyError(f"skill {skill_id!r} version {version!r} not found")
+        return SkillRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def rollback(
+        self,
+        skill_id: str,
+        version: int,
+        *,
+        approved_by: str,
+        reason: str = "",
+    ) -> SkillRecord:
+        """把指定历史版本恢复为新的当前版本，保留回滚操作审计信息。"""
+        if not approved_by.strip():
+            raise ValueError("approved_by is required")
+        target = self.get_version(skill_id, version)
+        current = self.get(skill_id)
+        restored = SkillRecord.from_dict(
+            {
+                **target.to_dict(),
+                "version": current.version,
+                "approved_by": approved_by,
+                "metadata": {
+                    **target.metadata,
+                    "rollback_from_version": current.version,
+                    "rollback_to_version": version,
+                    "rollback_by": approved_by,
+                    **({"rollback_reason": reason} if reason else {}),
+                },
+            }
+        )
+        return self.save(restored)
+
+    def set_rollout(self, skill_id: str, percent: int, *, approved_by: str) -> SkillRecord:
+        """设置技能灰度比例，0 表示不参与检索，100 表示全量生效。"""
+        if not approved_by.strip():
+            raise ValueError("approved_by is required")
+        if percent < 0 or percent > 100:
+            raise ValueError("rollout_percent must be between 0 and 100")
+        record = self.get(skill_id)
+        if record.status != SkillStatus.PUBLISHED:
+            raise ValueError("only published skills can change rollout percent")
+        record.metadata = {
+            **record.metadata,
+            "rollout_percent": percent,
+            "rollout_updated_by": approved_by,
+            "rollout_updated_at": _utc_now(),
+        }
+        return self.save(record)
+
+    def is_rollout_enabled(self, skill: SkillRecord, *, query: str = "", node: str = "") -> bool:
+        """按技能、节点和查询稳定散列，实现无状态、可复现的灰度命中判断。"""
+        raw_percent = skill.metadata.get("rollout_percent", 100)
+        try:
+            percent = int(raw_percent)
+        except (TypeError, ValueError):
+            percent = 100
+        if percent <= 0:
+            return False
+        if percent >= 100:
+            return True
+        seed = f"{skill.id}:{skill.version}:{node}:{query}".encode("utf-8", errors="ignore")
+        bucket = int(hashlib.sha256(seed).hexdigest()[:8], 16) % 100
+        return bucket < percent
 
     def exists(self, skill_id: str) -> bool:
         return self._meta_path(skill_id).exists()
@@ -141,6 +226,28 @@ class SkillRepository:
         if not clean:
             raise ValueError("skill_id is required")
         return self.body_dir / f"{clean}.md"
+
+    def _archive_version(self, record: SkillRecord) -> None:
+        # 历史版本以完整 JSON 保存，避免回滚时依赖当前 markdown 文件。
+        path = self._version_path(record.id, record.version)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return
+        path.write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _version_root(self, skill_id: str) -> Path:
+        clean = self._clean_id(skill_id)
+        if not clean:
+            raise ValueError("skill_id is required")
+        return self.version_dir / clean
+
+    def _version_path(self, skill_id: str, version: int) -> Path:
+        if version <= 0:
+            raise ValueError("version must be positive")
+        return self._version_root(skill_id) / f"v{version}.json"
 
     @staticmethod
     def _clean_id(raw: str) -> str:

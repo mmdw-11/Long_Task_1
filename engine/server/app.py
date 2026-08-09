@@ -148,6 +148,11 @@ class SkillDecisionReq(BaseModel):
     reason: str = ""
 
 
+class SkillRolloutReq(BaseModel):
+    percent: int = Field(100, ge=0, le=100)
+    approved_by: str
+
+
 class SkillSearchReq(BaseModel):
     query: str
     node: str = ""
@@ -646,6 +651,22 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
+    @app.get("/api/skills/{skill_id}/versions")
+    def list_skill_versions(skill_id: str) -> List[Dict[str, Any]]:
+        try:
+            return [item.to_dict() for item in skills.list_versions(skill_id)]
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/skills/{skill_id}/versions/{version}")
+    def get_skill_version(skill_id: str, version: int) -> Dict[str, Any]:
+        try:
+            return skills.get_version(skill_id, version).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     @app.post("/api/skills/candidates/from-run")
     def create_skill_candidate(req: CreateSkillCandidateReq) -> Dict[str, Any]:
         try:
@@ -695,6 +716,33 @@ def create_app(
     def retire_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
         try:
             return skill_evolution.retire(skill_id, reason=req.reason).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/{skill_id}/rollback/{version}")
+    def rollback_skill(skill_id: str, version: int, req: SkillDecisionReq) -> Dict[str, Any]:
+        try:
+            return skills.rollback(
+                skill_id,
+                version,
+                approved_by=req.approved_by or "",
+                reason=req.reason,
+            ).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/{skill_id}/rollout")
+    def set_skill_rollout(skill_id: str, req: SkillRolloutReq) -> Dict[str, Any]:
+        try:
+            return skills.set_rollout(
+                skill_id,
+                req.percent,
+                approved_by=req.approved_by,
+            ).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
