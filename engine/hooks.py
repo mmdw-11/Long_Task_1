@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +64,7 @@ from .modules.scheduling import (
     ResourceRequest,
     ResourceScheduler,
 )
+from .modules.skills import SkillRetriever, SkillTraceStore
 
 MEMORY_CONTEXT_KEY = "__memory_context__"
 MEMORY_CONTEXT_ITEMS_KEY = "__memory_context_items__"
@@ -72,6 +74,7 @@ REDACTION_RESULT_KEY = "__redaction__"
 AUDIT_PACK_KEY = "__audit_pack__"
 EVALUATION_RESULT_KEY = "__evaluation__"
 VALIDATION_FAILED_STATUS = "validation_failed"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -153,6 +156,8 @@ class HookManager(ExecutionHook):
         evaluator: Optional[Evaluator] = None,
         redactor: Optional[SensitiveDataRedactor] = None,
         audit_builder: Optional[AuditPackBuilder] = None,
+        skill_retriever: Optional[SkillRetriever] = None,
+        skill_trace_store: Optional[SkillTraceStore] = None,
         project_rules: Optional[Dict[str, Any]] = None,
         graph_view: Optional[Dict[str, Any]] = None,
         extra_hooks: Optional[List[ExecutionHook]] = None,
@@ -173,6 +178,8 @@ class HookManager(ExecutionHook):
         self.evaluator = evaluator or RuleEvaluator()
         self.redactor = redactor or SensitiveDataRedactor()
         self.audit_builder = audit_builder or AuditPackBuilder()
+        self.skill_retriever = skill_retriever
+        self.skill_trace_store = skill_trace_store
         self.project_rules = project_rules or {}
         self.graph_view = graph_view or {}
         self.extra_hooks: List[ExecutionHook] = list(extra_hooks or [])
@@ -185,11 +192,22 @@ class HookManager(ExecutionHook):
     def on_step_start(self, step: int, frontier: List[str], state: Dict[str, Any]) -> None:
         self._update_context_on_step_start(step, frontier, state)
         self._check_context_budget(state)
+        self._record_skill_trace("step_start", state=state, step=step, payload={"frontier": frontier})
         for h in self.extra_hooks:
             h.on_step_start(step, frontier, state)
 
     def on_node_start(self, ctx: NodeContext) -> FlowDecision:
         self._inject_memory_context(ctx)
+        if self.skill_retriever is not None:
+            self.skill_retriever.inject(
+                ctx.state,
+                node=ctx.node,
+                metadata={**ctx.metadata, **self._node_metadata(ctx.node)},
+            )
+        self._record_skill_trace(
+            "node_start", state=ctx.state, node=ctx.node, step=ctx.step,
+            payload={"input": ctx.state.get("input")}, metadata=ctx.metadata,
+        )
         deps = self.flow_controller.resolve_dependencies(ctx.node, self.graph_view)
         deps_satisfied = self._deps_satisfied(deps, ctx.state)
         decision = self.flow_controller.decide(
@@ -237,6 +255,10 @@ class HookManager(ExecutionHook):
                 node=ctx.node,
                 step=ctx.step,
             )
+        self._record_skill_trace(
+            "node_end", state=ctx.state, node=ctx.node, step=ctx.step,
+            payload={"update": update}, metadata={"evaluation": evaluation.to_dict()},
+        )
         for h in self.extra_hooks:
             h.on_node_end(ctx, update)
 
@@ -269,6 +291,11 @@ class HookManager(ExecutionHook):
             h.on_node_error(ctx, error)
         self._update_context_on_node_error(
             ctx, error, recoverable=not plan.should_abort
+        )
+        self._record_skill_trace(
+            "node_error", state=ctx.state, node=ctx.node, step=ctx.step,
+            payload={"error_type": type(error).__name__, "message": str(error)},
+            metadata={"recoverable": not plan.should_abort, "repair": plan.action.value},
         )
         if plan.should_abort:
             return None
@@ -545,6 +572,27 @@ class HookManager(ExecutionHook):
             or self.project_rules.get("task_id")
             or "default-run"
         )
+
+    def _record_skill_trace(
+        self,
+        event_type: str,
+        *,
+        state: Dict[str, Any],
+        node: str = "",
+        step: int = 0,
+        payload: Any = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort trace recording must never break the online graph."""
+        if self.skill_trace_store is None:
+            return
+        try:
+            self.skill_trace_store.record(
+                event_type, state=state, node=node, step=step,
+                payload=payload, metadata=metadata,
+            )
+        except Exception:
+            logger.exception("skill trace recording failed: event=%s node=%s", event_type, node)
 
     def _memory_query(self, ctx: NodeContext) -> str:
         parts: List[str] = [ctx.node]

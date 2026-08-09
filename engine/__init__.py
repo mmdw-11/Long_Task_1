@@ -92,6 +92,19 @@ from .modules.security import (
     RedactionResult,
     SensitiveDataRedactor,
 )
+from .modules.skills import (
+    SKILL_CONTEXT_KEY,
+    SKILL_CONTEXT_TEXT_KEY,
+    Skill,
+    SkillEvolutionService,
+    SkillManifest,
+    SkillMatch,
+    SkillRepository,
+    SkillRetriever,
+    SkillStatus,
+    SkillTraceStore,
+    ValidationReport,
+)
 from .modules.scheduling import (
     AdaptiveResourceScheduler,
     AdvancedTrainingResult,
@@ -240,6 +253,18 @@ __all__ = [
     "AuditPackBuilder",
     "RedactionResult",
     "SensitiveDataRedactor",
+    # Procedural skills
+    "SKILL_CONTEXT_KEY",
+    "SKILL_CONTEXT_TEXT_KEY",
+    "Skill",
+    "SkillEvolutionService",
+    "SkillManifest",
+    "SkillMatch",
+    "SkillRepository",
+    "SkillRetriever",
+    "SkillStatus",
+    "SkillTraceStore",
+    "ValidationReport",
     # Scheduling
     "AdaptiveResourceScheduler",
     "AdvancedTrainingResult",

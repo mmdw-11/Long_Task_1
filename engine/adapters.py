@@ -16,6 +16,8 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional
 
 from .hooks import MEMORY_CONTEXT_TEXT_KEY
+from .modules.context import CONTEXT_INJECTION_TEXT_KEY
+from .modules.skills import SKILL_CONTEXT_TEXT_KEY
 from .node import Node, NodeType
 
 
@@ -111,8 +113,12 @@ def make_agent_node_func(
             input_msg = None
         elif isinstance(raw_input, str):
             memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
-            if memory_context:
-                raw_input = f"{memory_context}\n\nCurrent input:\n{raw_input}"
+            context_injection = state.get(CONTEXT_INJECTION_TEXT_KEY)
+            skill_context = state.get(SKILL_CONTEXT_TEXT_KEY)
+            context_parts = [part for part in (context_injection, skill_context, memory_context) if part]
+            if context_parts:
+                combined_context = "\n\n".join(context_parts)
+                raw_input = f"{combined_context}\n\nCurrent input:\n{raw_input}"
             input_msg = _build_user_msg(Msg, TextBlock, raw_input)
         else:
             input_msg = raw_input  # 已经是 Msg
