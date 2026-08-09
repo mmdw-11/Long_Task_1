@@ -86,6 +86,19 @@ from .modules.execution import (
     ResilientInferenceRunner,
 )
 from .modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
+from .modules.skills import (
+    SKILL_CONTEXT_KEY,
+    SKILL_CONTEXT_TEXT_KEY,
+    SkillEvolutionService,
+    SkillMatch,
+    SkillRecord,
+    SkillRepository,
+    SkillRetriever,
+    SkillStatus,
+    SkillTraceEvent,
+    SkillTraceStore,
+    SkillValidationReport,
+)
 from .modules.evaluation import EvaluationResult, Evaluator, RuleEvaluator
 from .modules.security import (
     AuditPack,
@@ -240,6 +253,17 @@ __all__ = [
     "RunStore",
     "WorkflowRecord",
     "WorkflowStore",
+    "SKILL_CONTEXT_KEY",
+    "SKILL_CONTEXT_TEXT_KEY",
+    "SkillEvolutionService",
+    "SkillMatch",
+    "SkillRecord",
+    "SkillRepository",
+    "SkillRetriever",
+    "SkillStatus",
+    "SkillTraceEvent",
+    "SkillTraceStore",
+    "SkillValidationReport",
     # Security
     "AuditPack",
     "AuditPackBuilder",

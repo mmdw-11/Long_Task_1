@@ -57,6 +57,7 @@ from .modules.routing import (
     Router,
 )
 from .modules.security import AuditPackBuilder, SensitiveDataRedactor
+from .modules.skills import SKILL_CONTEXT_TEXT_KEY, SkillRetriever, SkillTraceEvent, SkillTraceStore
 from .modules.scheduling import (
     NoOpResourceScheduler,
     ResourceAllocation,
@@ -153,6 +154,8 @@ class HookManager(ExecutionHook):
         evaluator: Optional[Evaluator] = None,
         redactor: Optional[SensitiveDataRedactor] = None,
         audit_builder: Optional[AuditPackBuilder] = None,
+        skill_retriever: Optional[SkillRetriever] = None,
+        skill_trace_store: Optional[SkillTraceStore] = None,
         project_rules: Optional[Dict[str, Any]] = None,
         graph_view: Optional[Dict[str, Any]] = None,
         extra_hooks: Optional[List[ExecutionHook]] = None,
@@ -173,6 +176,8 @@ class HookManager(ExecutionHook):
         self.evaluator = evaluator or RuleEvaluator()
         self.redactor = redactor or SensitiveDataRedactor()
         self.audit_builder = audit_builder or AuditPackBuilder()
+        self.skill_retriever = skill_retriever
+        self.skill_trace_store = skill_trace_store
         self.project_rules = project_rules or {}
         self.graph_view = graph_view or {}
         self.extra_hooks: List[ExecutionHook] = list(extra_hooks or [])
@@ -190,6 +195,7 @@ class HookManager(ExecutionHook):
 
     def on_node_start(self, ctx: NodeContext) -> FlowDecision:
         self._inject_memory_context(ctx)
+        self._inject_skill_context(ctx)
         deps = self.flow_controller.resolve_dependencies(ctx.node, self.graph_view)
         deps_satisfied = self._deps_satisfied(deps, ctx.state)
         decision = self.flow_controller.decide(
@@ -237,6 +243,7 @@ class HookManager(ExecutionHook):
                 node=ctx.node,
                 step=ctx.step,
             )
+        self._record_skill_trace(ctx, "node_end", {"update": update or {}})
         for h in self.extra_hooks:
             h.on_node_end(ctx, update)
 
@@ -267,6 +274,11 @@ class HookManager(ExecutionHook):
         )
         for h in self.extra_hooks:
             h.on_node_error(ctx, error)
+        self._record_skill_trace(
+            ctx,
+            "node_error",
+            {"error_type": type(error).__name__, "message": str(error)},
+        )
         self._update_context_on_node_error(
             ctx, error, recoverable=not plan.should_abort
         )
@@ -348,6 +360,34 @@ class HookManager(ExecutionHook):
         ctx.state[MEMORY_CONTEXT_ITEMS_KEY] = [item.to_dict() for item in items]
         ctx.state[MEMORY_CONTEXT_TEXT_KEY] = context_text
         self._inject_context_ledger(ctx)
+
+    def _inject_skill_context(self, ctx: NodeContext) -> None:
+        if self.skill_retriever is None:
+            return
+        self.skill_retriever.inject(ctx.state, node=ctx.node, metadata=ctx.metadata)
+        self._record_skill_trace(
+            ctx,
+            "skill_retrieved",
+            {"skills": ctx.state.get(SKILL_CONTEXT_TEXT_KEY, "")},
+        )
+
+    def _record_skill_trace(
+        self,
+        ctx: NodeContext,
+        event: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        if self.skill_trace_store is None:
+            return
+        self.skill_trace_store.append(
+            SkillTraceEvent(
+                run_id=self._run_id_from_state(ctx.state),
+                node=ctx.node,
+                step=ctx.step,
+                event=event,
+                payload=payload,
+            )
+        )
 
     def _update_context_on_step_start(
         self, step: int, frontier: List[str], state: Dict[str, Any]

@@ -42,6 +42,13 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 
 from ..constants import END
 from ..modules.context import ContextPolicy
+from ..modules.skills import (
+    SkillEvolutionService,
+    SkillRepository,
+    SkillRetriever,
+    SkillStatus,
+    SkillTraceStore,
+)
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
 from ..orchestrator import Orchestrator, _load_dotenv_for_context_policy
 
@@ -112,6 +119,34 @@ class UpdateWorkflowReq(BaseModel):
     graph: Optional[Dict[str, Any]] = None
 
 
+class CreateSkillCandidateReq(BaseModel):
+    run_id: str
+    name: Optional[str] = None
+    description: str = ""
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateSkillReq(BaseModel):
+    name: str
+    content: str
+    description: str = ""
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillDecisionReq(BaseModel):
+    approved_by: Optional[str] = None
+    reason: str = ""
+
+
+class SkillSearchReq(BaseModel):
+    query: str
+    node: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    top_k: int = 3
+
+
 def _resolve_target(target: str) -> Any:
     """把接口传入的字符串目标解析为内部值（"END" -> END 哨兵）。"""
     return END if target == "END" else target
@@ -129,6 +164,8 @@ def create_app(
     context_ledger_root: Optional[str] = None,
     workflow_store: Optional[WorkflowStore] = None,
     run_store: Optional[RunStore] = None,
+    skill_repository: Optional[SkillRepository] = None,
+    skill_trace_store: Optional[SkillTraceStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -138,13 +175,29 @@ def create_app(
         os.environ.get("WORKFLOW_STORE_ROOT") or "runs/workflows"
     )
     runs = run_store or RunStore(os.environ.get("RUN_STORE_ROOT") or "runs/executions")
+    skills = skill_repository or SkillRepository(
+        os.environ.get("SKILL_STORE_ROOT") or "runs/skills"
+    )
+    skill_traces = skill_trace_store or SkillTraceStore(
+        os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
+    )
+    skill_retriever = SkillRetriever(skills)
+    skill_evolution = SkillEvolutionService(
+        repository=skills,
+        run_store=runs,
+        trace_store=skill_traces,
+    )
     if policy is not None:
         orch.set_context_policy(policy, ledger_root=ledger_root)
+    orch.set_skill_retriever(skill_retriever)
+    orch.set_skill_trace_store(skill_traces)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
 
     def _apply_policy(target: Orchestrator) -> None:
         if policy is not None:
             target.set_context_policy(policy, ledger_root=ledger_root)
+        target.set_skill_retriever(skill_retriever)
+        target.set_skill_trace_store(skill_traces)
 
     def _orchestrator_for_run(workflow_id: Optional[str]) -> Orchestrator:
         if workflow_id:
@@ -160,8 +213,9 @@ def create_app(
             runs.save(record)
             target = _orchestrator_for_run(record.workflow_id)
             compiled = target.build_graph(recursion_limit=record.recursion_limit)
+            run_input = {**record.input, "run_id": record.id}
             async for event in compiled.astream(
-                record.input,
+                run_input,
                 record.recursion_limit,
                 run_id=record.id,
             ):
@@ -392,6 +446,102 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         return {"ok": True}
+
+    # ------------------------- 技能生命周期 ------------------------- #
+    @app.post("/api/skills")
+    def create_skill(req: CreateSkillReq) -> Dict[str, Any]:
+        try:
+            return skills.create(
+                name=req.name,
+                content=req.content,
+                description=req.description,
+                tags=req.tags,
+                metadata=req.metadata,
+            ).to_dict()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/skills")
+    def list_skills(status: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            return [item.to_dict() for item in skills.list(status=status)]
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/search")
+    def search_skills(req: SkillSearchReq) -> Dict[str, Any]:
+        matches = skill_retriever.retrieve(
+            req.query,
+            node=req.node,
+            metadata=req.metadata,
+            top_k=req.top_k,
+        )
+        return {"matches": [item.to_dict() for item in matches]}
+
+    @app.get("/api/skills/{skill_id}")
+    def get_skill(skill_id: str) -> Dict[str, Any]:
+        try:
+            return skills.get(skill_id).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/skills/candidates/from-run")
+    def create_skill_candidate(req: CreateSkillCandidateReq) -> Dict[str, Any]:
+        try:
+            return skill_evolution.create_candidate_from_run(
+                req.run_id,
+                name=req.name,
+                description=req.description,
+                tags=req.tags,
+                metadata=req.metadata,
+            ).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/{skill_id}/validate")
+    def validate_skill(skill_id: str) -> Dict[str, Any]:
+        try:
+            return skill_evolution.validate(skill_id).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/{skill_id}/publish")
+    def publish_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
+        try:
+            return skill_evolution.publish(
+                skill_id,
+                approved_by=req.approved_by or "",
+            ).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/{skill_id}/reject")
+    def reject_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
+        try:
+            return skill_evolution.reject(skill_id, reason=req.reason).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/skills/{skill_id}/retire")
+    def retire_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
+        try:
+            return skill_evolution.retire(skill_id, reason=req.reason).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/runs/{run_id}/skill-traces")
+    def get_skill_traces(run_id: str) -> Dict[str, Any]:
+        return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
 
     return app
 

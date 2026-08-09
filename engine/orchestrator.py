@@ -30,6 +30,7 @@ from .constants import END, START
 from .failure import FAILURES_KEY
 from .graph import CompiledGraph, StateGraph
 from .hooks import MEMORY_CONTEXT_TEXT_KEY, HookManager
+from .modules.skills import SKILL_CONTEXT_TEXT_KEY, SkillRetriever, SkillTraceStore
 from .modules.evaluation import Evaluator
 from .modules.context import (
     CONTEXT_INJECTION_TEXT_KEY,
@@ -142,10 +143,13 @@ def echo_node_factory(spec: AgentSpec) -> Node:
     async def _echo(state: Dict[str, Any]) -> Dict[str, Any]:
         incoming = state.get("input")
         memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
+        skill_context = state.get(SKILL_CONTEXT_TEXT_KEY)
         context_injection = state.get(CONTEXT_INJECTION_TEXT_KEY)
         text = f"[{spec.name}] 收到: {incoming}"
         if context_injection:
             text = f"{text}\n\n{context_injection}"
+        if skill_context:
+            text = f"{text}\n\n{skill_context}"
         if memory_context:
             text = f"{text}\n\n{memory_context}"
         return {
@@ -193,6 +197,8 @@ class Orchestrator:
         self._context_injector: Optional[ContextInjector] = None
         self._drift_detector: Optional[DriftDetector] = None
         self._evaluator: Optional[Evaluator] = None
+        self._skill_retriever: Optional[SkillRetriever] = None
+        self._skill_trace_store: Optional[SkillTraceStore] = None
         self._project_rules: Dict[str, Any] = {}
         self._memory_top_k: int = 5
         self._wakeup_level: int | str = 1
@@ -250,6 +256,14 @@ class Orchestrator:
     def set_evaluator(self, evaluator: Evaluator) -> None:
         """注入节点后置验证器。"""
         self._evaluator = evaluator
+
+    def set_skill_retriever(self, retriever: SkillRetriever) -> None:
+        """Register procedural skill retrieval for node execution."""
+        self._skill_retriever = retriever
+
+    def set_skill_trace_store(self, store: SkillTraceStore) -> None:
+        """Register append-only traces used by skill evolution."""
+        self._skill_trace_store = store
 
     def set_context_policy(
         self,
@@ -575,6 +589,10 @@ class Orchestrator:
             kwargs["drift_detector"] = self._drift_detector
         if self._evaluator is not None:
             kwargs["evaluator"] = self._evaluator
+        if self._skill_retriever is not None:
+            kwargs["skill_retriever"] = self._skill_retriever
+        if self._skill_trace_store is not None:
+            kwargs["skill_trace_store"] = self._skill_trace_store
         return HookManager(**kwargs)
 
     @staticmethod
