@@ -41,6 +41,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
     ) from exc
 
 from ..constants import END
+from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.context import ContextPolicy
 from ..modules.skills import (
     SkillEvolutionService,
@@ -50,7 +51,7 @@ from ..modules.skills import (
     SkillTraceStore,
 )
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
-from ..orchestrator import Orchestrator, _load_dotenv_for_context_policy
+from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
 
 
 # ---------------------------------------------------------------------- #
@@ -166,6 +167,7 @@ def create_app(
     run_store: Optional[RunStore] = None,
     skill_repository: Optional[SkillRepository] = None,
     skill_trace_store: Optional[SkillTraceStore] = None,
+    node_factory: Optional[NodeFactory] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -187,6 +189,7 @@ def create_app(
         run_store=runs,
         trace_store=skill_traces,
     )
+    runtime_factory = node_factory or AgentRuntimeFactory()
     if policy is not None:
         orch.set_context_policy(policy, ledger_root=ledger_root)
     orch.set_skill_retriever(skill_retriever)
@@ -212,7 +215,10 @@ def create_app(
             record.status = "running"
             runs.save(record)
             target = _orchestrator_for_run(record.workflow_id)
-            compiled = target.build_graph(recursion_limit=record.recursion_limit)
+            compiled = target.build_graph(
+                node_factory=runtime_factory,
+                recursion_limit=record.recursion_limit,
+            )
             run_input = {**record.input, "run_id": record.id}
             async for event in compiled.astream(
                 run_input,
@@ -322,7 +328,10 @@ def create_app(
     @app.post("/api/run")
     async def run(req: RunReq) -> Dict[str, Any]:
         try:
-            compiled = orch.build_graph(recursion_limit=req.recursion_limit)
+            compiled = orch.build_graph(
+                node_factory=runtime_factory,
+                recursion_limit=req.recursion_limit,
+            )
             state = await compiled.ainvoke(req.input, req.recursion_limit)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))

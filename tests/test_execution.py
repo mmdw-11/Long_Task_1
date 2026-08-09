@@ -52,6 +52,25 @@ def test_local_model_executor_falls_back_without_device_config(monkeypatch):
     assert "hello device" in result.text
 
 
+def test_local_model_executor_falls_back_when_device_call_fails(monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.setenv("DEVICE_BASE_URL", "http://127.0.0.1:1/v1")
+    monkeypatch.setenv("DEVICE_MODEL", "missing-model")
+    monkeypatch.setenv("DEVICE_TIMEOUT_SECONDS", "0.1")
+
+    result = LocalModelExecutor().run(
+        InferenceRequest(
+            prompt="hello fallback",
+            allocation={"tier": "device", "endpoint": "local"},
+        )
+    )
+
+    assert result.executor == "LocalEchoExecutor"
+    assert result.metadata["fallback_reason"] == "DEVICE executor failed"
+    assert result.metadata["configured_model"] == "missing-model"
+    assert "hello fallback" in result.text
+
+
 def test_registry_routes_by_resource_tier():
     class FakeExecutor:
         def run(self, request):

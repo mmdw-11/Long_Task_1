@@ -82,29 +82,50 @@ class OpenAICompatibleExecutor(InferenceExecutor):
             }
             return result
 
-        from openai import OpenAI
+        try:
+            from openai import OpenAI
 
-        client = OpenAI(api_key=api_key or "not-needed", base_url=endpoint, timeout=self.timeout_seconds)
-        system = request.system_prompt or "Answer concisely and accurately."
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": request.prompt},
-            ],
-            temperature=0,
-            max_tokens=int(os.environ.get(f"{self.env_prefix}_MAX_TOKENS", "384")),
-        )
-        text = response.choices[0].message.content or ""
-        usage = getattr(response, "usage", None)
-        usage_data = json.loads(usage.model_dump_json()) if usage is not None else {}
-        return InferenceResult(
-            text=text,
-            executor=type(self).__name__,
-            endpoint=endpoint,
-            model=model,
-            metadata={"usage": usage_data, "backend": self.label},
-        )
+            client = OpenAI(api_key=api_key or "not-needed", base_url=endpoint, timeout=self.timeout_seconds)
+            system = request.system_prompt or "Answer concisely and accurately."
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": request.prompt},
+                ],
+                temperature=0,
+                max_tokens=int(os.environ.get(f"{self.env_prefix}_MAX_TOKENS", "384")),
+            )
+            text = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
+            usage_data = json.loads(usage.model_dump_json()) if usage is not None else {}
+            return InferenceResult(
+                text=text,
+                executor=type(self).__name__,
+                endpoint=endpoint,
+                model=model,
+                metadata={"usage": usage_data, "backend": self.label},
+            )
+        except Exception as exc:  # noqa: BLE001 - 在线产品链路优先降级而不是中断
+            if self.fallback is not None:
+                result = self.fallback.run(request)
+                result.metadata = {
+                    **result.metadata,
+                    "fallback_reason": f"{self.env_prefix} executor failed",
+                    "fallback_error": str(exc),
+                    "configured_endpoint": endpoint,
+                    "configured_model": model,
+                }
+                return result
+            return InferenceResult(
+                text="",
+                executor=type(self).__name__,
+                endpoint=endpoint,
+                model=model,
+                success=False,
+                error=str(exc),
+                retryable=True,
+            )
 
 
 class LocalModelExecutor(OpenAICompatibleExecutor):

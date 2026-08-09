@@ -1,7 +1,7 @@
-"""Procedural skill lifecycle module.
+"""过程性技能生命周期模块。
 
-Skills are persisted Markdown procedures that can be retrieved during graph
-execution and promoted through candidate, validation, and approval states.
+技能以 Markdown 规程形式持久化，运行时只检索已发布技能；候选技能必须经过
+验证和审批后才会进入在线执行链路。
 """
 
 from ._types import (
@@ -17,10 +17,17 @@ from .repository import SkillRepository
 from .retrieval import SkillRetriever
 from .trace import SkillTraceEvent, SkillTraceStore
 
+# 兼容旧入口命名，避免已有业务代码 import engine 时断链。
+Skill = SkillRecord
+SkillManifest = SkillRecord
+ValidationReport = SkillValidationReport
+
 __all__ = [
     "SKILL_CONTEXT_KEY",
     "SKILL_CONTEXT_TEXT_KEY",
+    "Skill",
     "SkillEvolutionService",
+    "SkillManifest",
     "SkillMatch",
     "SkillRecord",
     "SkillRepository",
@@ -29,4 +36,5 @@ __all__ = [
     "SkillTraceEvent",
     "SkillTraceStore",
     "SkillValidationReport",
+    "ValidationReport",
 ]
