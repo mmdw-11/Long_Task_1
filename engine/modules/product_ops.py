@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .skills import SkillRepository
+from .workflows import RunStore, WorkflowStore
+
 
 @dataclass
 class ToolRecord:
@@ -199,6 +202,59 @@ class ProductStatusService:
                 "skill_root": self.skill_root,
                 "tool_root": self.tool_root,
             },
+        }
+
+
+class ProjectSnapshotService:
+    """聚合导出后端核心数据，供备份、迁移预检查和问题排查使用。"""
+
+    def __init__(
+        self,
+        *,
+        workflows: WorkflowStore,
+        runs: RunStore,
+        skills: SkillRepository,
+        tools: ToolCatalogStore,
+        status_service: ProductStatusService,
+    ) -> None:
+        self.workflows = workflows
+        self.runs = runs
+        self.skills = skills
+        self.tools = tools
+        self.status_service = status_service
+
+    def export(
+        self,
+        *,
+        include_runs: bool = True,
+        include_skill_content: bool = True,
+    ) -> Dict[str, Any]:
+        """生成只读快照；默认包含运行记录和技能正文，方便完整排障。"""
+        workflow_records = self.workflows.list()
+        run_records = self.runs.list() if include_runs else []
+        skill_records = self.skills.list()
+        tool_records = self.tools.list()
+        exported_skills = []
+        for skill in skill_records:
+            # 技能正文可能较长，接口允许前端按需关闭正文导出。
+            payload = skill.to_dict()
+            if not include_skill_content:
+                payload.pop("content", None)
+            exported_skills.append(payload)
+        return {
+            "format_version": 1,
+            "generated_at": _utc_now(),
+            "system": self.status_service.snapshot(),
+            "summary": {
+                "workflows": len(workflow_records),
+                "runs": len(run_records),
+                "skills": len(skill_records),
+                "tools": len(tool_records),
+            },
+            "workflows": [item.to_dict() for item in workflow_records],
+            "runs": [item.to_dict() for item in run_records],
+            "skills": exported_skills,
+            "tools": [item.to_dict() for item in tool_records],
         }
 
 

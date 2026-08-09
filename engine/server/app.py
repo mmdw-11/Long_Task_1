@@ -44,7 +44,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.context import ContextPolicy
-from ..modules.product_ops import ProductStatusService, ToolCatalogStore, ToolRecord
+from ..modules.product_ops import ProjectSnapshotService, ProductStatusService, ToolCatalogStore, ToolRecord
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
@@ -235,6 +235,13 @@ def create_app(
         run_root=str(runs.root_dir),
         skill_root=str(skills.root_dir),
         tool_root=str(tools.root_dir),
+    )
+    project_snapshot = ProjectSnapshotService(
+        workflows=workflows,
+        runs=runs,
+        skills=skills,
+        tools=tools,
+        status_service=system_status,
     )
     if policy is not None:
         orch.set_context_policy(policy, ledger_root=ledger_root)
@@ -501,6 +508,16 @@ def create_app(
             "skills": {"total": len(skills.list())},
             "tools": {"total": len(tools.list())},
         }
+
+    @app.get("/api/system/export")
+    def export_system_snapshot(
+        include_runs: bool = True,
+        include_skill_content: bool = True,
+    ) -> Dict[str, Any]:
+        return project_snapshot.export(
+            include_runs=include_runs,
+            include_skill_content=include_skill_content,
+        )
 
     @app.get("/api/export")
     def export() -> Dict[str, Any]:
