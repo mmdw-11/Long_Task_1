@@ -16,9 +16,18 @@ from .repository import SkillRepository
 class SkillRetriever:
     """为当前节点执行检索已发布且命中灰度策略的 Markdown 技能。"""
 
-    def __init__(self, repository: SkillRepository, *, top_k: int = 3) -> None:
+    def __init__(
+        self,
+        repository: SkillRepository,
+        *,
+        top_k: int = 3,
+        min_score: float = 0.0,
+        max_chars: int = 4000,
+    ) -> None:
         self.repository = repository
         self.top_k = max(1, top_k)
+        self.min_score = max(0.0, float(min_score))
+        self.max_chars = max(1, int(max_chars))
 
     def retrieve(
         self,
@@ -27,9 +36,11 @@ class SkillRetriever:
         node: str = "",
         metadata: Optional[Dict[str, Any]] = None,
         top_k: Optional[int] = None,
+        task_type: str = "",
     ) -> List[SkillMatch]:
         metadata = metadata or {}
-        query_terms = _terms(" ".join([query, node, _metadata_text(metadata)]))
+        effective_task_type = task_type or str(metadata.get("task_type") or "")
+        query_terms = _terms(" ".join([query, node, effective_task_type, _metadata_text(metadata)]))
         if not query_terms:
             return []
         matches: List[SkillMatch] = []
@@ -37,8 +48,21 @@ class SkillRetriever:
             # 灰度比例由仓库统一判断，检索器只负责过滤不可生效的技能。
             if not self.repository.is_rollout_enabled(skill, query=query, node=node):
                 continue
+            manifest = skill.manifest
+            if manifest.applicable_nodes and node and node not in manifest.applicable_nodes:
+                continue
+            if manifest.task_types and effective_task_type and effective_task_type not in manifest.task_types:
+                continue
             skill_terms = _terms(
-                " ".join([skill.name, skill.description, " ".join(skill.tags), skill.content])
+                " ".join(
+                    [
+                        skill.name,
+                        skill.description,
+                        " ".join(skill.tags),
+                        " ".join(manifest.task_types),
+                        skill.content,
+                    ]
+                )
             )
             if not skill_terms:
                 continue
@@ -46,6 +70,8 @@ class SkillRetriever:
             if not overlap:
                 continue
             score = len(overlap) / len(query_terms | skill_terms)
+            if score < self.min_score:
+                continue
             matches.append(
                 SkillMatch(
                     skill=skill,
@@ -56,28 +82,33 @@ class SkillRetriever:
         limit = top_k or self.top_k
         return sorted(matches, key=lambda item: item.score, reverse=True)[:limit]
 
-    def inject(self, state: Dict[str, Any], *, node: str, metadata: Dict[str, Any]) -> None:
-        query = str(state.get("input") or state.get("task") or "")
-        matches = self.retrieve(query, node=node, metadata=metadata)
+    def inject(self, state: Dict[str, Any], *, node: str, metadata: Dict[str, Any]) -> List[SkillMatch]:
+        query = " ".join(
+            str(state.get(key) or "")
+            for key in ("input", "task", "goal")
+            if state.get(key) is not None
+        )
+        task_type = str(state.get("task_type") or metadata.get("task_type") or "")
+        matches = self.retrieve(query, node=node, metadata=metadata, task_type=task_type)
         if not matches:
             state.pop(SKILL_CONTEXT_KEY, None)
             state.pop(SKILL_CONTEXT_TEXT_KEY, None)
-            return
+            return []
         state[SKILL_CONTEXT_KEY] = [match.to_dict() for match in matches]
-        state[SKILL_CONTEXT_TEXT_KEY] = render_skill_context(matches)
+        state[SKILL_CONTEXT_TEXT_KEY] = render_skill_context(matches)[: self.max_chars]
+        return matches
 
 
 def render_skill_context(matches: List[SkillMatch]) -> str:
     sections = ["可复用技能："]
     for match in matches:
-        sections.append(
-            "\n".join(
-                [
-                    f"- {match.skill.name} ({match.skill.id}, score={match.score})",
-                    match.skill.content.strip(),
-                ]
-            )
+        block = "\n".join(
+            [
+                f"- {match.skill.name} ({match.skill.id}, score={match.score})",
+                match.skill.content.strip(),
+            ]
         )
+        sections.append(block)
     return "\n\n".join(sections)
 
 

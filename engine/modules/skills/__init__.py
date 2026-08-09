@@ -7,6 +7,8 @@
 from ._types import (
     SKILL_CONTEXT_KEY,
     SKILL_CONTEXT_TEXT_KEY,
+    Skill,
+    SkillManifest,
     SkillMatch,
     SkillRecord,
     SkillStatus,
@@ -17,9 +19,6 @@ from .repository import SkillRepository
 from .retrieval import SkillRetriever
 from .trace import SkillTraceEvent, SkillTraceStore
 
-# 兼容旧入口命名，避免已有业务代码 import engine 时断链。
-Skill = SkillRecord
-SkillManifest = SkillRecord
 ValidationReport = SkillValidationReport
 
 __all__ = [

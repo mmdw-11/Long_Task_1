@@ -1,13 +1,13 @@
-"""Skill candidate generation, validation, and approval workflow.
+"""技能候选生成、验证与审批发布服务。
 
-This service is deliberately conservative: it creates Markdown candidates from
-observed runs, validates structure and evidence, then requires an approver
-before a skill becomes retrievable in production execution.
+服务默认采用保守流程：从成功运行生成 Markdown 候选，结构校验通过后必须审批发布。
+同时保留旧版多轨迹候选生成接口，便于已有业务代码平滑迁移到当前后端闭环。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Callable, Dict, List, Optional
 
 from ..workflows import RunRecord, RunStore
 from ._types import SkillRecord, SkillStatus, SkillValidationReport
@@ -20,14 +20,26 @@ class SkillEvolutionService:
 
     def __init__(
         self,
-        *,
-        repository: SkillRepository,
+        *legacy_args: Any,
+        repository: Optional[SkillRepository] = None,
         run_store: Optional[RunStore] = None,
         trace_store: Optional[SkillTraceStore] = None,
+        minimum_score_gain: float = 0.0,
+        max_edit_ratio: float = 1.0,
+        max_edit_chars: int = 10000,
     ) -> None:
+        if legacy_args:
+            repository = legacy_args[0]
+            if len(legacy_args) > 1:
+                trace_store = legacy_args[1]
+        if repository is None:
+            raise ValueError("repository is required")
         self.repository = repository
         self.run_store = run_store
         self.trace_store = trace_store
+        self.minimum_score_gain = max(0.0, float(minimum_score_gain))
+        self.max_edit_ratio = max(0.0, float(max_edit_ratio))
+        self.max_edit_chars = max(0, int(max_edit_chars))
 
     def create_candidate_from_run(
         self,
@@ -87,10 +99,16 @@ class SkillEvolutionService:
             self.repository.save(skill)
         return report
 
-    def publish(self, skill_id: str, *, approved_by: str) -> SkillRecord:
+    def publish(
+        self,
+        skill_id: str,
+        version: Optional[str | int] = None,
+        *,
+        approved_by: str,
+    ) -> SkillRecord:
         if not approved_by.strip():
             raise ValueError("approved_by is required")
-        skill = self.repository.get(skill_id)
+        skill = self.repository.get(skill_id, version)
         if skill.status == SkillStatus.CANDIDATE:
             report = self.validate(skill_id)
             if not report.passed:
@@ -104,6 +122,89 @@ class SkillEvolutionService:
             approved_by=approved_by,
             metadata={"published_by": approved_by},
         )
+
+    def create_candidate_from_runs(
+        self,
+        *,
+        skill_id: str,
+        name: str,
+        run_ids: List[str],
+        version: str = "1.0.0",
+        task_types: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        content: Optional[str] = None,
+    ) -> SkillRecord:
+        """兼容旧接口：根据多条轨迹生成候选技能，并执行文本编辑预算控制。"""
+        if not skill_id.strip():
+            raise ValueError("skill_id is required")
+        if not run_ids:
+            raise ValueError("run_ids is required")
+        existing = self.repository.get(skill_id) if self.repository.exists(skill_id) else None
+        candidate_content = content or self._render_candidate_from_traces(run_ids)
+        if existing is not None:
+            self._validate_edit_budget(existing.content, candidate_content)
+        return self.repository.create(
+            skill_id=skill_id,
+            name=name,
+            content=candidate_content,
+            status=SkillStatus.CANDIDATE,
+            tags=tags or [],
+            source_run_ids=run_ids,
+            metadata={
+                "legacy_manifest": {
+                    "version": version,
+                    "task_types": task_types or [],
+                    "applicable_nodes": [],
+                }
+            },
+        )
+
+    def validate_candidate(
+        self,
+        skill_id: str,
+        version: Optional[str | int],
+        evaluator: Callable[[Optional[SkillRecord]], Dict[str, Any]],
+    ) -> SkillValidationReport:
+        """兼容旧接口：比较基线与候选分数，失败时写入拒绝编辑缓冲区。"""
+        skill = self.repository.get(skill_id, version)
+        baseline = evaluator(None) or {}
+        candidate = evaluator(skill) or {}
+        baseline_score = float(baseline.get("score") or 0.0)
+        candidate_score = float(candidate.get("score") or 0.0)
+        safety_passed = bool(candidate.get("safety_passed", True))
+        regression_passed = bool(candidate.get("regression_passed", True))
+        findings = [str(item) for item in candidate.get("findings") or []]
+        accepted = (
+            safety_passed
+            and regression_passed
+            and candidate_score >= baseline_score + self.minimum_score_gain
+        )
+        report = SkillValidationReport(
+            skill_id=skill.id,
+            passed=accepted,
+            score=round(candidate_score, 4),
+            findings=findings,
+            metadata={
+                "baseline_score": baseline_score,
+                "candidate_score": candidate_score,
+                "safety_passed": safety_passed,
+                "regression_passed": regression_passed,
+            },
+        )
+        if accepted:
+            self.repository.transition(
+                skill.id,
+                SkillStatus.VALIDATED,
+                metadata={"last_validation": report.to_dict()},
+            )
+        else:
+            self.repository.transition(
+                skill.id,
+                SkillStatus.REJECTED,
+                metadata={"last_validation": report.to_dict()},
+            )
+            self._append_rejected_edit(skill, report)
+        return report
 
     def reject(self, skill_id: str, *, reason: str = "") -> SkillRecord:
         metadata = {"rejected_reason": reason} if reason else None
@@ -141,3 +242,45 @@ class SkillEvolutionService:
                 f"- 最终输出摘要：{output_text[:500]}",
             ]
         )
+
+    def _render_candidate_from_traces(self, run_ids: List[str]) -> str:
+        nodes: List[str] = []
+        if self.trace_store is not None:
+            for run_id in run_ids:
+                for event in self.trace_store.list(run_id):
+                    if event.node:
+                        nodes.append(event.node)
+        unique_nodes = sorted(set(nodes)) or ["unknown"]
+        return "\n".join(
+            [
+                "# Learned procedural skill",
+                "",
+                "## 适用场景",
+                "- 当任务与历史成功轨迹相似时复用。",
+                "",
+                "## 执行步骤",
+                *[f"- 调用 `{node}` 节点完成对应子步骤。" for node in unique_nodes],
+                "",
+                "## 校验方式",
+                "- 确认关键节点均已执行，并检查最终输出符合任务目标。",
+            ]
+        )
+
+    def _validate_edit_budget(self, old_content: str, new_content: str) -> None:
+        delta = abs(len(new_content) - len(old_content))
+        changed = sum(1 for left, right in zip(old_content, new_content) if left != right) + delta
+        allowed = min(self.max_edit_chars, max(1, int(len(old_content) * self.max_edit_ratio)))
+        if changed > allowed:
+            raise ValueError(f"candidate edit exceeds budget: {changed} > {allowed}")
+
+    def _append_rejected_edit(self, skill: SkillRecord, report: SkillValidationReport) -> None:
+        path = self.repository.root_dir / "rejected_edits.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"skill_id": skill.id, "version": skill.version, "report": report.to_dict()},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )

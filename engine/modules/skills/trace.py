@@ -1,12 +1,13 @@
-"""Append-only skill trace store.
+"""技能运行轨迹追加日志。
 
-Execution hooks write compact node events here so skill evolution can inspect
-what actually happened without scraping logs or frontend state.
+执行钩子把节点事件写入这里，技能演化服务可以基于真实轨迹生成候选技能。
+append/list 是当前接口；record/read 用于兼容早期调用。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,8 +69,69 @@ class SkillTraceStore:
                 )
         return events
 
+    def record(
+        self,
+        event_type: str,
+        *,
+        state: Dict[str, Any],
+        node: str = "",
+        step: int = 0,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """兼容旧接口：从 state.run_id 提取运行号并写入事件。"""
+        run_id = str(state.get("run_id") or "default")
+        self.append(
+            SkillTraceEvent(
+                run_id=run_id,
+                node=node,
+                event=event_type,
+                step=step,
+                payload={"state": dict(state), **(payload or {})},
+            )
+        )
+
+    def read(self, run_id: str) -> List[Dict[str, Any]]:
+        """兼容旧接口：返回字典形式，并补 event_type 字段。"""
+        records = []
+        for event in self.list(run_id):
+            payload = _redact_value(event.to_dict())
+            payload["event_type"] = event.event
+            payload["skills"] = _normalize_skills(event.payload.get("skills") or event.payload.get("matches"))
+            records.append(payload)
+            # 新版 skill_retrieved 是节点开始时的检索事件；旧版前端按 node_start/step_start 展示。
+            if event.event == "skill_retrieved":
+                node_start = dict(payload)
+                node_start["event_type"] = "node_start"
+                records.append(node_start)
+                step_start = dict(payload)
+                step_start["event_type"] = "step_start"
+                records.append(step_start)
+        return records
+
     def path_for(self, run_id: str) -> Path:
         clean = "".join(ch for ch in run_id.strip() if ch.isalnum() or ch in {"-", "_"})
         if not clean:
             raise ValueError("run_id is required")
         return self.root_dir / f"{clean}.jsonl"
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(r"(api[_-]?key\s*[=:]\s*)[A-Za-z0-9_\-]{8,}", r"\1REDACTED", value)
+    return value
+
+
+def _normalize_skills(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    if isinstance(raw, str):
+        matches = re.findall(r"\(([^(),\s]+),\s*score=([0-9.]+)\)", raw)
+        return [
+            {"skill_id": skill_id, "score": float(score)}
+            for skill_id, score in matches
+        ]
+    return []

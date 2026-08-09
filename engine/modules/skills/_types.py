@@ -1,7 +1,6 @@
-"""Shared data contracts for procedural skills.
+"""过程性技能共享数据结构。
 
-These types are intentionally plain dataclasses so API, hooks, tests, and future
-database adapters can share one stable payload shape.
+核心结构是 SkillRecord；SkillManifest 和 Skill 用于兼容早期业务代码里的技能对象写法。
 """
 
 from __future__ import annotations
@@ -25,6 +24,30 @@ class SkillStatus(str, Enum):
 
 
 @dataclass
+class SkillManifest:
+    """旧版技能清单结构，保留给已有调用方平滑迁移。"""
+
+    skill_id: str
+    name: str
+    version: str = "1.0.0"
+    status: SkillStatus = SkillStatus.DRAFT
+    description: str = ""
+    task_types: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    applicable_nodes: List[str] = field(default_factory=list)
+    approved_by: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Skill:
+    """旧版技能对象，内部会被仓库转换为 SkillRecord 存储。"""
+
+    manifest: SkillManifest
+    content: str
+
+
+@dataclass
 class SkillRecord:
     """A persisted Markdown skill plus lifecycle metadata."""
 
@@ -40,6 +63,23 @@ class SkillRecord:
     created_at: str = ""
     updated_at: str = ""
     version: int = 1
+
+    @property
+    def manifest(self) -> SkillManifest:
+        """兼容旧版 skill.manifest 读取方式。"""
+        legacy = dict(self.metadata.get("legacy_manifest") or {})
+        return SkillManifest(
+            skill_id=self.id,
+            name=self.name,
+            version=str(legacy.get("version") or self.version),
+            status=self.status,
+            description=self.description,
+            task_types=[str(item) for item in legacy.get("task_types") or []],
+            tags=list(self.tags),
+            applicable_nodes=[str(item) for item in legacy.get("applicable_nodes") or []],
+            approved_by=self.approved_by,
+            metadata=dict(self.metadata),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -93,6 +133,8 @@ class SkillMatch:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "skill_id": self.skill.id,
+            "version": str(self.skill.manifest.version),
             "score": self.score,
             "reason": self.reason,
             "skill": self.skill.to_dict(),
@@ -108,6 +150,11 @@ class SkillValidationReport:
     score: float
     findings: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def accepted(self) -> bool:
+        """兼容旧版评测报告命名。"""
+        return self.passed
 
     def to_dict(self) -> Dict[str, Any]:
         return {
