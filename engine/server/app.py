@@ -43,6 +43,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.context import ContextPolicy
+from ..modules.product_ops import ProductStatusService, ToolCatalogStore, ToolRecord
 from ..modules.skills import (
     SkillEvolutionService,
     SkillRepository,
@@ -148,6 +149,25 @@ class SkillSearchReq(BaseModel):
     top_k: int = 3
 
 
+class CreateToolReq(BaseModel):
+    name: str
+    display_name: str
+    description: str = ""
+    category: str = "general"
+    enabled: bool = True
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateToolReq(BaseModel):
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    enabled: Optional[bool] = None
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 def _resolve_target(target: str) -> Any:
     """把接口传入的字符串目标解析为内部值（"END" -> END 哨兵）。"""
     return END if target == "END" else target
@@ -168,6 +188,7 @@ def create_app(
     skill_repository: Optional[SkillRepository] = None,
     skill_trace_store: Optional[SkillTraceStore] = None,
     node_factory: Optional[NodeFactory] = None,
+    tool_catalog_store: Optional[ToolCatalogStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -180,6 +201,9 @@ def create_app(
     skills = skill_repository or SkillRepository(
         os.environ.get("SKILL_STORE_ROOT") or "runs/skills"
     )
+    tools = tool_catalog_store or ToolCatalogStore(
+        os.environ.get("TOOL_CATALOG_ROOT") or "runs/tool_catalog"
+    )
     skill_traces = skill_trace_store or SkillTraceStore(
         os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
     )
@@ -190,6 +214,12 @@ def create_app(
         trace_store=skill_traces,
     )
     runtime_factory = node_factory or AgentRuntimeFactory()
+    system_status = ProductStatusService(
+        workflow_root=str(workflows.root_dir),
+        run_root=str(runs.root_dir),
+        skill_root=str(skills.root_dir),
+        tool_root=str(tools.root_dir),
+    )
     if policy is not None:
         orch.set_context_policy(policy, ledger_root=ledger_root)
     orch.set_skill_retriever(skill_retriever)
@@ -256,6 +286,10 @@ def create_app(
     @app.get("/api/agents")
     def list_agents() -> List[Dict[str, Any]]:
         return [a.to_dict() for a in orch.list_agents()]
+
+    @app.get("/api/system/status")
+    def get_system_status() -> Dict[str, Any]:
+        return system_status.snapshot()
 
     @app.get("/api/agents/{agent_id}")
     def get_agent(agent_id: str) -> Dict[str, Any]:
@@ -551,6 +585,62 @@ def create_app(
     @app.get("/api/runs/{run_id}/skill-traces")
     def get_skill_traces(run_id: str) -> Dict[str, Any]:
         return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
+
+    # ------------------------- 工具目录 ------------------------- #
+    @app.post("/api/tools")
+    def create_tool(req: CreateToolReq) -> Dict[str, Any]:
+        try:
+            return tools.create(
+                name=req.name,
+                display_name=req.display_name,
+                description=req.description,
+                category=req.category,
+                enabled=req.enabled,
+                tags=req.tags,
+                metadata=req.metadata,
+            ).to_dict()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/tools")
+    def list_tools(enabled: Optional[bool] = None) -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in tools.list(enabled=enabled)]
+
+    @app.get("/api/tools/{tool_id}")
+    def get_tool(tool_id: str) -> Dict[str, Any]:
+        try:
+            return tools.get(tool_id).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.put("/api/tools/{tool_id}")
+    def update_tool(tool_id: str, req: UpdateToolReq) -> Dict[str, Any]:
+        try:
+            current = tools.get(tool_id)
+            updated = ToolRecord.from_dict(
+                {
+                    **current.to_dict(),
+                    "display_name": req.display_name if req.display_name is not None else current.display_name,
+                    "description": req.description if req.description is not None else current.description,
+                    "category": req.category if req.category is not None else current.category,
+                    "enabled": req.enabled if req.enabled is not None else current.enabled,
+                    "tags": req.tags if req.tags is not None else current.tags,
+                    "metadata": req.metadata if req.metadata is not None else current.metadata,
+                }
+            )
+            return tools.save(updated).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.delete("/api/tools/{tool_id}")
+    def delete_tool(tool_id: str) -> Dict[str, Any]:
+        try:
+            tools.delete(tool_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
 
     return app
 
