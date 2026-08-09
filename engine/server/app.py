@@ -29,10 +29,11 @@ Agent 管理
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, HTTPException
     from pydantic import BaseModel, Field
 except Exception as exc:  # pragma: no cover - 取决于运行环境
     raise ImportError(
@@ -41,7 +42,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 
 from ..constants import END
 from ..modules.context import ContextPolicy
-from ..modules.workflows import WorkflowRecord, WorkflowStore
+from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
 from ..orchestrator import Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -88,6 +89,12 @@ class RunReq(BaseModel):
     recursion_limit: int = 50
 
 
+class CreateRunReq(BaseModel):
+    input: Dict[str, Any] = Field(default_factory=dict)
+    recursion_limit: int = 50
+    workflow_id: Optional[str] = None
+
+
 class SaveWorkflowReq(BaseModel):
     name: str
     description: str = ""
@@ -110,6 +117,10 @@ def _resolve_target(target: str) -> Any:
     return END if target == "END" else target
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def create_app(
     orchestrator: Optional[Orchestrator] = None,
     *,
@@ -117,6 +128,7 @@ def create_app(
     context_policy_path: Optional[str] = None,
     context_ledger_root: Optional[str] = None,
     workflow_store: Optional[WorkflowStore] = None,
+    run_store: Optional[RunStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -125,6 +137,7 @@ def create_app(
     workflows = workflow_store or WorkflowStore(
         os.environ.get("WORKFLOW_STORE_ROOT") or "runs/workflows"
     )
+    runs = run_store or RunStore(os.environ.get("RUN_STORE_ROOT") or "runs/executions")
     if policy is not None:
         orch.set_context_policy(policy, ledger_root=ledger_root)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
@@ -132,6 +145,38 @@ def create_app(
     def _apply_policy(target: Orchestrator) -> None:
         if policy is not None:
             target.set_context_policy(policy, ledger_root=ledger_root)
+
+    def _orchestrator_for_run(workflow_id: Optional[str]) -> Orchestrator:
+        if workflow_id:
+            target = Orchestrator.from_dict(workflows.get(workflow_id).graph)
+        else:
+            target = Orchestrator.from_dict(orch.to_dict())
+        _apply_policy(target)
+        return target
+
+    async def _execute_run(record: RunRecord) -> None:
+        try:
+            record.status = "running"
+            runs.save(record)
+            target = _orchestrator_for_run(record.workflow_id)
+            compiled = target.build_graph(recursion_limit=record.recursion_limit)
+            async for event in compiled.astream(
+                record.input,
+                record.recursion_limit,
+                run_id=record.id,
+            ):
+                record.events.append(event)
+                if event.get("type") == "final":
+                    record.state = dict(event.get("state") or {})
+                runs.save(record)
+            record.status = "succeeded"
+            record.finished_at = _utc_now()
+            runs.save(record)
+        except Exception as e:  # noqa: BLE001 - API persists failures for polling
+            record.status = "failed"
+            record.error = str(e)
+            record.finished_at = _utc_now()
+            runs.save(record)
 
     # ------------------------- Agent 管理 ------------------------- #
     @app.post("/api/agents")
@@ -228,6 +273,39 @@ def create_app(
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"state": state}
+
+    @app.post("/api/runs")
+    async def create_run(
+        req: CreateRunReq,
+        background_tasks: BackgroundTasks,
+    ) -> Dict[str, Any]:
+        try:
+            if req.workflow_id:
+                workflows.get(req.workflow_id)
+            record = runs.create(
+                input=req.input,
+                recursion_limit=req.recursion_limit,
+                workflow_id=req.workflow_id,
+            )
+            record.status = "queued"
+            runs.save(record)
+            background_tasks.add_task(_execute_run, record)
+            return record.to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/runs")
+    def list_runs(workflow_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in runs.list(workflow_id=workflow_id)]
+
+    @app.get("/api/runs/{run_id}")
+    def get_run(run_id: str) -> Dict[str, Any]:
+        try:
+            return runs.get(run_id).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/export")
     def export() -> Dict[str, Any]:
