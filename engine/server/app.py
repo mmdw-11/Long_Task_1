@@ -536,6 +536,22 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
+    @app.get("/api/workflows/{workflow_id}/versions")
+    def list_workflow_versions(workflow_id: str) -> List[Dict[str, Any]]:
+        try:
+            return [item.to_dict() for item in workflows.list_versions(workflow_id)]
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/workflows/{workflow_id}/versions/{version}")
+    def get_workflow_version(workflow_id: str, version: int) -> Dict[str, Any]:
+        try:
+            return workflows.get_version(workflow_id, version).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     @app.put("/api/workflows/{workflow_id}")
     def update_workflow(workflow_id: str, req: UpdateWorkflowReq) -> Dict[str, Any]:
         try:
@@ -574,6 +590,15 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"ok": True, "workflow": record.to_dict(), "graph": orch.to_dict()}
+
+    @app.post("/api/workflows/{workflow_id}/rollback/{version}")
+    def rollback_workflow(workflow_id: str, version: int) -> Dict[str, Any]:
+        try:
+            return workflows.rollback(workflow_id, version).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.delete("/api/workflows/{workflow_id}")
     def delete_workflow(workflow_id: str) -> Dict[str, Any]:

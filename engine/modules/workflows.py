@@ -138,17 +138,23 @@ class RunRecord:
 
 
 class WorkflowStore:
-    """File-backed workflow repository with deterministic JSON records."""
+    """文件型工作流仓库，支持主版本与历史版本归档。"""
 
     def __init__(self, root_dir: str | Path = "runs/workflows") -> None:
         self.root_dir = Path(root_dir)
+        self.version_dir = self.root_dir / "versions"
         self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.version_dir.mkdir(parents=True, exist_ok=True)
 
     def save(self, record: WorkflowRecord) -> WorkflowRecord:
         existing = self.get(record.id) if self.exists(record.id) else None
         now = _utc_now()
         if existing is not None:
+            self._archive_version(existing)
             record.created_at = existing.created_at
+            record.version = existing.version + 1
+        else:
+            record.version = max(1, record.version)
         record.updated_at = now
         self._path(record.id).write_text(
             json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
@@ -197,11 +203,67 @@ class WorkflowStore:
             raise KeyError(f"workflow {workflow_id!r} not found")
         path.unlink()
 
+    def list_versions(self, workflow_id: str) -> List[WorkflowRecord]:
+        if not self.exists(workflow_id):
+            raise KeyError(f"workflow {workflow_id!r} not found")
+        version_root = self._version_root(workflow_id)
+        records = []
+        for path in sorted(version_root.glob("v*.json")):
+            records.append(WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+        records.append(self.get(workflow_id))
+        return sorted(records, key=lambda item: item.version, reverse=True)
+
+    def get_version(self, workflow_id: str, version: int) -> WorkflowRecord:
+        current = self.get(workflow_id)
+        if current.version == version:
+            return current
+        path = self._version_path(workflow_id, version)
+        if not path.exists():
+            raise KeyError(f"workflow {workflow_id!r} version {version!r} not found")
+        return WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def rollback(self, workflow_id: str, version: int) -> WorkflowRecord:
+        target = self.get_version(workflow_id, version)
+        current = self.get(workflow_id)
+        restored = WorkflowRecord.from_dict(
+            {
+                **target.to_dict(),
+                "version": current.version,
+                "metadata": {
+                    **target.metadata,
+                    "rollback_from_version": current.version,
+                    "rollback_to_version": version,
+                },
+            }
+        )
+        return self.save(restored)
+
+    def _archive_version(self, record: WorkflowRecord) -> None:
+        path = self._version_path(record.id, record.version)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return
+        path.write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
     def _path(self, workflow_id: str) -> Path:
         clean = _clean_id(workflow_id)
         if not clean:
             raise ValueError("workflow_id is required")
         return self.root_dir / f"{clean}.json"
+
+    def _version_root(self, workflow_id: str) -> Path:
+        clean = _clean_id(workflow_id)
+        if not clean:
+            raise ValueError("workflow_id is required")
+        return self.version_dir / clean
+
+    def _version_path(self, workflow_id: str, version: int) -> Path:
+        if version <= 0:
+            raise ValueError("version must be positive")
+        return self._version_root(workflow_id) / f"v{version}.json"
 
 
 class RunStore:
