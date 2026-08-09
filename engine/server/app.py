@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
 except Exception as exc:  # pragma: no cover - 取决于运行环境
     raise ImportError(
         "启动 REST 服务需要安装 fastapi 与 uvicorn：pip install fastapi 'uvicorn[standard]'"
@@ -41,6 +41,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 
 from ..constants import END
 from ..modules.context import ContextPolicy
+from ..modules.workflows import WorkflowRecord, WorkflowStore
 from ..orchestrator import Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -87,6 +88,23 @@ class RunReq(BaseModel):
     recursion_limit: int = 50
 
 
+class SaveWorkflowReq(BaseModel):
+    name: str
+    description: str = ""
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    graph: Optional[Dict[str, Any]] = None
+    workflow_id: Optional[str] = None
+
+
+class UpdateWorkflowReq(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    graph: Optional[Dict[str, Any]] = None
+
+
 def _resolve_target(target: str) -> Any:
     """把接口传入的字符串目标解析为内部值（"END" -> END 哨兵）。"""
     return END if target == "END" else target
@@ -98,14 +116,22 @@ def create_app(
     context_policy: Optional[ContextPolicy] = None,
     context_policy_path: Optional[str] = None,
     context_ledger_root: Optional[str] = None,
+    workflow_store: Optional[WorkflowStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
     policy = context_policy or _load_context_policy(context_policy_path)
     ledger_root = context_ledger_root or os.environ.get("CONTEXT_LEDGER_ROOT") or "runs/context"
+    workflows = workflow_store or WorkflowStore(
+        os.environ.get("WORKFLOW_STORE_ROOT") or "runs/workflows"
+    )
     if policy is not None:
         orch.set_context_policy(policy, ledger_root=ledger_root)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
+
+    def _apply_policy(target: Orchestrator) -> None:
+        if policy is not None:
+            target.set_context_policy(policy, ledger_root=ledger_root)
 
     # ------------------------- Agent 管理 ------------------------- #
     @app.post("/api/agents")
@@ -212,9 +238,82 @@ def create_app(
         # nonlocal 重绑定会更新所有闭包共享的同一变量，后续接口即读取新实例。
         nonlocal orch
         orch = Orchestrator.from_dict(data)
-        if policy is not None:
-            orch.set_context_policy(policy, ledger_root=ledger_root)
+        _apply_policy(orch)
         return {"ok": True, "agents": len(data.get("agents", []))}
+
+    # ------------------------- 工作流持久化 ------------------------- #
+    @app.post("/api/workflows")
+    def save_workflow(req: SaveWorkflowReq) -> Dict[str, Any]:
+        try:
+            record = workflows.create(
+                workflow_id=req.workflow_id,
+                name=req.name,
+                description=req.description,
+                tags=req.tags,
+                metadata=req.metadata,
+                graph=req.graph or orch.to_dict(),
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return record.to_dict()
+
+    @app.get("/api/workflows")
+    def list_workflows() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in workflows.list()]
+
+    @app.get("/api/workflows/{workflow_id}")
+    def get_workflow(workflow_id: str) -> Dict[str, Any]:
+        try:
+            return workflows.get(workflow_id).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.put("/api/workflows/{workflow_id}")
+    def update_workflow(workflow_id: str, req: UpdateWorkflowReq) -> Dict[str, Any]:
+        try:
+            current = workflows.get(workflow_id)
+            updated = WorkflowRecord.from_dict(
+                {
+                    **current.to_dict(),
+                    "name": req.name if req.name is not None else current.name,
+                    "description": (
+                        req.description
+                        if req.description is not None
+                        else current.description
+                    ),
+                    "tags": req.tags if req.tags is not None else current.tags,
+                    "metadata": (
+                        req.metadata if req.metadata is not None else current.metadata
+                    ),
+                    "graph": req.graph if req.graph is not None else current.graph,
+                }
+            )
+            return workflows.save(updated).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/workflows/{workflow_id}/load")
+    def load_workflow(workflow_id: str) -> Dict[str, Any]:
+        nonlocal orch
+        try:
+            record = workflows.get(workflow_id)
+            orch = Orchestrator.from_dict(record.graph)
+            _apply_policy(orch)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "workflow": record.to_dict(), "graph": orch.to_dict()}
+
+    @app.delete("/api/workflows/{workflow_id}")
+    def delete_workflow(workflow_id: str) -> Dict[str, Any]:
+        try:
+            workflows.delete(workflow_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
 
     return app
 

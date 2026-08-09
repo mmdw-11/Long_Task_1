@@ -85,6 +85,7 @@ from .modules.execution import (
     OpenAICompatibleExecutor,
     ResilientInferenceRunner,
 )
+from .modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
 from .modules.evaluation import EvaluationResult, Evaluator, RuleEvaluator
 from .modules.security import (
     AuditPack,
@@ -235,6 +236,10 @@ __all__ = [
     "OpenAICompatibleCloudExecutor",
     "OpenAICompatibleExecutor",
     "ResilientInferenceRunner",
+    "RunRecord",
+    "RunStore",
+    "WorkflowRecord",
+    "WorkflowStore",
     # Security
     "AuditPack",
     "AuditPackBuilder",
