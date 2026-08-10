@@ -1,4 +1,8 @@
-"""LLM 记忆判断层：mem0 风格的记忆更新决策。"""
+"""LLM 记忆判断层：mem0 风格的记忆更新决策。
+
+默认工厂会读取项目现有 `.env`，复用端边云链路中“云”侧的 DeepSeek/OpenAI 兼容
+模型，用于判断长期记忆应该新增、更新、丢弃还是保持不变。
+"""
 
 from __future__ import annotations
 
@@ -124,7 +128,7 @@ class OpenAIMemoryJudge:
             result = json.loads(content)
             return result.get("actions", [])
         except json.JSONDecodeError:
-            # Fallback: try to extract JSON from the response
+            # 返回非严格 JSON 时，兜底提取第一个 JSON 对象。
             match = re.search(r"\{.*\}", content, re.DOTALL)
             if match:
                 try:
@@ -133,3 +137,24 @@ class OpenAIMemoryJudge:
                 except json.JSONDecodeError:
                     pass
             return []
+
+
+def build_default_memory_judge() -> OpenAIMemoryJudge:
+    """构造默认记忆判断器。
+
+    这里不新引入一套模型配置，而是复用项目原本的云端配置：
+    - OPENAI_API_KEY / DEEPSEEK_API_KEY
+    - OPENAI_BASE_URL，默认 https://api.deepseek.com
+    - OPENAI_JUDGE_MODEL 或 OPENAI_MODEL
+
+    这样记忆模块、端边云调度和实验代码使用同一个 DeepSeek 入口。
+    """
+    from ...config import load_settings
+
+    settings = load_settings()
+    return OpenAIMemoryJudge(
+        api_key=settings.api_key,
+        model=os.environ.get("OPENAI_JUDGE_MODEL") or settings.model,
+        base_url=settings.base_url,
+        temperature=float(os.environ.get("MEMORY_JUDGE_TEMPERATURE", "0")),
+    )
