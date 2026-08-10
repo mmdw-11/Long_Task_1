@@ -1,0 +1,2 @@
+{"id":"longmem-sample-1","question":"小明最后决定使用哪个数据库？","answer":"SQLite","memories":["第一轮讨论里，小明考虑过 MySQL。","最终复盘中，小明决定实验阶段先使用 SQLite，后续再迁移。"]}
+{"id":"longmem-sample-2","question":"技能发布前需要谁审批？","answer":"PM","memories":["技能候选必须先通过结构校验。","发布技能时必须提供 approved_by，当前项目约定由 PM 审批。"]}

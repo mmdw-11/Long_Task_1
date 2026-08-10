@@ -1,0 +1,2 @@
+{"id":"skill-sample-1","task":"安排一次跨部门会议并检查冲突","task_type":"calendar","trajectory":"成功经验：先读取参与人日历，再检查时间冲突，最后创建提醒并输出确认清单。","expected_steps":["读取参与人日历","检查时间冲突","创建提醒"]}
+{"id":"skill-sample-2","task":"修复代码缺陷并补充验证","task_type":"code","trajectory":"成功经验：先复现报错，再定位根因，然后实现最小修复，最后补充单元测试。","expected_steps":["复现报错","定位根因","补充单元测试"]}

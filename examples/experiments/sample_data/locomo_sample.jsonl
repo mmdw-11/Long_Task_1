@@ -1,0 +1,2 @@
+{"id":"locomo-sample-1","question":"用户不喜欢哪种报告风格？","answer":"过度营销","conversation":[{"speaker":"user","text":"我喜欢实用、安静一点的报告。"},{"speaker":"assistant","text":"明白，避免过度营销风格，突出实验指标。"}]}
+{"id":"locomo-sample-2","question":"用户希望先做哪个实验？","answer":"技能闭环","conversation":[{"speaker":"user","text":"我想先证明技能闭环有效，再做复杂路由训练。"},{"speaker":"assistant","text":"那就先跑技能闭环小样本。"}]}

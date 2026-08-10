@@ -35,7 +35,7 @@ from .base import MemoryStore, NoOpMemoryStore
 from .embedding import BGEM3EmbeddingModel, EmbeddingModel, HashingEmbeddingModel
 
 # LLM judge
-from .judge import MemoryLLMJudge, OpenAIMemoryJudge
+from .judge import MemoryLLMJudge, OpenAIMemoryJudge, build_default_memory_judge
 
 # Store implementation
 from .store import HybridTieredMemoryStore
@@ -64,6 +64,7 @@ __all__ = [
     # Judge
     "MemoryLLMJudge",
     "OpenAIMemoryJudge",
+    "build_default_memory_judge",
     # Store
     "HybridTieredMemoryStore",
 ]
