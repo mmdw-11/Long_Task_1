@@ -73,3 +73,16 @@ class ExperimentRow:
             "metrics": dict(self.metrics),
             "metadata": dict(self.metadata),
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExperimentRow":
+        """从 rows.jsonl 里的字典恢复实验结果，供断点续跑合并使用。"""
+        return cls(
+            id=str(data.get("id") or ""),
+            passed=bool(data.get("passed", False)),
+            score=float(data.get("score") or 0.0),
+            prediction=str(data.get("prediction") or ""),
+            expected=str(data.get("expected") or ""),
+            metrics=dict(data.get("metrics") or {}),
+            metadata=dict(data.get("metadata") or {}),
+        )
