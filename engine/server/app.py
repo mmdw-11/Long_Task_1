@@ -28,13 +28,16 @@ Agent 管理
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 try:
     from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel, Field
 except Exception as exc:  # pragma: no cover - 取决于运行环境
     raise ImportError(
@@ -43,6 +46,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 
 from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
+from ..modules.auth import AuthStore
 from ..modules.context import ContextPolicy
 from ..modules.product_ops import ProjectSnapshotService, ProductStatusService, ToolCatalogStore, ToolRecord
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
@@ -66,6 +70,14 @@ class CreateAgentReq(BaseModel):
     model: str = ""
     description: str = ""
     config: Dict[str, Any] = {}
+
+
+class UpdateAgentReq(BaseModel):
+    name: Optional[str] = None
+    sys_prompt: Optional[str] = None
+    model: Optional[str] = None
+    description: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
 
 
 class AddSubAgentReq(BaseModel):
@@ -179,6 +191,26 @@ class UpdateToolReq(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class RegisterReq(BaseModel):
+    email: str
+    name: str
+    password: str
+
+
+class LoginReq(BaseModel):
+    email: str
+    password: str
+
+
+class ForgotPasswordReq(BaseModel):
+    email: str
+
+
+class ResetPasswordReq(BaseModel):
+    token: str
+    password: str
+
+
 def _resolve_target(target: str) -> Any:
     """把接口传入的字符串目标解析为内部值（"END" -> END 哨兵）。"""
     return END if target == "END" else target
@@ -186,6 +218,48 @@ def _resolve_target(target: str) -> Any:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _build_run_summary(record: RunRecord) -> Dict[str, Any]:
+    """基于可见执行事件生成稳定、完整且可审计的运行总结。"""
+    steps: List[Dict[str, Any]] = []
+    for event in record.events:
+        if event.get("type") != "node_end":
+            continue
+        output = event.get("output")
+        if not output:
+            update = dict(event.get("update") or {})
+            messages = list(update.get("messages") or [])
+            latest = messages[-1] if messages else {}
+            output = latest.get("content") if isinstance(latest, dict) else None
+        steps.append(
+            {
+                "order": len(steps) + 1,
+                "agent": event.get("node"),
+                "output": str(output or "")[:4000],
+                "executor": event.get("executor"),
+                "model": event.get("model"),
+                "tool_calls": list(event.get("tool_calls") or []),
+                "completed_at": event.get("timestamp"),
+            }
+        )
+    final_text = ""
+    messages = list(record.state.get("messages") or [])
+    if messages and isinstance(messages[-1], dict):
+        final_text = str(messages[-1].get("content") or "")
+    if not final_text:
+        final_text = str(record.state.get("input") or "")
+    return {
+        "title": "运行完成" if record.status == "succeeded" else "运行未成功完成",
+        "status": record.status,
+        "overview": (
+            f"共执行 {len(steps)} 个 Agent 步骤，"
+            f"产生 {len(record.events)} 条可见运行事件。"
+        ),
+        "steps": steps,
+        "final_output": final_text,
+        "errors": [record.error] if record.error else [],
+    }
 
 
 def create_app(
@@ -201,6 +275,8 @@ def create_app(
     node_factory: Optional[NodeFactory] = None,
     tool_catalog_store: Optional[ToolCatalogStore] = None,
     api_audit_store: Optional[ApiAuditStore] = None,
+    auth_store: Optional[AuthStore] = None,
+    auth_required: bool = False,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -219,6 +295,7 @@ def create_app(
     api_audit = api_audit_store or ApiAuditStore(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
+    auth = auth_store or AuthStore(os.environ.get("AUTH_DB_PATH") or "runs/auth/users.sqlite3")
     skill_traces = skill_trace_store or SkillTraceStore(
         os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
     )
@@ -251,12 +328,24 @@ def create_app(
 
     @app.middleware("http")
     async def admin_guard_and_audit(request: Request, call_next):
+        auth_public = request.url.path in {
+            "/api/auth/register", "/api/auth/login", "/api/auth/forgot-password", "/api/auth/reset-password"
+        }
+        authorization = request.headers.get("Authorization", "")
+        bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if not bearer and request.url.path.endswith("/events"):
+            bearer = request.query_params.get("access_token", "")
+        user = auth.user_for_token(bearer)
+        if auth_required and request.url.path.startswith("/api/") and not auth_public and user is None:
+            return JSONResponse(status_code=401, content={"detail": "请先登录"})
+        request.state.user = user
         # 仅对写接口启用最小保护；读接口保留无密钥可访问能力。
         requires_admin = (
             request.method.upper() in {"POST", "PUT", "DELETE"}
             and request.url.path.startswith("/api/")
+            and not auth_public
         )
-        actor = request.headers.get("X-Actor", "")
+        actor = user.email if user else request.headers.get("X-Actor", "")
         provided_key = request.headers.get("X-Admin-Key", "")
         if requires_admin and admin_api_key and provided_key != admin_api_key:
             api_audit.append(
@@ -285,6 +374,56 @@ def create_app(
             )
         return response
 
+    # ------------------------- 账户与会话 ------------------------- #
+    @app.post("/api/auth/register")
+    def register(req: RegisterReq) -> Dict[str, Any]:
+        try:
+            user = auth.register(req.email, req.name, req.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"token": auth.create_session(user.id), "user": user.to_dict()}
+
+    @app.post("/api/auth/login")
+    def login(req: LoginReq) -> Dict[str, Any]:
+        user = auth.authenticate(req.email, req.password)
+        if user is None:
+            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+        return {"token": auth.create_session(user.id), "user": user.to_dict()}
+
+    @app.get("/api/auth/me")
+    def current_user(request: Request) -> Dict[str, Any]:
+        user = request.state.user
+        if user is None:
+            raise HTTPException(status_code=401, detail="请先登录")
+        return {"user": user.to_dict()}
+
+    @app.post("/api/auth/logout")
+    def logout(request: Request) -> Dict[str, Any]:
+        authorization = request.headers.get("Authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if token:
+            auth.revoke_session(token)
+        return {"ok": True}
+
+    @app.post("/api/auth/forgot-password")
+    def forgot_password(req: ForgotPasswordReq) -> Dict[str, Any]:
+        token = auth.create_password_reset(req.email)
+        payload: Dict[str, Any] = {"message": "如果该邮箱已注册，重置说明将被发送"}
+        # 本地开发没有邮件服务时返回一次性令牌；生产环境必须关闭并由邮件适配器投递。
+        if token and os.environ.get("AUTH_EXPOSE_RESET_TOKEN", "1") == "1":
+            payload["reset_token"] = token
+        return payload
+
+    @app.post("/api/auth/reset-password")
+    def reset_password(req: ResetPasswordReq) -> Dict[str, Any]:
+        try:
+            updated = auth.reset_password(req.token, req.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not updated:
+            raise HTTPException(status_code=400, detail="重置链接无效或已过期")
+        return {"ok": True}
+
     def _apply_policy(target: Orchestrator) -> None:
         if policy is not None:
             target.set_context_policy(policy, ledger_root=ledger_root)
@@ -300,8 +439,15 @@ def create_app(
         return target
 
     async def _execute_run(record: RunRecord) -> None:
+        started_clock = time.perf_counter()
         try:
             record.status = "running"
+            record.metadata = {
+                **record.metadata,
+                "started_at": _utc_now(),
+                "active_agent": None,
+                "summary": None,
+            }
             runs.save(record)
             target = _orchestrator_for_run(record.workflow_id)
             compiled = target.build_graph(
@@ -314,6 +460,26 @@ def create_app(
                 record.recursion_limit,
                 run_id=record.id,
             ):
+                event = {
+                    **event,
+                    "sequence": len(record.events) + 1,
+                    "timestamp": _utc_now(),
+                }
+                if event.get("type") == "node_start":
+                    record.metadata["active_agent"] = event.get("node")
+                    event["message"] = f"进入 {event.get('node')}，开始处理当前步骤"
+                elif event.get("type") == "node_end":
+                    update = dict(event.get("update") or {})
+                    messages = list(update.get("messages") or [])
+                    latest_message = messages[-1] if messages else {}
+                    result = dict(latest_message.get("result") or {}) if isinstance(latest_message, dict) else {}
+                    event["output"] = latest_message.get("content") if isinstance(latest_message, dict) else None
+                    event["executor"] = result.get("executor")
+                    event["model"] = result.get("model")
+                    event["tool_calls"] = list(result.get("metadata", {}).get("tool_calls") or [])
+                    event["message"] = f"{event.get('node')} 已完成当前步骤"
+                elif event.get("type") == "route":
+                    event["message"] = f"{event.get('node')} 完成路由，下一步：{', '.join(event.get('targets') or ['结束'])}"
                 # 长任务取消采用协作式检查，避免强杀执行线程导致状态文件损坏。
                 latest = runs.get(record.id)
                 if latest.status == "cancel_requested":
@@ -329,11 +495,23 @@ def create_app(
                 runs.save(record)
             record.status = "succeeded"
             record.finished_at = _utc_now()
+            record.metadata = {
+                **record.metadata,
+                "active_agent": None,
+                "duration_ms": round((time.perf_counter() - started_clock) * 1000, 2),
+                "summary": _build_run_summary(record),
+            }
             runs.save(record)
         except Exception as e:  # noqa: BLE001 - API persists failures for polling
             record.status = "failed"
             record.error = str(e)
             record.finished_at = _utc_now()
+            record.metadata = {
+                **record.metadata,
+                "active_agent": None,
+                "duration_ms": round((time.perf_counter() - started_clock) * 1000, 2),
+                "summary": _build_run_summary(record),
+            }
             runs.save(record)
 
     # ------------------------- Agent 管理 ------------------------- #
@@ -375,6 +553,22 @@ def create_app(
             return orch.get_agent(agent_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.put("/api/agents/{agent_id}")
+    def update_agent(agent_id: str, req: UpdateAgentReq) -> Dict[str, Any]:
+        try:
+            return orch.update_agent(
+                agent_id,
+                name=req.name,
+                sys_prompt=req.sys_prompt,
+                model=req.model,
+                description=req.description,
+                config=req.config,
+            ).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.delete("/api/agents/{agent_id}")
     def delete_agent(agent_id: str) -> Dict[str, Any]:
@@ -481,6 +675,45 @@ def create_app(
             return runs.get(run_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/runs/{run_id}/events")
+    async def stream_run_events(run_id: str, after: int = 0):
+        """用 SSE 推送持久化运行事件；断线后可通过 after 继续。"""
+        try:
+            runs.get(run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        async def _event_stream():
+            cursor = max(0, after)
+            idle_ticks = 0
+            while True:
+                record = runs.get(run_id)
+                while cursor < len(record.events):
+                    event = record.events[cursor]
+                    cursor += 1
+                    yield f"id: {cursor}\nevent: run_event\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    idle_ticks = 0
+                if record.status in {"succeeded", "failed", "canceled"}:
+                    completed = {
+                        "type": "run_completed",
+                        "status": record.status,
+                        "finished_at": record.finished_at,
+                        "duration_ms": record.metadata.get("duration_ms"),
+                        "summary": record.metadata.get("summary"),
+                    }
+                    yield f"event: run_completed\ndata: {json.dumps(completed, ensure_ascii=False)}\n\n"
+                    break
+                idle_ticks += 1
+                if idle_ticks % 15 == 0:
+                    yield ": keep-alive\n\n"
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/api/runs/{run_id}/cancel")
     def cancel_run(run_id: str, req: CancelRunReq) -> Dict[str, Any]:
@@ -837,4 +1070,4 @@ def _load_context_policy(context_policy_path: Optional[str]) -> Optional[Context
 
 
 # 便于 `uvicorn engine.server.app:app` 直接启动。
-app = create_app()
+app = create_app(auth_required=os.environ.get("AUTH_REQUIRED", "1") == "1")
