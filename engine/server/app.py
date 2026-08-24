@@ -36,7 +36,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 try:
-    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel, Field
 except Exception as exc:  # pragma: no cover - 取决于运行环境
@@ -334,9 +335,20 @@ def create_app(
     orch.set_skill_retriever(skill_retriever)
     orch.set_skill_trace_store(skill_traces)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\]):\d+",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.middleware("http")
     async def admin_guard_and_audit(request: Request, call_next):
+        # CORS preflight does not carry a bearer token. Let CORSMiddleware
+        # answer it before applying the API authentication policy.
+        if request.method.upper() == "OPTIONS":
+            return await call_next(request)
         auth_public = request.url.path in {
             "/api/auth/register", "/api/auth/login", "/api/auth/forgot-password", "/api/auth/reset-password"
         }
@@ -344,6 +356,8 @@ def create_app(
         bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
         if not bearer and request.url.path.endswith("/events"):
             bearer = request.query_params.get("access_token", "")
+        if not bearer:
+            bearer = request.cookies.get("agentforge_session", "")
         user = auth.user_for_token(bearer)
         if auth_required and request.url.path.startswith("/api/") and not auth_public and user is None:
             return JSONResponse(status_code=401, content={"detail": "请先登录"})
@@ -384,20 +398,35 @@ def create_app(
         return response
 
     # ------------------------- 账户与会话 ------------------------- #
+    def _set_session_cookie(response: Response, token: str) -> None:
+        response.set_cookie(
+            "agentforge_session",
+            token,
+            max_age=7 * 24 * 60 * 60,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            path="/",
+        )
+
     @app.post("/api/auth/register")
-    def register(req: RegisterReq) -> Dict[str, Any]:
+    def register(req: RegisterReq, response: Response) -> Dict[str, Any]:
         try:
             user = auth.register(req.email, req.name, req.password)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return {"token": auth.create_session(user.id), "user": user.to_dict()}
+        token = auth.create_session(user.id)
+        _set_session_cookie(response, token)
+        return {"token": token, "user": user.to_dict()}
 
     @app.post("/api/auth/login")
-    def login(req: LoginReq) -> Dict[str, Any]:
+    def login(req: LoginReq, response: Response) -> Dict[str, Any]:
         user = auth.authenticate(req.email, req.password)
         if user is None:
             raise HTTPException(status_code=401, detail="邮箱或密码错误")
-        return {"token": auth.create_session(user.id), "user": user.to_dict()}
+        token = auth.create_session(user.id)
+        _set_session_cookie(response, token)
+        return {"token": token, "user": user.to_dict()}
 
     @app.get("/api/auth/me")
     def current_user(request: Request) -> Dict[str, Any]:
@@ -407,11 +436,14 @@ def create_app(
         return {"user": user.to_dict()}
 
     @app.post("/api/auth/logout")
-    def logout(request: Request) -> Dict[str, Any]:
+    def logout(request: Request, response: Response) -> Dict[str, Any]:
         authorization = request.headers.get("Authorization", "")
         token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if not token:
+            token = request.cookies.get("agentforge_session", "")
         if token:
             auth.revoke_session(token)
+        response.delete_cookie("agentforge_session", path="/")
         return {"ok": True}
 
     @app.post("/api/auth/forgot-password")
