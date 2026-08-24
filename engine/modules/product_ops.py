@@ -178,6 +178,9 @@ class ProductStatusService:
                 "skill_lifecycle": True,
                 "agent_runtime": True,
                 "tool_catalog": True,
+                "runtime_tool_execution": True,
+                "run_todo_stream": True,
+                "approval_events": True,
             },
             "models": {
                 "device": {

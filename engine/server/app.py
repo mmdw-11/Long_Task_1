@@ -48,6 +48,7 @@ from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.auth import AuthStore
 from ..modules.context import ContextPolicy
+from ..modules.context.todo import TodoManager
 from ..modules.product_ops import ProjectSnapshotService, ProductStatusService, ToolCatalogStore, ToolRecord
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
@@ -58,6 +59,7 @@ from ..modules.skills import (
     SkillTraceStore,
 )
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
+from ..modules.tool_runtime import ensure_builtin_tools
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -119,6 +121,10 @@ class CreateRunReq(BaseModel):
 
 
 class CancelRunReq(BaseModel):
+    reason: str = ""
+
+
+class ApprovalDecisionReq(BaseModel):
     reason: str = ""
 
 
@@ -289,9 +295,12 @@ def create_app(
     skills = skill_repository or SkillRepository(
         os.environ.get("SKILL_STORE_ROOT") or "runs/skills"
     )
+    owns_tool_catalog = tool_catalog_store is None
     tools = tool_catalog_store or ToolCatalogStore(
         os.environ.get("TOOL_CATALOG_ROOT") or "runs/tool_catalog"
     )
+    if owns_tool_catalog or os.environ.get("SEED_BUILTIN_TOOLS") == "1":
+        ensure_builtin_tools(tools)
     api_audit = api_audit_store or ApiAuditStore(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
@@ -305,7 +314,7 @@ def create_app(
         run_store=runs,
         trace_store=skill_traces,
     )
-    runtime_factory = node_factory or AgentRuntimeFactory()
+    runtime_factory = node_factory or AgentRuntimeFactory(tool_catalog_store=tools)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -438,6 +447,100 @@ def create_app(
         _apply_policy(target)
         return target
 
+    def _append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = {
+            **event,
+            "sequence": len(record.events) + 1,
+            "timestamp": _utc_now(),
+        }
+        record.events.append(enriched)
+        runs.save(record)
+        return enriched
+
+    def _task_text(payload: Dict[str, Any]) -> str:
+        for key in ("input", "task", "goal", "query"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _initial_plan(payload: Dict[str, Any], target: Orchestrator) -> List[str]:
+        explicit = payload.get("current_plan") or payload.get("plan")
+        if isinstance(explicit, list) and explicit:
+            return [str(item) for item in explicit if str(item).strip()]
+        graph = target.to_dict()
+        agents = [item for item in graph.get("agents", []) if isinstance(item, dict)]
+        if agents:
+            return [
+                f"{agent.get('name') or agent.get('id')}：{agent.get('description') or '完成该节点负责的任务'}"
+                for agent in agents
+            ]
+        task = _task_text(payload)
+        return [
+            f"理解任务目标：{task[:80]}",
+            "拆解关键步骤并收集必要上下文",
+            "执行任务并记录证据、工具结果与中间产物",
+            "核对输出完整性并生成最终总结",
+        ]
+
+    def _seed_todo_events(record: RunRecord, target: Orchestrator) -> None:
+        plan = _initial_plan(record.input, target)
+        record.input = {**record.input, "current_plan": plan, "original_goal": _task_text(record.input)}
+        record.metadata = {**record.metadata, "todos": []}
+        if policy is not None and target._context_ledger is not None:  # noqa: SLF001 - service-level integration hook
+            ledger = target._context_ledger.load_or_create(record.id, {**record.input, "run_id": record.id})  # noqa: SLF001
+            TodoManager(ledger).set_todos(plan, source="planner", reason="initial run planning")
+            target._context_ledger.save(ledger)  # noqa: SLF001
+            todos = [item.to_dict() for item in ledger.todo_items]
+        else:
+            todos = [
+                {
+                    "id": f"todo-{idx}",
+                    "content": item,
+                    "status": "in_progress" if idx == 1 else "pending",
+                    "source": "planner",
+                }
+                for idx, item in enumerate(plan, 1)
+            ]
+        record.metadata["todos"] = todos
+        _append_event(
+            record,
+            {
+                "type": "plan_created",
+                "message": "已根据任务和工作流生成执行 TODO",
+                "plan": plan,
+                "todos": todos,
+            },
+        )
+
+    def _advance_todo(record: RunRecord, *, node: str, output: str = "") -> None:
+        todos = list(record.metadata.get("todos") or [])
+        if not todos:
+            return
+        active_idx = next((idx for idx, item in enumerate(todos) if item.get("status") == "in_progress"), -1)
+        if active_idx < 0:
+            active_idx = next((idx for idx, item in enumerate(todos) if item.get("status") == "pending"), -1)
+            if active_idx >= 0:
+                todos[active_idx]["status"] = "in_progress"
+        if active_idx < 0:
+            return
+        todos[active_idx]["status"] = "completed"
+        todos[active_idx]["evidence"] = output[:500] or f"{node} completed"
+        next_idx = next((idx for idx, item in enumerate(todos) if item.get("status") == "pending"), -1)
+        if next_idx >= 0:
+            todos[next_idx]["status"] = "in_progress"
+        record.metadata["todos"] = todos
+        _append_event(
+            record,
+            {
+                "type": "todo_updated",
+                "node": node,
+                "message": f"{node} 完成后已更新 TODO 状态",
+                "todos": todos,
+                "active_todo_id": todos[next_idx]["id"] if next_idx >= 0 else "",
+            },
+        )
+
     async def _execute_run(record: RunRecord) -> None:
         started_clock = time.perf_counter()
         try:
@@ -450,6 +553,7 @@ def create_app(
             }
             runs.save(record)
             target = _orchestrator_for_run(record.workflow_id)
+            _seed_todo_events(record, target)
             compiled = target.build_graph(
                 node_factory=runtime_factory,
                 recursion_limit=record.recursion_limit,
@@ -460,11 +564,6 @@ def create_app(
                 record.recursion_limit,
                 run_id=record.id,
             ):
-                event = {
-                    **event,
-                    "sequence": len(record.events) + 1,
-                    "timestamp": _utc_now(),
-                }
                 if event.get("type") == "node_start":
                     record.metadata["active_agent"] = event.get("node")
                     event["message"] = f"进入 {event.get('node')}，开始处理当前步骤"
@@ -489,7 +588,27 @@ def create_app(
                     record.metadata = latest.metadata
                     runs.save(record)
                     return
-                record.events.append(event)
+                _append_event(record, event)
+                if event.get("type") == "node_end":
+                    for tool_call in event.get("tool_calls") or []:
+                        _append_event(
+                            record,
+                            {
+                                "type": (
+                                    "approval_required"
+                                    if tool_call.get("status") == "approval_required"
+                                    else "tool_result"
+                                ),
+                                "node": event.get("node"),
+                                "tool_call": tool_call,
+                                "message": (
+                                    f"{event.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
+                                    if tool_call.get("status") == "approval_required"
+                                    else f"{event.get('node')} 已调用工具 {tool_call.get('display_name') or tool_call.get('name')}"
+                                ),
+                            },
+                        )
+                    _advance_todo(record, node=str(event.get("node") or ""), output=str(event.get("output") or ""))
                 if event.get("type") == "final":
                     record.state = dict(event.get("state") or {})
                 runs.save(record)
@@ -721,6 +840,50 @@ def create_app(
             return runs.mark_cancel_requested(run_id, reason=req.reason).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/runs/{run_id}/approvals/{sequence}/approve")
+    def approve_tool_call(run_id: str, sequence: int, req: ApprovalDecisionReq) -> Dict[str, Any]:
+        return _record_approval_decision(run_id, sequence, approved=True, reason=req.reason)
+
+    @app.post("/api/runs/{run_id}/approvals/{sequence}/reject")
+    def reject_tool_call(run_id: str, sequence: int, req: ApprovalDecisionReq) -> Dict[str, Any]:
+        return _record_approval_decision(run_id, sequence, approved=False, reason=req.reason)
+
+    def _record_approval_decision(run_id: str, sequence: int, *, approved: bool, reason: str = "") -> Dict[str, Any]:
+        try:
+            record = runs.get(run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        target = next(
+            (
+                event
+                for event in record.events
+                if int(event.get("sequence") or 0) == sequence and event.get("type") == "approval_required"
+            ),
+            None,
+        )
+        if target is None:
+            raise HTTPException(status_code=404, detail="approval event not found")
+        decisions = dict(record.metadata.get("approval_decisions") or {})
+        decisions[str(sequence)] = {
+            "approved": approved,
+            "reason": reason,
+            "decided_at": _utc_now(),
+        }
+        record.metadata["approval_decisions"] = decisions
+        _append_event(
+            record,
+            {
+                "type": "approval_decision",
+                "approval_sequence": sequence,
+                "approved": approved,
+                "reason": reason,
+                "tool_call": target.get("tool_call"),
+                "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
+            },
+        )
+        runs.save(record)
+        return record.to_dict()
 
     @app.post("/api/runs/{run_id}/retry")
     async def retry_run(run_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
@@ -1070,4 +1233,11 @@ def _load_context_policy(context_policy_path: Optional[str]) -> Optional[Context
 
 
 # 便于 `uvicorn engine.server.app:app` 直接启动。
-app = create_app(auth_required=os.environ.get("AUTH_REQUIRED", "1") == "1")
+_load_dotenv_for_context_policy()
+_default_context_policy_path = os.environ.get("CONTEXT_POLICY_PATH")
+if not _default_context_policy_path and os.path.exists("configs/context_policy.yaml"):
+    _default_context_policy_path = "configs/context_policy.yaml"
+app = create_app(
+    context_policy_path=_default_context_policy_path,
+    auth_required=os.environ.get("AUTH_REQUIRED", "1") == "1",
+)
