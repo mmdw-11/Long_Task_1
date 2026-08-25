@@ -396,6 +396,82 @@ class ApplicationStore:
         return self.root_dir / f"{clean}.json"
 
 
+@dataclass
+class MemoryBankRecord:
+    """控制台记忆库资源；不替代运行时上下文账本，只保存其可配置入口。"""
+
+    id: str
+    name: str
+    description: str = ""
+    status: str = "ready"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "name": self.name, "description": self.description,
+            "status": self.status, "metadata": dict(self.metadata),
+            "created_at": self.created_at, "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MemoryBankRecord":
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("memory bank name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"memory-{uuid.uuid4().hex[:12]}",
+            name=name, description=str(data.get("description") or ""),
+            status=str(data.get("status") or "ready"), metadata=dict(data.get("metadata") or {}),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+        )
+
+
+class MemoryBankStore:
+    """文件型记忆库目录，供应用挂载和控制台浏览。"""
+
+    def __init__(self, root_dir: str | Path = "runs/memory_banks") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, *, name: str, description: str = "", metadata: Optional[Dict[str, Any]] = None) -> MemoryBankRecord:
+        return self.save(MemoryBankRecord.from_dict({"name": name, "description": description, "metadata": metadata or {}}))
+
+    def save(self, record: MemoryBankRecord) -> MemoryBankRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            record.created_at = self.get(record.id).created_at
+        record.updated_at = now
+        self._path(record.id).write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return record
+
+    def list(self) -> List[MemoryBankRecord]:
+        return sorted([self.get(p.stem) for p in self.root_dir.glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, bank_id: str) -> MemoryBankRecord:
+        path = self._path(bank_id)
+        if not path.exists():
+            raise KeyError(f"memory bank {bank_id!r} not found")
+        return MemoryBankRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def delete(self, bank_id: str) -> None:
+        path = self._path(bank_id)
+        if not path.exists():
+            raise KeyError(f"memory bank {bank_id!r} not found")
+        path.unlink()
+
+    def exists(self, bank_id: str) -> bool:
+        return self._path(bank_id).exists()
+
+    def _path(self, bank_id: str) -> Path:
+        clean = _clean_id(bank_id)
+        if not clean:
+            raise ValueError("memory bank id is required")
+        return self.root_dir / f"{clean}.json"
+
+
 class ProductStatusService:
     """汇总后端能力、配置和健康摘要。"""
 

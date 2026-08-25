@@ -54,6 +54,7 @@ from ..modules.product_ops import (
     ApiKeyStore,
     ApplicationRecord,
     ApplicationStore,
+    MemoryBankStore,
     ProjectSnapshotService,
     ProductStatusService,
     ToolCatalogStore,
@@ -242,6 +243,14 @@ class CreateApplicationRunReq(BaseModel):
     recursion_limit: int = 50
 
 
+class CreateMemoryBankReq(BaseModel):
+    """创建控制台可挂载的记忆库资源。"""
+
+    name: str
+    description: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RegisterReq(BaseModel):
     email: str
     name: str
@@ -326,6 +335,7 @@ def create_app(
     node_factory: Optional[NodeFactory] = None,
     tool_catalog_store: Optional[ToolCatalogStore] = None,
     application_store: Optional[ApplicationStore] = None,
+    memory_bank_store: Optional[MemoryBankStore] = None,
     api_key_store: Optional[ApiKeyStore] = None,
     api_audit_store: Optional[ApiAuditStore] = None,
     auth_store: Optional[AuthStore] = None,
@@ -350,6 +360,9 @@ def create_app(
         ensure_builtin_tools(tools)
     applications = application_store or ApplicationStore(
         os.environ.get("APPLICATION_STORE_ROOT") or "runs/applications"
+    )
+    memory_banks = memory_bank_store or MemoryBankStore(
+        os.environ.get("MEMORY_BANK_STORE_ROOT") or "runs/memory_banks"
     )
     api_keys = api_key_store or ApiKeyStore(os.environ.get("API_KEY_STORE_ROOT") or "runs/api_keys")
     api_audit = api_audit_store or ApiAuditStore(
@@ -1415,6 +1428,102 @@ def create_app(
     @app.get("/api/runs/{run_id}/skill-traces")
     def get_skill_traces(run_id: str) -> Dict[str, Any]:
         return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
+
+    # ------------------------- 百炼式资源市场 ------------------------- #
+    # 这些条目是可安装的本地模板，不声明为已接入第三方云服务。
+    mcp_market = [
+        {"slug": "web-search", "name": "联网检索", "provider": "示例市场", "category": "通用办公", "description": "为 Agent 提供检索与网页摘要能力；安装后仍需配置实际 MCP URL。", "installs": 129, "cover": "mint"},
+        {"slug": "calendar", "name": "日历与会议", "provider": "示例市场", "category": "通用办公", "description": "查询可用时间、创建会议和发送日程提醒的 MCP 接入模板。", "installs": 88, "cover": "violet"},
+        {"slug": "email", "name": "邮件发送", "provider": "示例市场", "category": "通用办公", "description": "起草、确认并发送邮件。真实发送前将进入工具审批流程。", "installs": 201, "cover": "blue"},
+        {"slug": "maps", "name": "地图与路线", "provider": "示例市场", "category": "生活服务", "description": "地点搜索、路线规划和行程建议的 MCP 接入模板。", "installs": 109, "cover": "warm"},
+        {"slug": "contract", "name": "合同信息抽取", "provider": "示例市场", "category": "法律", "description": "从合同正文中抽取关键字段；可替换为企业内的 MCP 服务地址。", "installs": 66, "cover": "rose"},
+        {"slug": "knowledge", "name": "企业知识检索", "provider": "示例市场", "category": "知识库", "description": "面向企业文档的检索问答 MCP 接入模板。", "installs": 55, "cover": "cyan"},
+    ]
+    skill_market = [
+        {"slug": "email-writer", "name": "商务邮件撰写", "category": "通用办公", "description": "根据收件人、目的和语气起草清晰、可发送的商务邮件。", "content": "# 商务邮件撰写\n\n先确认收件人、主题、目的和语气；给出结构化邮件草稿。发送前必须请求用户确认。"},
+        {"slug": "research-report", "name": "研究报告", "category": "内容创意", "description": "把研究主题拆解为目标、证据、结论与待验证项，避免虚构来源。", "content": "# 研究报告\n\n先列出研究问题和证据需求，输出结论时标识事实、推断和待核验项。"},
+        {"slug": "travel-planner", "name": "旅行计划", "category": "通用办公", "description": "生成兼顾时间、预算、天气与交通的行程方案。", "content": "# 旅行计划\n\n确认目的地、日期、预算、同行人和偏好；涉及实时信息时建议调用已授权工具。"},
+        {"slug": "meeting-summary", "name": "会议纪要", "category": "通用办公", "description": "将会议材料整理为结论、行动项、负责人和截止时间。", "content": "# 会议纪要\n\n以结论、行动项、负责人、截止时间四部分输出；缺失信息明确标记待补充。"},
+        {"slug": "web-design", "name": "网页设计", "category": "代码开发", "description": "把用户需求转为信息架构、界面层级和可实施的前端建议。", "content": "# 网页设计\n\n先给出页面目标、用户路径和组件清单，再输出可实施的视觉与交互建议。"},
+        {"slug": "data-analysis", "name": "数据分析", "category": "金融", "description": "帮助解释指标、识别异常并给出可复现的分析路径。", "content": "# 数据分析\n\n明确数据范围与口径，区分计算结果和业务推断，给出复核步骤。"},
+    ]
+    app_templates = [
+        {"slug": "blank-agent", "name": "空白智能体", "description": "最小化核心工具集，从零开始构建。", "system_prompt": "你是可靠的智能体助手。先澄清任务，再规划、执行和总结。"},
+        {"slug": "article-polish", "name": "文章润色", "description": "改善表达和结构，不改变原意、不捏造事实。", "system_prompt": "你是文章润色助手。保留事实和原意，输出修改稿与修改说明。"},
+        {"slug": "research", "name": "研究报告", "description": "从主题到完整报告的研究型智能体模板。", "system_prompt": "你是研究报告助手。先分解问题与证据，再输出有来源边界的完整报告。"},
+        {"slug": "email-assistant", "name": "邮件助手", "description": "起草邮件并在真实发送前请求用户确认。", "system_prompt": "你是邮件助手。先收集收件人、主题、正文和附件信息；调用发送邮件工具前必须等待用户批准。"},
+    ]
+
+    @app.get("/api/marketplace/mcp")
+    def list_mcp_marketplace() -> List[Dict[str, Any]]:
+        return mcp_market
+
+    @app.post("/api/marketplace/mcp/{slug}/install")
+    def install_mcp_template(slug: str) -> Dict[str, Any]:
+        item = next((x for x in mcp_market if x["slug"] == slug), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="未找到 MCP 市场模板")
+        existing = next((x for x in tools.list() if x.name == f"mcp_{slug}"), None)
+        if existing is not None:
+            return {"installed": False, "tool": existing.to_dict(), "message": "该 MCP 模板已经安装"}
+        record = tools.create(
+            name=f"mcp_{slug}", display_name=item["name"], description=item["description"],
+            category="mcp", tags=["mcp", item["category"]],
+            metadata={"source": "mcp", "adapter": "mcp_http", "market_slug": slug, "risk": "read", "mcp_url": "", "needs_configuration": True},
+        )
+        return {"installed": True, "tool": record.to_dict(), "message": "MCP 模板已安装，请在 MCP 管理中填写服务地址"}
+
+    @app.get("/api/marketplace/skills")
+    def list_skill_marketplace() -> List[Dict[str, Any]]:
+        return [{k: v for k, v in item.items() if k != "content"} for item in skill_market]
+
+    @app.post("/api/marketplace/skills/{slug}/install")
+    def install_skill_template(slug: str) -> Dict[str, Any]:
+        item = next((x for x in skill_market if x["slug"] == slug), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="未找到 Skill 市场模板")
+        existing = next((x for x in skills.list() if x.metadata.get("market_slug") == slug), None)
+        if existing is not None:
+            return {"installed": False, "skill": existing.to_dict(), "message": "该 Skill 模板已经安装"}
+        record = skills.create(name=item["name"], content=item["content"], description=item["description"], tags=[item["category"], "market"], metadata={"market_slug": slug, "source": "market"})
+        return {"installed": True, "skill": record.to_dict(), "message": "Skill 模板已保存为草稿，可在 Skill 管理中发布"}
+
+    @app.get("/api/marketplace/apps")
+    def list_application_templates() -> List[Dict[str, Any]]:
+        return app_templates
+
+    @app.post("/api/marketplace/apps/{slug}/install")
+    def install_application_template(slug: str) -> Dict[str, Any]:
+        item = next((x for x in app_templates if x["slug"] == slug), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="未找到应用模板")
+        app_record = applications.create(name=item["name"], app_type="agent", description=item["description"], system_prompt=item["system_prompt"], metadata={"template_slug": slug})
+        draft = Orchestrator()
+        entry_id = draft.create_agent(name=item["name"], sys_prompt=item["system_prompt"], description=item["description"], config={"tool_ids": [], "skill_ids": []})
+        draft.set_entry(entry_id)
+        workflow = workflows.create(name=item["name"], description=item["description"], tags=["agent", "template"], metadata={"application_id": app_record.id, "template_slug": slug}, graph=draft.to_dict())
+        app_record.workflow_id, app_record.entry_agent_id = workflow.id, entry_id
+        return {"installed": True, "application": applications.save(app_record).to_dict()}
+
+    # ------------------------- 记忆库目录 ------------------------- #
+    @app.get("/api/memory-banks")
+    def list_memory_banks() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in memory_banks.list()]
+
+    @app.post("/api/memory-banks")
+    def create_memory_bank(req: CreateMemoryBankReq) -> Dict[str, Any]:
+        try:
+            return memory_banks.create(name=req.name, description=req.description, metadata=req.metadata).to_dict()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.delete("/api/memory-banks/{bank_id}")
+    def delete_memory_bank(bank_id: str) -> Dict[str, Any]:
+        try:
+            memory_banks.delete(bank_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
 
     # ------------------------- API Key 管理 ------------------------- #
     @app.get("/api/api-keys")
