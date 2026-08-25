@@ -86,6 +86,8 @@ class Connection:
     # 条件边可选：从状态字段取值来路由，或提供命名条件。
     condition_key: Optional[str] = None
     path_map: Dict[str, str] = field(default_factory=dict)
+    # 仅供控制台表达连接语义；执行时条件语义仍由 conditional/path_map 决定。
+    edge_type: str = "direct"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -94,6 +96,7 @@ class Connection:
             "conditional": self.conditional,
             "condition_key": self.condition_key,
             "path_map": self.path_map,
+            "edge_type": self.edge_type,
         }
 
 
@@ -408,7 +411,7 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # 连接 / 入口
     # ------------------------------------------------------------------ #
-    def connect(self, source_id: str, target_id: str) -> None:
+    def connect(self, source_id: str, target_id: str, *, edge_type: str = "direct") -> None:
         """连接两个 agent：source -> target（图中的一条静态边）。
 
         ``target_id`` 可以是另一个 agent 的 id，也可以是 ``END`` 表示结束。
@@ -421,13 +424,15 @@ class Orchestrator:
             for c in self._connections
         ):
             return  # 已存在相同连线
-        self._connections.append(Connection(source_id, target_id))
+        self._connections.append(Connection(source_id, target_id, edge_type=edge_type))
 
     def connect_conditional(
         self,
         source_id: str,
         condition_key: str,
         path_map: Dict[str, str],
+        *,
+        edge_type: str = "condition",
     ) -> None:
         """建立条件连线：依据状态中 ``condition_key`` 的值路由到不同目标。
 
@@ -444,15 +449,19 @@ class Orchestrator:
                 conditional=True,
                 condition_key=condition_key,
                 path_map=dict(path_map),
+                edge_type=edge_type,
             )
         )
 
-    def disconnect(self, source_id: str, target_id: str) -> None:
+    def disconnect(self, source_id: str, target_id: str, *, conditional: bool = False) -> None:
         """删除 source -> target 的静态连线。"""
         self._connections = [
             c
             for c in self._connections
-            if not (c.source == source_id and c.target == target_id and not c.conditional)
+            if not (
+                c.source == source_id
+                and ((c.conditional and conditional) or (not c.conditional and not conditional and c.target == target_id))
+            )
         ]
 
     def set_entry(self, agent_id: str) -> None:
@@ -580,6 +589,7 @@ class Orchestrator:
                     conditional=c.get("conditional", False),
                     condition_key=c.get("condition_key"),
                     path_map=c.get("path_map", {}),
+                    edge_type=c.get("edge_type", "condition" if c.get("conditional", False) else "direct"),
                 )
             )
         orch._entry = data.get("entry")

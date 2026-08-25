@@ -109,11 +109,14 @@ class ConnectReq(BaseModel):
     conditional: bool = False
     condition_key: Optional[str] = None
     path_map: Dict[str, str] = {}
+    # 控制台展示用：direct / condition / loop / batch / intent。
+    edge_type: str = "direct"
 
 
 class DisconnectReq(BaseModel):
     source_id: str
     target_id: str
+    conditional: bool = False
 
 
 class EntryReq(BaseModel):
@@ -865,16 +868,21 @@ def create_app(
                 if not req.condition_key or not req.path_map:
                     raise ValueError("条件边需要提供 condition_key 与 path_map")
                 path_map = {k: _resolve_target(v) for k, v in req.path_map.items()}
-                orch.connect_conditional(req.source_id, req.condition_key, path_map)
+                orch.connect_conditional(
+                    req.source_id,
+                    req.condition_key,
+                    path_map,
+                    edge_type=req.edge_type or "condition",
+                )
             else:
-                orch.connect(req.source_id, _resolve_target(req.target_id))
+                orch.connect(req.source_id, _resolve_target(req.target_id), edge_type=req.edge_type)
         except (KeyError, ValueError) as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"ok": True}
 
     @app.delete("/api/connections")
     def disconnect(req: DisconnectReq) -> Dict[str, Any]:
-        orch.disconnect(req.source_id, _resolve_target(req.target_id))
+        orch.disconnect(req.source_id, _resolve_target(req.target_id), conditional=req.conditional)
         return {"ok": True}
 
     # ------------------------- 图 / 执行 ------------------------- #
