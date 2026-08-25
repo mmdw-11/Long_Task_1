@@ -50,7 +50,15 @@ from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.auth import AuthStore
 from ..modules.context import ContextPolicy
 from ..modules.context.todo import TodoManager
-from ..modules.product_ops import ApiKeyStore, ProjectSnapshotService, ProductStatusService, ToolCatalogStore, ToolRecord
+from ..modules.product_ops import (
+    ApiKeyStore,
+    ApplicationRecord,
+    ApplicationStore,
+    ProjectSnapshotService,
+    ProductStatusService,
+    ToolCatalogStore,
+    ToolRecord,
+)
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
@@ -207,6 +215,28 @@ class UpdateApiKeyReq(BaseModel):
     enabled: bool
 
 
+class CreateApplicationReq(BaseModel):
+    name: str
+    app_type: str = "agent"
+    description: str = ""
+    model: str = ""
+    system_prompt: str = ""
+    tool_ids: List[str] = Field(default_factory=list)
+    skill_ids: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateApplicationReq(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    model: Optional[str] = None
+    system_prompt: Optional[str] = None
+    tool_ids: Optional[List[str]] = None
+    skill_ids: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class RegisterReq(BaseModel):
     email: str
     name: str
@@ -290,6 +320,7 @@ def create_app(
     skill_trace_store: Optional[SkillTraceStore] = None,
     node_factory: Optional[NodeFactory] = None,
     tool_catalog_store: Optional[ToolCatalogStore] = None,
+    application_store: Optional[ApplicationStore] = None,
     api_key_store: Optional[ApiKeyStore] = None,
     api_audit_store: Optional[ApiAuditStore] = None,
     auth_store: Optional[AuthStore] = None,
@@ -312,6 +343,9 @@ def create_app(
     )
     if owns_tool_catalog or os.environ.get("SEED_BUILTIN_TOOLS") == "1":
         ensure_builtin_tools(tools)
+    applications = application_store or ApplicationStore(
+        os.environ.get("APPLICATION_STORE_ROOT") or "runs/applications"
+    )
     api_keys = api_key_store or ApiKeyStore(os.environ.get("API_KEY_STORE_ROOT") or "runs/api_keys")
     api_audit = api_audit_store or ApiAuditStore(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
@@ -708,6 +742,7 @@ def create_app(
             "anthropic_base_url": f"{host.rstrip('/')}/apps/anthropic",
             "workspace": os.environ.get("AGENTFORGE_WORKSPACE_NAME") or "默认业务空间",
             "api_key_count": len(api_keys.list()),
+            "application_count": len(applications.list()),
         }
         return snapshot
 
@@ -950,6 +985,7 @@ def create_app(
     def get_system_metrics() -> Dict[str, Any]:
         return {
             "runs": runs.metrics(),
+            "applications": {"total": len(applications.list())},
             "workflows": {"total": len(workflows.list())},
             "skills": {"total": len(skills.list())},
             "tools": {"total": len(tools.list())},
@@ -976,6 +1012,124 @@ def create_app(
         orch = Orchestrator.from_dict(data)
         _apply_policy(orch)
         return {"ok": True, "agents": len(data.get("agents", []))}
+
+    # ------------------------- 应用中心 ------------------------- #
+    @app.get("/api/apps")
+    def list_applications() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in applications.list()]
+
+    @app.post("/api/apps")
+    def create_application(req: CreateApplicationReq) -> Dict[str, Any]:
+        try:
+            app_record = applications.create(
+                name=req.name,
+                app_type=req.app_type,
+                description=req.description,
+                model=req.model,
+                system_prompt=req.system_prompt,
+                tool_ids=req.tool_ids,
+                skill_ids=req.skill_ids,
+                metadata=req.metadata,
+            )
+            draft = Orchestrator()
+            entry_id = draft.create_agent(
+                name=req.name,
+                sys_prompt=req.system_prompt,
+                model=req.model,
+                description=req.description or "负责应用入口任务理解、工具调用和最终答复。",
+                config={"tool_ids": req.tool_ids, "skill_ids": req.skill_ids},
+            )
+            draft.set_entry(entry_id)
+            workflow = workflows.create(
+                name=req.name,
+                description=req.description,
+                tags=[req.app_type, "application"],
+                metadata={"application_id": app_record.id, **req.metadata},
+                graph=draft.to_dict(),
+            )
+            app_record.workflow_id = workflow.id
+            app_record.entry_agent_id = entry_id
+            app_record.metadata = {**app_record.metadata, "workflow_version": workflow.version}
+            applications.save(app_record)
+            return app_record.to_dict()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/apps/{app_id}")
+    def get_application(app_id: str) -> Dict[str, Any]:
+        try:
+            app_record = applications.get(app_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        payload = app_record.to_dict()
+        if app_record.workflow_id:
+            try:
+                payload["workflow"] = workflows.get(app_record.workflow_id).to_dict()
+            except KeyError:
+                payload["workflow_missing"] = True
+        return payload
+
+    @app.put("/api/apps/{app_id}")
+    def update_application(app_id: str, req: UpdateApplicationReq) -> Dict[str, Any]:
+        try:
+            current = applications.get(app_id)
+            updated = ApplicationRecord.from_dict(
+                {
+                    **current.to_dict(),
+                    "name": req.name if req.name is not None else current.name,
+                    "description": req.description if req.description is not None else current.description,
+                    "status": req.status if req.status is not None else current.status,
+                    "model": req.model if req.model is not None else current.model,
+                    "system_prompt": req.system_prompt if req.system_prompt is not None else current.system_prompt,
+                    "tool_ids": req.tool_ids if req.tool_ids is not None else current.tool_ids,
+                    "skill_ids": req.skill_ids if req.skill_ids is not None else current.skill_ids,
+                    "metadata": req.metadata if req.metadata is not None else current.metadata,
+                }
+            )
+            if updated.workflow_id:
+                workflow = workflows.get(updated.workflow_id)
+                graph = Orchestrator.from_dict(workflow.graph)
+                if updated.entry_agent_id:
+                    graph.update_agent(
+                        updated.entry_agent_id,
+                        name=updated.name,
+                        sys_prompt=updated.system_prompt,
+                        model=updated.model,
+                        description=updated.description,
+                        config={"tool_ids": updated.tool_ids, "skill_ids": updated.skill_ids},
+                    )
+                workflows.save(
+                    WorkflowRecord.from_dict(
+                        {
+                            **workflow.to_dict(),
+                            "name": updated.name,
+                            "description": updated.description,
+                            "graph": graph.to_dict(),
+                        }
+                    )
+                )
+            return applications.save(updated).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/apps/{app_id}/publish")
+    def publish_application(app_id: str) -> Dict[str, Any]:
+        try:
+            app_record = applications.get(app_id)
+            app_record.status = "published"
+            return applications.save(app_record).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.delete("/api/apps/{app_id}")
+    def delete_application(app_id: str) -> Dict[str, Any]:
+        try:
+            applications.delete(app_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
 
     # ------------------------- 工作流持久化 ------------------------- #
     @app.post("/api/workflows")

@@ -261,6 +261,141 @@ class ApiKeyStore:
         return self.root_dir / f"{clean}.json"
 
 
+@dataclass
+class ApplicationRecord:
+    """应用中心记录，承接百炼式创建应用入口并绑定现有工作流。"""
+
+    id: str
+    name: str
+    app_type: str = "agent"
+    description: str = ""
+    status: str = "draft"
+    workflow_id: str = ""
+    entry_agent_id: str = ""
+    model: str = ""
+    system_prompt: str = ""
+    tool_ids: List[str] = field(default_factory=list)
+    skill_ids: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "app_type": self.app_type,
+            "description": self.description,
+            "status": self.status,
+            "workflow_id": self.workflow_id,
+            "entry_agent_id": self.entry_agent_id,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "tool_ids": list(self.tool_ids),
+            "skill_ids": list(self.skill_ids),
+            "metadata": dict(self.metadata),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ApplicationRecord":
+        if not isinstance(data, dict):
+            raise ValueError("application payload must be an object")
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("application.name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"app-{uuid.uuid4().hex[:12]}",
+            name=name,
+            app_type=str(data.get("app_type") or "agent"),
+            description=str(data.get("description") or ""),
+            status=str(data.get("status") or "draft"),
+            workflow_id=str(data.get("workflow_id") or ""),
+            entry_agent_id=str(data.get("entry_agent_id") or ""),
+            model=str(data.get("model") or ""),
+            system_prompt=str(data.get("system_prompt") or ""),
+            tool_ids=[str(item) for item in data.get("tool_ids") or []],
+            skill_ids=[str(item) for item in data.get("skill_ids") or []],
+            metadata=dict(data.get("metadata") or {}),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+        )
+
+
+class ApplicationStore:
+    """文件型应用仓库，保存用户在控制台创建的应用入口。"""
+
+    def __init__(self, root_dir: str | Path = "runs/applications") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(
+        self,
+        *,
+        name: str,
+        app_type: str = "agent",
+        description: str = "",
+        model: str = "",
+        system_prompt: str = "",
+        tool_ids: Optional[List[str]] = None,
+        skill_ids: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ApplicationRecord:
+        record = ApplicationRecord.from_dict(
+            {
+                "name": name,
+                "app_type": app_type,
+                "description": description,
+                "model": model,
+                "system_prompt": system_prompt,
+                "tool_ids": tool_ids or [],
+                "skill_ids": skill_ids or [],
+                "metadata": metadata or {},
+            }
+        )
+        return self.save(record)
+
+    def save(self, record: ApplicationRecord) -> ApplicationRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            existing = self.get(record.id)
+            record.created_at = existing.created_at
+        else:
+            record.created_at = record.created_at or now
+        record.updated_at = now
+        self._path(record.id).write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record
+
+    def list(self) -> List[ApplicationRecord]:
+        records = [self.get(path.stem) for path in sorted(self.root_dir.glob("*.json"))]
+        return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, app_id: str) -> ApplicationRecord:
+        path = self._path(app_id)
+        if not path.exists():
+            raise KeyError(f"application {app_id!r} not found")
+        return ApplicationRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def delete(self, app_id: str) -> None:
+        path = self._path(app_id)
+        if not path.exists():
+            raise KeyError(f"application {app_id!r} not found")
+        path.unlink()
+
+    def exists(self, app_id: str) -> bool:
+        return self._path(app_id).exists()
+
+    def _path(self, app_id: str) -> Path:
+        clean = _clean_id(app_id)
+        if not clean:
+            raise ValueError("application id is required")
+        return self.root_dir / f"{clean}.json"
+
+
 class ProductStatusService:
     """汇总后端能力、配置和健康摘要。"""
 
