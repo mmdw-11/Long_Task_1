@@ -237,6 +237,11 @@ class UpdateApplicationReq(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class CreateApplicationRunReq(BaseModel):
+    input: Dict[str, Any] = Field(default_factory=dict)
+    recursion_limit: int = 50
+
+
 class RegisterReq(BaseModel):
     email: str
     name: str
@@ -1122,6 +1127,48 @@ def create_app(
             return applications.save(app_record).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/apps/{app_id}/runs")
+    async def create_application_run(
+        app_id: str,
+        req: CreateApplicationRunReq,
+        background_tasks: BackgroundTasks,
+    ) -> Dict[str, Any]:
+        """以应用为入口发起调试运行，前端无需理解内部 workflow_id。"""
+        try:
+            app_record = applications.get(app_id)
+            if not app_record.workflow_id:
+                raise HTTPException(status_code=400, detail="应用尚未绑定工作流")
+            workflows.get(app_record.workflow_id)
+            input_payload = dict(req.input or {})
+            if "input" not in input_payload:
+                input_payload["input"] = f"请运行应用：{app_record.name}"
+            record = runs.create(
+                input=input_payload,
+                recursion_limit=req.recursion_limit,
+                workflow_id=app_record.workflow_id,
+            )
+            record.metadata["application_id"] = app_record.id
+            record.metadata["application_name"] = app_record.name
+            record.status = "queued"
+            runs.save(record)
+            background_tasks.add_task(_execute_run, record)
+            return record.to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/apps/{app_id}/runs")
+    def list_application_runs(app_id: str) -> List[Dict[str, Any]]:
+        """列出某个应用触发的运行记录，便于应用详情页做调试历史。"""
+        try:
+            app_record = applications.get(app_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return [
+            item.to_dict()
+            for item in runs.list(workflow_id=app_record.workflow_id)
+            if item.metadata.get("application_id") in {None, app_record.id}
+        ]
 
     @app.delete("/api/apps/{app_id}")
     def delete_application(app_id: str) -> Dict[str, Any]:

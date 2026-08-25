@@ -55,3 +55,26 @@ def test_update_application_syncs_entry_agent(tmp_path, monkeypatch):
     assert agent["name"] == "邮件审核助手"
     assert agent["sys_prompt"] == "先审核再回复"
     assert agent["config"]["tool_ids"] == ["tool-a"]
+
+
+def test_create_run_from_application_entry(tmp_path, monkeypatch):
+    """应用调试接口会自动使用应用绑定的工作流，隐藏内部编排细节。"""
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=ToolCatalogStore(tmp_path / "tools"),
+        application_store=ApplicationStore(tmp_path / "apps"),
+    )
+    client = TestClient(app)
+
+    created = client.post("/api/apps", json={"name": "邮件助手"}).json()
+    run = client.post(
+        f"/api/apps/{created['id']}/runs",
+        json={"input": {"input": "给张三写一封会议提醒邮件"}},
+    ).json()
+    history = client.get(f"/api/apps/{created['id']}/runs").json()
+
+    assert run["workflow_id"] == created["workflow_id"]
+    assert run["metadata"]["application_id"] == created["id"]
+    assert history
