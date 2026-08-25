@@ -1,16 +1,17 @@
-"""Runtime tool selection and execution for agent runs.
-
-Tool records are product metadata. A tool only becomes executable when its
-``name`` or ``metadata.adapter`` maps to one of the safe built-in adapters
-below. This keeps natural-language descriptions useful for model/tool
-selection without turning descriptions into machine permissions.
-"""
+"""运行时工具选择和执行模块，负责把工具目录中的配置安全接入 Agent 运行过程。"""
 
 from __future__ import annotations
 
 import ast
+import json
 import operator
+import os
 import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
@@ -85,6 +86,10 @@ class ToolRuntime:
                 score += 4
             if adapter in {"calculator", "calc"} and re.search(r"\d+\s*[-+*/()]", normalized):
                 score += 4
+            if adapter in {"mcp_http", "mcp_url", "mcp"} and re.search(r"mcp|tool|工具|服务|接口", normalized):
+                score += 3
+            if adapter in {"script", "python_script"} and re.search(r"script|脚本|代码|处理|转换|生成|工具", normalized):
+                score += 3
             if score > 0:
                 scored.append((score, tool))
         return [tool for _, tool in sorted(scored, key=lambda item: item[0], reverse=True)[:3]]
@@ -114,6 +119,12 @@ class ToolRuntime:
             elif adapter in {"echo", "note"}:
                 result = task_text[:1000]
                 args = {"text": task_text[:1000]}
+            elif adapter in {"mcp_http", "mcp_url", "mcp"}:
+                args = {"url": str(tool.metadata.get("mcp_url") or tool.metadata.get("url") or "")}
+                result = _call_mcp_http(tool.metadata, task_text)
+            elif adapter in {"script", "python_script"}:
+                args = {"language": str(tool.metadata.get("language") or "python")}
+                result = _run_script_tool(tool.metadata, task_text)
             else:
                 return ToolRuntimeResult(
                     id=tool.id,
@@ -181,6 +192,73 @@ def ensure_builtin_tools(catalog: ToolCatalogStore) -> None:
 
 def _tokens(text: str) -> List[str]:
     return [item for item in re.split(r"[^a-z0-9_\u4e00-\u9fff]+", text.lower()) if item]
+
+
+def _call_mcp_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+    url = str(metadata.get("mcp_url") or metadata.get("url") or "").strip()
+    if not url:
+        raise ValueError("mcp_url is required")
+    method = str(metadata.get("method") or "tools/list")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": f"agentforge-{datetime.now(timezone.utc).timestamp()}",
+        "method": method,
+        "params": metadata.get("params") or {"task": task_text[:1000]},
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=float(metadata.get("timeout_seconds") or 8)) as response:
+            text = response.read(200_000).decode("utf-8", errors="replace")
+            try:
+                parsed: Any = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = text
+            return {"url": url, "method": method, "response": parsed}
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"MCP HTTP request failed: {exc}") from exc
+
+
+def _run_script_tool(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+    if os.environ.get("AGENTFORGE_ENABLE_SCRIPT_TOOLS") != "1":
+        return {
+            "enabled": False,
+            "message": "Script execution is registered but disabled. Set AGENTFORGE_ENABLE_SCRIPT_TOOLS=1 to run user scripts.",
+        }
+    language = str(metadata.get("language") or "python").lower()
+    if language not in {"python", "python3"}:
+        raise ValueError("only python script tools are supported")
+    script = str(metadata.get("script") or "").strip()
+    if not script:
+        raise ValueError("script is required")
+    timeout = max(1.0, min(float(metadata.get("timeout_seconds") or 5), 30.0))
+    with tempfile.NamedTemporaryFile("w", suffix=".py", encoding="utf-8", delete=False) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        completed = subprocess.run(
+            [sys.executable, script_path],
+            input=json.dumps({"task": task_text}, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+        }
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
 
 
 def _extract_expression(text: str) -> str:

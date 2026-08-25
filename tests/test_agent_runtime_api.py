@@ -140,3 +140,43 @@ def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
     payload = decided.json()
     assert payload["metadata"]["approval_decisions"][str(approval["sequence"])]["approved"] is False
     assert payload["events"][-1]["type"] == "approval_decision"
+
+
+def test_script_tool_is_registered_but_disabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.delenv("AGENTFORGE_ENABLE_SCRIPT_TOOLS", raising=False)
+    monkeypatch.delenv("DEVICE_BASE_URL", raising=False)
+    monkeypatch.delenv("DEVICE_MODEL", raising=False)
+
+    tool_store = ToolCatalogStore(tmp_path / "tools")
+    script_tool = tool_store.create(
+        name="email_formatter",
+        display_name="邮件格式化脚本",
+        description="使用脚本处理邮件内容",
+        metadata={
+            "source": "script",
+            "adapter": "script",
+            "risk": "low",
+            "script": "print('ok')",
+        },
+    )
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=tool_store,
+    )
+    client = TestClient(app)
+
+    agent_id = client.post(
+        "/api/agents",
+        json={"name": "script_worker", "description": "脚本处理", "config": {"tool_ids": [script_tool.id]}},
+    ).json()["id"]
+    client.post("/api/graph/entry", json={"agent_id": agent_id})
+
+    created = client.post("/api/runs", json={"input": {"input": "请使用脚本工具处理邮件"}}).json()
+    record = client.get(f"/api/runs/{created['id']}").json()
+    tool_event = next(event for event in record["events"] if event["type"] == "tool_result")
+
+    assert tool_event["tool_call"]["name"] == "email_formatter"
+    assert tool_event["tool_call"]["status"] == "succeeded"
+    assert tool_event["tool_call"]["result"]["enabled"] is False
