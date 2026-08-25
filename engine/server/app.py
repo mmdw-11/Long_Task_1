@@ -50,7 +50,7 @@ from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.auth import AuthStore
 from ..modules.context import ContextPolicy
 from ..modules.context.todo import TodoManager
-from ..modules.product_ops import ProjectSnapshotService, ProductStatusService, ToolCatalogStore, ToolRecord
+from ..modules.product_ops import ApiKeyStore, ProjectSnapshotService, ProductStatusService, ToolCatalogStore, ToolRecord
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
@@ -198,6 +198,15 @@ class UpdateToolReq(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class CreateApiKeyReq(BaseModel):
+    name: str
+    scope: str = "workspace"
+
+
+class UpdateApiKeyReq(BaseModel):
+    enabled: bool
+
+
 class RegisterReq(BaseModel):
     email: str
     name: str
@@ -281,6 +290,7 @@ def create_app(
     skill_trace_store: Optional[SkillTraceStore] = None,
     node_factory: Optional[NodeFactory] = None,
     tool_catalog_store: Optional[ToolCatalogStore] = None,
+    api_key_store: Optional[ApiKeyStore] = None,
     api_audit_store: Optional[ApiAuditStore] = None,
     auth_store: Optional[AuthStore] = None,
     auth_required: bool = False,
@@ -302,6 +312,7 @@ def create_app(
     )
     if owns_tool_catalog or os.environ.get("SEED_BUILTIN_TOOLS") == "1":
         ensure_builtin_tools(tools)
+    api_keys = api_key_store or ApiKeyStore(os.environ.get("API_KEY_STORE_ROOT") or "runs/api_keys")
     api_audit = api_audit_store or ApiAuditStore(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
@@ -690,6 +701,13 @@ def create_app(
         snapshot["security"] = {
             "admin_key_enabled": bool(admin_api_key),
             "audit_log_path": str(api_audit.path),
+        }
+        host = os.environ.get("AGENTFORGE_PUBLIC_BASE_URL") or "http://127.0.0.1:8000"
+        snapshot["api_access"] = {
+            "openai_compatible_base_url": f"{host.rstrip('/')}/compatible-mode/v1",
+            "anthropic_base_url": f"{host.rstrip('/')}/apps/anthropic",
+            "workspace": os.environ.get("AGENTFORGE_WORKSPACE_NAME") or "默认业务空间",
+            "api_key_count": len(api_keys.list()),
         }
         return snapshot
 
@@ -1196,6 +1214,36 @@ def create_app(
     @app.get("/api/runs/{run_id}/skill-traces")
     def get_skill_traces(run_id: str) -> Dict[str, Any]:
         return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
+
+    # ------------------------- API Key 管理 ------------------------- #
+    @app.get("/api/api-keys")
+    def list_api_keys() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in api_keys.list()]
+
+    @app.post("/api/api-keys")
+    def create_api_key(req: CreateApiKeyReq, request: Request) -> Dict[str, Any]:
+        user = getattr(request.state, "user", None)
+        created_by = user.email if user else request.headers.get("X-Actor", "")
+        try:
+            record, secret = api_keys.create(name=req.name, scope=req.scope, created_by=created_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return record.to_dict(include_secret=secret)
+
+    @app.put("/api/api-keys/{key_id}")
+    def update_api_key(key_id: str, req: UpdateApiKeyReq) -> Dict[str, Any]:
+        try:
+            return api_keys.update_enabled(key_id, req.enabled).to_dict()
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.delete("/api/api-keys/{key_id}")
+    def delete_api_key(key_id: str) -> Dict[str, Any]:
+        try:
+            api_keys.delete(key_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
 
     # ------------------------- 工具目录 ------------------------- #
     @app.post("/api/tools")

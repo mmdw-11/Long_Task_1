@@ -1,14 +1,11 @@
-"""产品化运维辅助模块。
-
-该模块给前端提供两类后端能力：
-1. 系统状态摘要：集中暴露模型、运行目录、能力开关与时间信息。
-2. 工具目录仓库：把可被 Agent 使用的工具元信息持久化，避免散落在前端配置里。
-"""
+"""产品化运维辅助模块，集中保存控制台需要展示和管理的后端资源。"""
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -144,6 +141,123 @@ class ToolCatalogStore:
         clean = _clean_id(tool_id)
         if not clean:
             raise ValueError("tool_id is required")
+        return self.root_dir / f"{clean}.json"
+
+
+@dataclass
+class ApiKeyRecord:
+    """控制台 API Key 记录，只持久化哈希和前缀，不保存完整密钥。"""
+
+    id: str
+    name: str
+    prefix: str
+    key_hash: str
+    scope: str = "workspace"
+    enabled: bool = True
+    created_by: str = ""
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+    last_used_at: str = ""
+
+    def to_dict(self, *, include_secret: Optional[str] = None) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "name": self.name,
+            "prefix": self.prefix,
+            "scope": self.scope,
+            "enabled": self.enabled,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_used_at": self.last_used_at,
+        }
+        if include_secret:
+            data["secret"] = include_secret
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ApiKeyRecord":
+        if not isinstance(data, dict):
+            raise ValueError("api key payload must be an object")
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("api key name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"ak-{uuid.uuid4().hex[:12]}",
+            name=name,
+            prefix=str(data.get("prefix") or ""),
+            key_hash=str(data.get("key_hash") or ""),
+            scope=str(data.get("scope") or "workspace"),
+            enabled=bool(data.get("enabled", True)),
+            created_by=str(data.get("created_by") or ""),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+            last_used_at=str(data.get("last_used_at") or ""),
+        )
+
+
+class ApiKeyStore:
+    """文件型 API Key 仓库，提供类似百炼控制台的密钥创建和禁用能力。"""
+
+    def __init__(self, root_dir: str | Path = "runs/api_keys") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, *, name: str, scope: str = "workspace", created_by: str = "") -> tuple[ApiKeyRecord, str]:
+        secret = f"af-{secrets.token_urlsafe(32)}"
+        record = ApiKeyRecord.from_dict(
+            {
+                "name": name,
+                "scope": scope,
+                "prefix": secret[:10],
+                "key_hash": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+                "created_by": created_by,
+            }
+        )
+        self.save(record)
+        return record, secret
+
+    def save(self, record: ApiKeyRecord) -> ApiKeyRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            existing = self.get(record.id)
+            record.created_at = existing.created_at
+        else:
+            record.created_at = record.created_at or now
+        record.updated_at = now
+        self._path(record.id).write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record
+
+    def list(self) -> List[ApiKeyRecord]:
+        return sorted([self.get(path.stem) for path in self.root_dir.glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, key_id: str) -> ApiKeyRecord:
+        path = self._path(key_id)
+        if not path.exists():
+            raise KeyError(f"api key {key_id!r} not found")
+        return ApiKeyRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def update_enabled(self, key_id: str, enabled: bool) -> ApiKeyRecord:
+        record = self.get(key_id)
+        record.enabled = enabled
+        return self.save(record)
+
+    def delete(self, key_id: str) -> None:
+        path = self._path(key_id)
+        if not path.exists():
+            raise KeyError(f"api key {key_id!r} not found")
+        path.unlink()
+
+    def exists(self, key_id: str) -> bool:
+        return self._path(key_id).exists()
+
+    def _path(self, key_id: str) -> Path:
+        clean = _clean_id(key_id)
+        if not clean:
+            raise ValueError("api key id is required")
         return self.root_dir / f"{clean}.json"
 
 
