@@ -54,6 +54,7 @@ from ..modules.product_ops import (
     ApiKeyStore,
     ApplicationRecord,
     ApplicationStore,
+    ConsoleResourceStore,
     MemoryBankStore,
     ProjectSnapshotService,
     ProductStatusService,
@@ -251,6 +252,14 @@ class CreateMemoryBankReq(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class CreateConsoleResourceReq(BaseModel):
+    """创建组件、知识库、数据连接或治理资源。"""
+
+    name: str
+    description: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RegisterReq(BaseModel):
     email: str
     name: str
@@ -336,6 +345,7 @@ def create_app(
     tool_catalog_store: Optional[ToolCatalogStore] = None,
     application_store: Optional[ApplicationStore] = None,
     memory_bank_store: Optional[MemoryBankStore] = None,
+    console_resource_store: Optional[ConsoleResourceStore] = None,
     api_key_store: Optional[ApiKeyStore] = None,
     api_audit_store: Optional[ApiAuditStore] = None,
     auth_store: Optional[AuthStore] = None,
@@ -363,6 +373,9 @@ def create_app(
     )
     memory_banks = memory_bank_store or MemoryBankStore(
         os.environ.get("MEMORY_BANK_STORE_ROOT") or "runs/memory_banks"
+    )
+    console_resources = console_resource_store or ConsoleResourceStore(
+        os.environ.get("CONSOLE_RESOURCE_STORE_ROOT") or "runs/console_resources"
     )
     api_keys = api_key_store or ApiKeyStore(os.environ.get("API_KEY_STORE_ROOT") or "runs/api_keys")
     api_audit = api_audit_store or ApiAuditStore(
@@ -1521,6 +1534,55 @@ def create_app(
     def delete_memory_bank(bank_id: str) -> Dict[str, Any]:
         try:
             memory_banks.delete(bank_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
+
+    # ------------------------- 组件与数据资源 ------------------------- #
+    resource_kinds = {"components", "knowledge-bases", "data-connections", "evaluations", "observability", "permissions", "ui-designs"}
+    component_market = [
+        {"slug": "web-search-node", "name": "网页检索组件", "category": "工具", "description": "在工作流中提供联网检索节点；需要挂载已安装的检索 MCP。"},
+        {"slug": "approval-node", "name": "人工审批组件", "category": "安全", "description": "在高风险工具调用或发布操作前暂停并等待用户决定。"},
+        {"slug": "summary-node", "name": "任务总结组件", "category": "输出", "description": "根据运行轨迹生成可审计的最终总结。"},
+        {"slug": "todo-node", "name": "TODO 规划组件", "category": "编排", "description": "使用现有 TODO 管理器拆解并跟踪长任务，降低上下文漂移。"},
+    ]
+
+    @app.get("/api/components/market")
+    def list_component_market() -> List[Dict[str, Any]]:
+        return component_market
+
+    @app.post("/api/components/{slug}/install")
+    def install_component(slug: str) -> Dict[str, Any]:
+        item = next((x for x in component_market if x["slug"] == slug), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="未找到组件模板")
+        existing = next((x for x in console_resources.list("components") if x.metadata.get("market_slug") == slug), None)
+        if existing is not None:
+            return {"installed": False, "component": existing.to_dict(), "message": "该组件已经安装"}
+        record = console_resources.create(kind="components", name=item["name"], description=item["description"], metadata={"market_slug": slug, "category": item["category"], "source": "market"})
+        return {"installed": True, "component": record.to_dict(), "message": "组件已安装，可在组件管理中查看"}
+
+    @app.get("/api/resources/{kind}")
+    def list_console_resources(kind: str) -> List[Dict[str, Any]]:
+        if kind not in resource_kinds:
+            raise HTTPException(status_code=404, detail="不支持的资源类型")
+        return [item.to_dict() for item in console_resources.list(kind)]
+
+    @app.post("/api/resources/{kind}")
+    def create_console_resource(kind: str, req: CreateConsoleResourceReq) -> Dict[str, Any]:
+        if kind not in resource_kinds:
+            raise HTTPException(status_code=404, detail="不支持的资源类型")
+        try:
+            return console_resources.create(kind=kind, name=req.name, description=req.description, metadata=req.metadata).to_dict()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.delete("/api/resources/{kind}/{resource_id}")
+    def delete_console_resource(kind: str, resource_id: str) -> Dict[str, Any]:
+        if kind not in resource_kinds:
+            raise HTTPException(status_code=404, detail="不支持的资源类型")
+        try:
+            console_resources.delete(kind, resource_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         return {"ok": True}

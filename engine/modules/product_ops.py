@@ -472,6 +472,69 @@ class MemoryBankStore:
         return self.root_dir / f"{clean}.json"
 
 
+@dataclass
+class ConsoleResourceRecord:
+    """组件、知识库、连接、评测等控制台资源的通用文件记录。"""
+
+    id: str
+    kind: str
+    name: str
+    description: str = ""
+    status: str = "ready"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "kind": self.kind, "name": self.name, "description": self.description, "status": self.status, "metadata": dict(self.metadata), "created_at": self.created_at, "updated_at": self.updated_at}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConsoleResourceRecord":
+        kind = _clean_id(str(data.get("kind") or ""))
+        name = str(data.get("name") or "").strip()
+        if not kind or not name:
+            raise ValueError("resource kind and name are required")
+        return cls(id=_clean_id(str(data.get("id") or "")) or f"{kind}-{uuid.uuid4().hex[:12]}", kind=kind, name=name, description=str(data.get("description") or ""), status=str(data.get("status") or "ready"), metadata=dict(data.get("metadata") or {}), created_at=str(data.get("created_at") or _utc_now()), updated_at=str(data.get("updated_at") or _utc_now()))
+
+
+class ConsoleResourceStore:
+    """通用控制台资源仓库，保持产品页数据可操作且不侵入运行时核心状态。"""
+
+    def __init__(self, root_dir: str | Path = "runs/console_resources") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, *, kind: str, name: str, description: str = "", metadata: Optional[Dict[str, Any]] = None) -> ConsoleResourceRecord:
+        return self.save(ConsoleResourceRecord.from_dict({"kind": kind, "name": name, "description": description, "metadata": metadata or {}}))
+
+    def save(self, record: ConsoleResourceRecord) -> ConsoleResourceRecord:
+        now = _utc_now(); path = self._path(record.kind, record.id)
+        if path.exists(): record.created_at = self.get(record.kind, record.id).created_at
+        record.updated_at = now
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return record
+
+    def list(self, kind: str) -> List[ConsoleResourceRecord]:
+        clean = _clean_id(kind)
+        return sorted([ConsoleResourceRecord.from_dict(json.loads(p.read_text(encoding="utf-8"))) for p in (self.root_dir / clean).glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, kind: str, resource_id: str) -> ConsoleResourceRecord:
+        path = self._path(kind, resource_id)
+        if not path.exists(): raise KeyError(f"resource {resource_id!r} not found")
+        return ConsoleResourceRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def delete(self, kind: str, resource_id: str) -> None:
+        path = self._path(kind, resource_id)
+        if not path.exists(): raise KeyError(f"resource {resource_id!r} not found")
+        path.unlink()
+
+    def _path(self, kind: str, resource_id: str) -> Path:
+        clean_kind, clean_id = _clean_id(kind), _clean_id(resource_id)
+        if not clean_kind or not clean_id: raise ValueError("resource kind and id are required")
+        return self.root_dir / clean_kind / f"{clean_id}.json"
+
+
 class ProductStatusService:
     """汇总后端能力、配置和健康摘要。"""
 
