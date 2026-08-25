@@ -139,7 +139,34 @@ def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
     assert decided.status_code == 200
     payload = decided.json()
     assert payload["metadata"]["approval_decisions"][str(approval["sequence"])]["approved"] is False
-    assert payload["events"][-1]["type"] == "approval_decision"
+    assert payload["events"][-1]["type"] == "tool_result"
+    assert payload["events"][-1]["tool_call"]["status"] == "rejected"
+
+
+def test_approved_high_risk_tool_executes_after_decision(tmp_path, monkeypatch):
+    """高风险工具在批准前不执行，批准后由后端适配器真实写入 tool_result。"""
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    tool_store = ToolCatalogStore(tmp_path / "tools")
+    risky_tool = tool_store.create(
+        name="send_mail_demo", display_name="邮件发送演示", description="发送邮件",
+        metadata={"adapter": "echo", "risk": "high"},
+    )
+    app = create_app(run_store=RunStore(tmp_path / "runs"), tool_catalog_store=tool_store)
+    client = TestClient(app)
+    agent_id = client.post(
+        "/api/agents", json={"name": "邮件助手", "description": "发送邮件", "config": {"tool_ids": [risky_tool.id]}}
+    ).json()["id"]
+    client.post("/api/graph/entry", json={"agent_id": agent_id})
+    created = client.post("/api/runs", json={"input": {"input": "请发送邮件给客户"}}).json()
+    record = client.get(f"/api/runs/{created['id']}").json()
+    approval = next(event for event in record["events"] if event["type"] == "approval_required")
+
+    approved = client.post(f"/api/runs/{created['id']}/approvals/{approval['sequence']}/approve", json={}).json()
+    result = approved["events"][-1]["tool_call"]
+
+    assert approved["metadata"]["approval_decisions"][str(approval["sequence"])]["approved"] is True
+    assert result["status"] == "succeeded"
+    assert result["name"] == "send_mail_demo"
 
 
 def test_script_tool_is_registered_but_disabled_by_default(tmp_path, monkeypatch):

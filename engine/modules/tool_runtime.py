@@ -94,11 +94,11 @@ class ToolRuntime:
                 scored.append((score, tool))
         return [tool for _, tool in sorted(scored, key=lambda item: item[0], reverse=True)[:3]]
 
-    def execute(self, tool: ToolRecord, task_text: str) -> ToolRuntimeResult:
+    def execute(self, tool: ToolRecord, task_text: str, *, bypass_approval: bool = False) -> ToolRuntimeResult:
         adapter = str(tool.metadata.get("adapter") or tool.name).strip().lower()
         risk = str(tool.metadata.get("risk") or "low").lower()
         approval_required = risk not in {"low", "read"}
-        if approval_required:
+        if approval_required and not bypass_approval:
             return ToolRuntimeResult(
                 id=tool.id,
                 name=tool.name,

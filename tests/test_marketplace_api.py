@@ -21,13 +21,14 @@ def test_marketplace_installation_and_memory_bank(tmp_path, monkeypatch):
     )
     client = TestClient(app)
 
-    mcp = client.post("/api/marketplace/mcp/email/install")
+    mcp = client.post("/api/marketplace/mcp/local-demo/install")
     skill = client.post("/api/marketplace/skills/email-writer/install")
     application = client.post("/api/marketplace/apps/email-assistant/install")
     memory = client.post("/api/memory-banks", json={"name": "客户沟通记忆库"})
 
     assert mcp.status_code == 200
-    assert mcp.json()["tool"]["metadata"]["needs_configuration"] is True
+    assert mcp.json()["tool"]["metadata"]["needs_configuration"] is False
+    assert mcp.json()["tool"]["metadata"]["mcp_url"].endswith("/mcp/demo")
     assert skill.status_code == 200
     assert skill.json()["skill"]["name"] == "商务邮件撰写"
     assert application.status_code == 200

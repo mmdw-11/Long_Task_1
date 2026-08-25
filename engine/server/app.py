@@ -70,7 +70,7 @@ from ..modules.skills import (
     SkillTraceStore,
 )
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
-from ..modules.tool_runtime import ensure_builtin_tools
+from ..modules.tool_runtime import ToolRuntime, ensure_builtin_tools
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -206,6 +206,12 @@ class UpdateToolReq(BaseModel):
     enabled: Optional[bool] = None
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
+
+
+class TestToolReq(BaseModel):
+    """从控制台验证工具适配器；高风险工具只返回审批请求。"""
+
+    task: str = "请执行工具连通性测试"
 
 
 class CreateApiKeyReq(BaseModel):
@@ -418,6 +424,28 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.post("/mcp/demo")
+    async def local_demo_mcp(request: Request) -> Dict[str, Any]:
+        """无外部权限的本地 MCP JSON-RPC 演示端点，用于验证接入链路。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        method = str(payload.get("method") or "tools/list")
+        request_id = payload.get("id")
+        if method == "tools/list":
+            result: Dict[str, Any] = {
+                "tools": [
+                    {"name": "preview_email", "description": "仅生成邮件预览，不发送真实邮件", "inputSchema": {"type": "object"}},
+                    {"name": "lookup_demo", "description": "返回本地演示检索结果", "inputSchema": {"type": "object"}},
+                ]
+            }
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": f"本地 MCP 已收到：{json.dumps(payload.get('params') or {}, ensure_ascii=False)}"}]}
+        else:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "method not found"}}
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     @app.middleware("http")
     async def admin_guard_and_audit(request: Request, call_next):
@@ -998,6 +1026,34 @@ def create_app(
                 "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
             },
         )
+        tool_call = dict(target.get("tool_call") or {})
+        # 高风险工具不会在模型选择阶段执行；只有批准后才在这里以绕过二次审批的方式执行。
+        if approved:
+            try:
+                tool = tools.get(str(tool_call.get("id") or ""))
+                task_text = str((tool_call.get("arguments") or {}).get("task") or record.input.get("input") or "")
+                result = ToolRuntime(tools).execute(tool, task_text, bypass_approval=True).to_dict()
+            except Exception as exc:  # noqa: BLE001 - 审批后的执行错误必须留在审计轨迹中
+                result = {**tool_call, "status": "failed", "error": str(exc)}
+            _append_event(
+                record,
+                {
+                    "type": "tool_result",
+                    "node": target.get("node"),
+                    "tool_call": result,
+                    "message": f"审批后已执行工具 {result.get('display_name') or result.get('name')}",
+                },
+            )
+        else:
+            _append_event(
+                record,
+                {
+                    "type": "tool_result",
+                    "node": target.get("node"),
+                    "tool_call": {**tool_call, "status": "rejected", "error": reason or "用户拒绝执行"},
+                    "message": "工具调用已被用户拒绝",
+                },
+            )
         runs.save(record)
         return record.to_dict()
 
@@ -1445,6 +1501,7 @@ def create_app(
     # ------------------------- 百炼式资源市场 ------------------------- #
     # 这些条目是可安装的本地模板，不声明为已接入第三方云服务。
     mcp_market = [
+        {"slug": "local-demo", "name": "本地演示 MCP", "provider": "AgentForge", "category": "演示", "description": "零权限 JSON-RPC 演示服务，用于验证 MCP URL、工具发现与调用链。", "installs": 1, "cover": "violet", "mcp_url": "http://127.0.0.1:8000/mcp/demo"},
         {"slug": "web-search", "name": "联网检索", "provider": "示例市场", "category": "通用办公", "description": "为 Agent 提供检索与网页摘要能力；安装后仍需配置实际 MCP URL。", "installs": 129, "cover": "mint"},
         {"slug": "calendar", "name": "日历与会议", "provider": "示例市场", "category": "通用办公", "description": "查询可用时间、创建会议和发送日程提醒的 MCP 接入模板。", "installs": 88, "cover": "violet"},
         {"slug": "email", "name": "邮件发送", "provider": "示例市场", "category": "通用办公", "description": "起草、确认并发送邮件。真实发送前将进入工具审批流程。", "installs": 201, "cover": "blue"},
@@ -1482,9 +1539,10 @@ def create_app(
         record = tools.create(
             name=f"mcp_{slug}", display_name=item["name"], description=item["description"],
             category="mcp", tags=["mcp", item["category"]],
-            metadata={"source": "mcp", "adapter": "mcp_http", "market_slug": slug, "risk": "read", "mcp_url": "", "needs_configuration": True},
+            metadata={"source": "mcp", "adapter": "mcp_http", "market_slug": slug, "risk": "read", "mcp_url": item.get("mcp_url", ""), "needs_configuration": not bool(item.get("mcp_url"))},
         )
-        return {"installed": True, "tool": record.to_dict(), "message": "MCP 模板已安装，请在 MCP 管理中填写服务地址"}
+        message = "本地演示 MCP 已安装，可直接在 MCP 管理中测试" if item.get("mcp_url") else "MCP 模板已安装，请在 MCP 管理中填写服务地址"
+        return {"installed": True, "tool": record.to_dict(), "message": message}
 
     @app.get("/api/marketplace/skills")
     def list_skill_marketplace() -> List[Dict[str, Any]]:
@@ -1643,6 +1701,14 @@ def create_app(
             return tools.get(tool_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/tools/{tool_id}/test")
+    def test_tool(tool_id: str, req: TestToolReq) -> Dict[str, Any]:
+        try:
+            tool = tools.get(tool_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return ToolRuntime(tools).execute(tool, req.task).to_dict()
 
     @app.put("/api/tools/{tool_id}")
     def update_tool(tool_id: str, req: UpdateToolReq) -> Dict[str, Any]:
