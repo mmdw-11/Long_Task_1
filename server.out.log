@@ -1,0 +1,2 @@
+INFO:     127.0.0.1:61871 - "PUT /api/agents/__missing__ HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:61871 - "GET /api/runs/__missing__/events HTTP/1.1" 404 Not Found

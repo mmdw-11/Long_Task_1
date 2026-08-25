@@ -1,14 +1,11 @@
-"""产品化运维辅助模块。
-
-该模块给前端提供两类后端能力：
-1. 系统状态摘要：集中暴露模型、运行目录、能力开关与时间信息。
-2. 工具目录仓库：把可被 Agent 使用的工具元信息持久化，避免散落在前端配置里。
-"""
+"""产品化运维辅助模块，集中保存控制台需要展示和管理的后端资源。"""
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -147,6 +144,397 @@ class ToolCatalogStore:
         return self.root_dir / f"{clean}.json"
 
 
+@dataclass
+class ApiKeyRecord:
+    """控制台 API Key 记录，只持久化哈希和前缀，不保存完整密钥。"""
+
+    id: str
+    name: str
+    prefix: str
+    key_hash: str
+    scope: str = "workspace"
+    enabled: bool = True
+    created_by: str = ""
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+    last_used_at: str = ""
+
+    def to_dict(self, *, include_secret: Optional[str] = None) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "name": self.name,
+            "prefix": self.prefix,
+            "scope": self.scope,
+            "enabled": self.enabled,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_used_at": self.last_used_at,
+        }
+        if include_secret:
+            data["secret"] = include_secret
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ApiKeyRecord":
+        if not isinstance(data, dict):
+            raise ValueError("api key payload must be an object")
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("api key name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"ak-{uuid.uuid4().hex[:12]}",
+            name=name,
+            prefix=str(data.get("prefix") or ""),
+            key_hash=str(data.get("key_hash") or ""),
+            scope=str(data.get("scope") or "workspace"),
+            enabled=bool(data.get("enabled", True)),
+            created_by=str(data.get("created_by") or ""),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+            last_used_at=str(data.get("last_used_at") or ""),
+        )
+
+
+class ApiKeyStore:
+    """文件型 API Key 仓库，提供类似百炼控制台的密钥创建和禁用能力。"""
+
+    def __init__(self, root_dir: str | Path = "runs/api_keys") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, *, name: str, scope: str = "workspace", created_by: str = "") -> tuple[ApiKeyRecord, str]:
+        secret = f"af-{secrets.token_urlsafe(32)}"
+        record = ApiKeyRecord.from_dict(
+            {
+                "name": name,
+                "scope": scope,
+                "prefix": secret[:10],
+                "key_hash": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+                "created_by": created_by,
+            }
+        )
+        self.save(record)
+        return record, secret
+
+    def save(self, record: ApiKeyRecord) -> ApiKeyRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            existing = self.get(record.id)
+            record.created_at = existing.created_at
+        else:
+            record.created_at = record.created_at or now
+        record.updated_at = now
+        self._path(record.id).write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record
+
+    def list(self) -> List[ApiKeyRecord]:
+        return sorted([self.get(path.stem) for path in self.root_dir.glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, key_id: str) -> ApiKeyRecord:
+        path = self._path(key_id)
+        if not path.exists():
+            raise KeyError(f"api key {key_id!r} not found")
+        return ApiKeyRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def update_enabled(self, key_id: str, enabled: bool) -> ApiKeyRecord:
+        record = self.get(key_id)
+        record.enabled = enabled
+        return self.save(record)
+
+    def delete(self, key_id: str) -> None:
+        path = self._path(key_id)
+        if not path.exists():
+            raise KeyError(f"api key {key_id!r} not found")
+        path.unlink()
+
+    def exists(self, key_id: str) -> bool:
+        return self._path(key_id).exists()
+
+    def _path(self, key_id: str) -> Path:
+        clean = _clean_id(key_id)
+        if not clean:
+            raise ValueError("api key id is required")
+        return self.root_dir / f"{clean}.json"
+
+
+@dataclass
+class ApplicationRecord:
+    """应用中心记录，承接百炼式创建应用入口并绑定现有工作流。"""
+
+    id: str
+    name: str
+    app_type: str = "agent"
+    description: str = ""
+    status: str = "draft"
+    workflow_id: str = ""
+    entry_agent_id: str = ""
+    model: str = ""
+    system_prompt: str = ""
+    tool_ids: List[str] = field(default_factory=list)
+    skill_ids: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "app_type": self.app_type,
+            "description": self.description,
+            "status": self.status,
+            "workflow_id": self.workflow_id,
+            "entry_agent_id": self.entry_agent_id,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "tool_ids": list(self.tool_ids),
+            "skill_ids": list(self.skill_ids),
+            "metadata": dict(self.metadata),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ApplicationRecord":
+        if not isinstance(data, dict):
+            raise ValueError("application payload must be an object")
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("application.name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"app-{uuid.uuid4().hex[:12]}",
+            name=name,
+            app_type=str(data.get("app_type") or "agent"),
+            description=str(data.get("description") or ""),
+            status=str(data.get("status") or "draft"),
+            workflow_id=str(data.get("workflow_id") or ""),
+            entry_agent_id=str(data.get("entry_agent_id") or ""),
+            model=str(data.get("model") or ""),
+            system_prompt=str(data.get("system_prompt") or ""),
+            tool_ids=[str(item) for item in data.get("tool_ids") or []],
+            skill_ids=[str(item) for item in data.get("skill_ids") or []],
+            metadata=dict(data.get("metadata") or {}),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+        )
+
+
+class ApplicationStore:
+    """文件型应用仓库，保存用户在控制台创建的应用入口。"""
+
+    def __init__(self, root_dir: str | Path = "runs/applications") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(
+        self,
+        *,
+        name: str,
+        app_type: str = "agent",
+        description: str = "",
+        model: str = "",
+        system_prompt: str = "",
+        tool_ids: Optional[List[str]] = None,
+        skill_ids: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ApplicationRecord:
+        record = ApplicationRecord.from_dict(
+            {
+                "name": name,
+                "app_type": app_type,
+                "description": description,
+                "model": model,
+                "system_prompt": system_prompt,
+                "tool_ids": tool_ids or [],
+                "skill_ids": skill_ids or [],
+                "metadata": metadata or {},
+            }
+        )
+        return self.save(record)
+
+    def save(self, record: ApplicationRecord) -> ApplicationRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            existing = self.get(record.id)
+            record.created_at = existing.created_at
+        else:
+            record.created_at = record.created_at or now
+        record.updated_at = now
+        self._path(record.id).write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record
+
+    def list(self) -> List[ApplicationRecord]:
+        records = [self.get(path.stem) for path in sorted(self.root_dir.glob("*.json"))]
+        return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, app_id: str) -> ApplicationRecord:
+        path = self._path(app_id)
+        if not path.exists():
+            raise KeyError(f"application {app_id!r} not found")
+        return ApplicationRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def delete(self, app_id: str) -> None:
+        path = self._path(app_id)
+        if not path.exists():
+            raise KeyError(f"application {app_id!r} not found")
+        path.unlink()
+
+    def exists(self, app_id: str) -> bool:
+        return self._path(app_id).exists()
+
+    def _path(self, app_id: str) -> Path:
+        clean = _clean_id(app_id)
+        if not clean:
+            raise ValueError("application id is required")
+        return self.root_dir / f"{clean}.json"
+
+
+@dataclass
+class MemoryBankRecord:
+    """控制台记忆库资源；不替代运行时上下文账本，只保存其可配置入口。"""
+
+    id: str
+    name: str
+    description: str = ""
+    status: str = "ready"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "name": self.name, "description": self.description,
+            "status": self.status, "metadata": dict(self.metadata),
+            "created_at": self.created_at, "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MemoryBankRecord":
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("memory bank name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"memory-{uuid.uuid4().hex[:12]}",
+            name=name, description=str(data.get("description") or ""),
+            status=str(data.get("status") or "ready"), metadata=dict(data.get("metadata") or {}),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+        )
+
+
+class MemoryBankStore:
+    """文件型记忆库目录，供应用挂载和控制台浏览。"""
+
+    def __init__(self, root_dir: str | Path = "runs/memory_banks") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, *, name: str, description: str = "", metadata: Optional[Dict[str, Any]] = None) -> MemoryBankRecord:
+        return self.save(MemoryBankRecord.from_dict({"name": name, "description": description, "metadata": metadata or {}}))
+
+    def save(self, record: MemoryBankRecord) -> MemoryBankRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            record.created_at = self.get(record.id).created_at
+        record.updated_at = now
+        self._path(record.id).write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return record
+
+    def list(self) -> List[MemoryBankRecord]:
+        return sorted([self.get(p.stem) for p in self.root_dir.glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, bank_id: str) -> MemoryBankRecord:
+        path = self._path(bank_id)
+        if not path.exists():
+            raise KeyError(f"memory bank {bank_id!r} not found")
+        return MemoryBankRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def delete(self, bank_id: str) -> None:
+        path = self._path(bank_id)
+        if not path.exists():
+            raise KeyError(f"memory bank {bank_id!r} not found")
+        path.unlink()
+
+    def exists(self, bank_id: str) -> bool:
+        return self._path(bank_id).exists()
+
+    def _path(self, bank_id: str) -> Path:
+        clean = _clean_id(bank_id)
+        if not clean:
+            raise ValueError("memory bank id is required")
+        return self.root_dir / f"{clean}.json"
+
+
+@dataclass
+class ConsoleResourceRecord:
+    """组件、知识库、连接、评测等控制台资源的通用文件记录。"""
+
+    id: str
+    kind: str
+    name: str
+    description: str = ""
+    status: str = "ready"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "kind": self.kind, "name": self.name, "description": self.description, "status": self.status, "metadata": dict(self.metadata), "created_at": self.created_at, "updated_at": self.updated_at}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConsoleResourceRecord":
+        kind = _clean_id(str(data.get("kind") or ""))
+        name = str(data.get("name") or "").strip()
+        if not kind or not name:
+            raise ValueError("resource kind and name are required")
+        return cls(id=_clean_id(str(data.get("id") or "")) or f"{kind}-{uuid.uuid4().hex[:12]}", kind=kind, name=name, description=str(data.get("description") or ""), status=str(data.get("status") or "ready"), metadata=dict(data.get("metadata") or {}), created_at=str(data.get("created_at") or _utc_now()), updated_at=str(data.get("updated_at") or _utc_now()))
+
+
+class ConsoleResourceStore:
+    """通用控制台资源仓库，保持产品页数据可操作且不侵入运行时核心状态。"""
+
+    def __init__(self, root_dir: str | Path = "runs/console_resources") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, *, kind: str, name: str, description: str = "", metadata: Optional[Dict[str, Any]] = None) -> ConsoleResourceRecord:
+        return self.save(ConsoleResourceRecord.from_dict({"kind": kind, "name": name, "description": description, "metadata": metadata or {}}))
+
+    def save(self, record: ConsoleResourceRecord) -> ConsoleResourceRecord:
+        now = _utc_now(); path = self._path(record.kind, record.id)
+        if path.exists(): record.created_at = self.get(record.kind, record.id).created_at
+        record.updated_at = now
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return record
+
+    def list(self, kind: str) -> List[ConsoleResourceRecord]:
+        clean = _clean_id(kind)
+        return sorted([ConsoleResourceRecord.from_dict(json.loads(p.read_text(encoding="utf-8"))) for p in (self.root_dir / clean).glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def get(self, kind: str, resource_id: str) -> ConsoleResourceRecord:
+        path = self._path(kind, resource_id)
+        if not path.exists(): raise KeyError(f"resource {resource_id!r} not found")
+        return ConsoleResourceRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def delete(self, kind: str, resource_id: str) -> None:
+        path = self._path(kind, resource_id)
+        if not path.exists(): raise KeyError(f"resource {resource_id!r} not found")
+        path.unlink()
+
+    def _path(self, kind: str, resource_id: str) -> Path:
+        clean_kind, clean_id = _clean_id(kind), _clean_id(resource_id)
+        if not clean_kind or not clean_id: raise ValueError("resource kind and id are required")
+        return self.root_dir / clean_kind / f"{clean_id}.json"
+
+
 class ProductStatusService:
     """汇总后端能力、配置和健康摘要。"""
 
@@ -178,6 +566,9 @@ class ProductStatusService:
                 "skill_lifecycle": True,
                 "agent_runtime": True,
                 "tool_catalog": True,
+                "runtime_tool_execution": True,
+                "run_todo_stream": True,
+                "approval_events": True,
             },
             "models": {
                 "device": {

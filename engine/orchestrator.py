@@ -326,6 +326,35 @@ class Orchestrator:
         if self._entry == agent_id:
             self._entry = None
 
+    def update_agent(
+        self,
+        agent_id: str,
+        *,
+        name: Optional[str] = None,
+        sys_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> AgentSpec:
+        """Update an agent without replacing its graph identity or connections."""
+        self._require(agent_id)
+        spec = self._agents[agent_id]
+        if name is not None:
+            if not name.strip():
+                raise ValueError("agent name cannot be empty")
+            if any(item.id != agent_id and item.name == name for item in self._agents.values()):
+                raise ValueError(f"agent name {name!r} already exists")
+            spec.name = name
+        if sys_prompt is not None:
+            spec.sys_prompt = sys_prompt
+        if model is not None:
+            spec.model = model
+        if description is not None:
+            spec.description = description
+        if config is not None:
+            spec.config = dict(config)
+        return spec
+
     def get_agent(self, agent_id: str) -> AgentSpec:
         self._require(agent_id)
         return self._agents[agent_id]
