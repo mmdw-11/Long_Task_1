@@ -63,6 +63,11 @@ class SkillRecord:
     created_at: str = ""
     updated_at: str = ""
     version: int = 1
+    owner_user_id: Optional[str] = None
+    visibility: str = "private"
+    source_type: str = "manual"
+    validation_status: str = "pending"
+    package_sha256: str = ""
 
     @property
     def manifest(self) -> SkillManifest:
@@ -95,6 +100,11 @@ class SkillRecord:
             "updated_at": self.updated_at,
             "version": self.version,
             "content": self.content,
+            "owner_user_id": self.owner_user_id,
+            "visibility": self.visibility,
+            "source_type": self.source_type,
+            "validation_status": self.validation_status,
+            "package_sha256": self.package_sha256,
         }
 
     @classmethod
@@ -120,6 +130,11 @@ class SkillRecord:
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
             version=int(data.get("version") or 1),
+            owner_user_id=data.get("owner_user_id"),
+            visibility=str(data.get("visibility") or "private"),
+            source_type=str(data.get("source_type") or data.get("metadata", {}).get("source") or "manual"),
+            validation_status=str(data.get("validation_status") or "pending"),
+            package_sha256=str(data.get("package_sha256") or data.get("metadata", {}).get("sha256") or ""),
         )
 
 

@@ -122,6 +122,9 @@ class ToolRuntime:
             elif adapter in {"mcp_http", "mcp_url", "mcp"}:
                 args = {"url": str(tool.metadata.get("mcp_url") or tool.metadata.get("url") or "")}
                 result = _call_mcp_http(tool.metadata, task_text)
+            elif adapter == "openapi_http":
+                args = {"url": str(tool.metadata.get("operation_url") or "")}
+                result = _call_openapi_http(tool.metadata, task_text)
             elif adapter in {"script", "python_script"}:
                 args = {"language": str(tool.metadata.get("language") or "python")}
                 result = _run_script_tool(tool.metadata, task_text)
@@ -198,18 +201,23 @@ def _call_mcp_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
     url = str(metadata.get("mcp_url") or metadata.get("url") or "").strip()
     if not url:
         raise ValueError("mcp_url is required")
-    method = str(metadata.get("method") or "tools/list")
+    method = str(metadata.get("method") or "tools/call")
+    remote_name = str(metadata.get("remote_tool_name") or "")
     payload = {
         "jsonrpc": "2.0",
         "id": f"agentforge-{datetime.now(timezone.utc).timestamp()}",
         "method": method,
-        "params": metadata.get("params") or {"task": task_text[:1000]},
+        "params": metadata.get("params") or ({"name": remote_name, "arguments": {"input": task_text[:1000]}} if remote_name else {"task": task_text[:1000]}),
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    credential_env = str(metadata.get("credential_env") or "")
+    if credential_env and os.environ.get(credential_env):
+        headers["Authorization"] = f"Bearer {os.environ[credential_env]}"
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -222,6 +230,27 @@ def _call_mcp_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
             return {"url": url, "method": method, "response": parsed}
     except urllib.error.URLError as exc:
         raise RuntimeError(f"MCP HTTP request failed: {exc}") from exc
+
+
+def _call_openapi_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+    url = str(metadata.get("operation_url") or "").strip()
+    if not url:
+        raise ValueError("OpenAPI operation_url is required")
+    method = str(metadata.get("http_method") or "POST").upper()
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    credential_env = str(metadata.get("credential_env") or "")
+    if credential_env and os.environ.get(credential_env):
+        headers["Authorization"] = f"Bearer {os.environ[credential_env]}"
+    data = json.dumps({"input": task_text[:4000]}, ensure_ascii=False).encode("utf-8") if method not in {"GET", "HEAD"} else None
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=float(metadata.get("timeout_seconds") or 10)) as response:
+            text = response.read(200_000).decode("utf-8", errors="replace")
+            try: payload: Any = json.loads(text)
+            except json.JSONDecodeError: payload = text
+            return {"url": url, "status": response.status, "response": payload}
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenAPI request failed: {exc}") from exc
 
 
 def _run_script_tool(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:

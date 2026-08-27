@@ -41,10 +41,17 @@ class SkillRetriever:
         metadata = metadata or {}
         effective_task_type = task_type or str(metadata.get("task_type") or "")
         query_terms = _terms(" ".join([query, node, effective_task_type, _metadata_text(metadata)]))
+        allowed_ids = None
+        if "skill_ids" in metadata:
+            allowed_ids = {str(item) for item in metadata.get("skill_ids") or []}
+            if not allowed_ids:
+                return []
         if not query_terms:
             return []
         matches: List[SkillMatch] = []
         for skill in self.repository.list(status=SkillStatus.PUBLISHED):
+            if allowed_ids is not None and skill.id not in allowed_ids:
+                continue
             # 灰度比例由仓库统一判断，检索器只负责过滤不可生效的技能。
             if not self.repository.is_rollout_enabled(skill, query=query, node=node):
                 continue

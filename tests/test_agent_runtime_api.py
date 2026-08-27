@@ -37,7 +37,9 @@ def test_sync_run_uses_inference_runtime(tmp_path, monkeypatch):
     message = response.json()["state"]["messages"][0]
     assert message["runtime"] == "inference"
     assert message["result"]["executor"] == "LocalEchoExecutor"
-    assert "当前 Agent：runtime_agent" in message["content"]
+    assert "当前未配置可用的推理模型" in message["content"]
+    assert "当前 Agent：runtime_agent" not in message["content"]
+    assert "Context Injection" not in message["content"]
 
 
 def test_background_run_uses_inference_runtime(tmp_path, monkeypatch):
@@ -97,6 +99,8 @@ def test_background_run_streams_plan_todo_and_tool_events(tmp_path, monkeypatch)
     tool_event = next(event for event in record["events"] if event["type"] == "tool_result")
     assert tool_event["tool_call"]["name"] == "current_time"
     assert tool_event["tool_call"]["status"] == "succeeded"
+    assert "当前时间" in record["state"]["messages"][0]["content"]
+    assert "Context Injection" not in record["state"]["messages"][0]["content"]
 
 
 def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):

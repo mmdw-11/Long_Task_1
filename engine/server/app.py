@@ -32,6 +32,9 @@ import asyncio
 import json
 import os
 import time
+import urllib.error
+import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -61,6 +64,8 @@ from ..modules.product_ops import (
     ToolCatalogStore,
     ToolRecord,
 )
+from ..modules.model_connections import MODEL_PRESETS, ModelConnection, ModelConnectionStore
+from ..modules.external_imports import discover_mcp_tools, openapi_operations, parse_openapi, read_remote_document, read_skill_git, read_skill_zip, validate_remote_url
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
@@ -71,7 +76,18 @@ from ..modules.skills import (
 )
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
 from ..modules.tool_runtime import ToolRuntime, ensure_builtin_tools
+from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
+
+
+BUILTIN_SKILLS = [
+    {"slug":"email-writer","name":"商务邮件撰写","category":"通用办公","description":"根据收件人、目的和语气起草清晰、可发送的商务邮件。","content":"# 商务邮件撰写\n\n先确认收件人、主题、目的和语气；给出结构化邮件草稿。发送前必须请求用户确认。"},
+    {"slug":"research-report","name":"研究报告","category":"内容创意","description":"把研究主题拆解为目标、证据、结论与待验证项，避免虚构来源。","content":"# 研究报告\n\n先列出研究问题和证据需求，输出结论时标识事实、推断和待核验项。"},
+    {"slug":"travel-planner","name":"旅行计划","category":"通用办公","description":"生成兼顾时间、预算、天气与交通的行程方案。","content":"# 旅行计划\n\n确认目的地、日期、预算、同行人和偏好；涉及实时信息时建议调用已授权工具。"},
+    {"slug":"meeting-summary","name":"会议纪要","category":"通用办公","description":"将会议材料整理为结论、行动项、负责人和截止时间。","content":"# 会议纪要\n\n以结论、行动项、负责人、截止时间四部分输出；缺失信息明确标记待补充。"},
+    {"slug":"web-design","name":"网页设计","category":"代码开发","description":"把用户需求转为信息架构、界面层级和可实施的前端建议。","content":"# 网页设计\n\n先给出页面目标、用户路径和组件清单，再输出可实施的视觉与交互建议。"},
+    {"slug":"data-analysis","name":"数据分析","category":"金融","description":"帮助解释指标、识别异常并给出可复现的分析路径。","content":"# 数据分析\n\n明确数据范围与口径，区分计算结果和业务推断，给出复核步骤。"},
+]
 
 
 # ---------------------------------------------------------------------- #
@@ -224,24 +240,32 @@ class UpdateApiKeyReq(BaseModel):
 
 
 class CreateApplicationReq(BaseModel):
-    name: str
+    name: str = Field(max_length=50)
     app_type: str = "agent"
     description: str = ""
     model: str = ""
     system_prompt: str = ""
+    avatar_url: str = ""
     tool_ids: List[str] = Field(default_factory=list)
     skill_ids: List[str] = Field(default_factory=list)
+    knowledge_base_ids: List[str] = Field(default_factory=list)
+    memory_bank_ids: List[str] = Field(default_factory=list)
+    prompt_variables: List[Dict[str, Any]] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class UpdateApplicationReq(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=50)
     description: Optional[str] = None
     status: Optional[str] = None
     model: Optional[str] = None
     system_prompt: Optional[str] = None
+    avatar_url: Optional[str] = None
     tool_ids: Optional[List[str]] = None
     skill_ids: Optional[List[str]] = None
+    knowledge_base_ids: Optional[List[str]] = None
+    memory_bank_ids: Optional[List[str]] = None
+    prompt_variables: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
 
 
@@ -356,6 +380,7 @@ def create_app(
     api_audit_store: Optional[ApiAuditStore] = None,
     auth_store: Optional[AuthStore] = None,
     auth_required: bool = False,
+    model_connection_store: Optional[ModelConnectionStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -377,6 +402,7 @@ def create_app(
     applications = application_store or ApplicationStore(
         os.environ.get("APPLICATION_STORE_ROOT") or "runs/applications"
     )
+    model_connections = model_connection_store or ModelConnectionStore(os.environ.get("MODEL_CONNECTION_ROOT") or "runs/model_connections")
     memory_banks = memory_bank_store or MemoryBankStore(
         os.environ.get("MEMORY_BANK_STORE_ROOT") or "runs/memory_banks"
     )
@@ -388,6 +414,25 @@ def create_app(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
     auth = auth_store or AuthStore(os.environ.get("AUTH_DB_PATH") or "runs/auth/users.sqlite3")
+    # 内置 Skill 是平台可信只读能力，启动时幂等预置并直接发布。
+    for template in BUILTIN_SKILLS:
+        existing = next((item for item in skills.list() if item.metadata.get("market_slug") == template["slug"]), None)
+        if existing is None:
+            skills.create(name=template["name"],content=template["content"],description=template["description"],tags=[template["category"],"market","builtin"],status=SkillStatus.PUBLISHED,visibility="builtin",source_type="builtin",validation_status="passed",metadata={"market_slug":template["slug"],"source":"builtin","category":template["category"],"migration_version":1})
+        elif existing.visibility != "builtin" or existing.status != SkillStatus.PUBLISHED:
+            existing.status=SkillStatus.PUBLISHED;existing.owner_user_id=None;existing.visibility="builtin";existing.source_type="builtin";existing.validation_status="passed";existing.metadata={**existing.metadata,"source":"builtin","category":template["category"],"migration_version":1};skills.save(existing)
+    # 旧资源没有所有者；在存在账号时一次性归属最早注册用户。
+    legacy_owner = auth.first_user()
+    legacy_owner_id = (legacy_owner.id if legacy_owner is not None else "") if auth_required else "local-user"
+    migration_marker = applications.root_dir / ".ownership-v1"
+    if legacy_owner_id:
+        for record in applications.list():
+            if not record.owner_user_id:
+                record.owner_user_id=legacy_owner_id;applications.save(record)
+        for record in skills.list():
+            if record.visibility != "builtin" and not record.owner_user_id:
+                record.owner_user_id=legacy_owner_id;record.visibility="private";skills.save(record,versioned=False)
+        migration_marker.write_text(legacy_owner_id,encoding="utf-8")
     skill_traces = skill_trace_store or SkillTraceStore(
         os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
     )
@@ -397,7 +442,8 @@ def create_app(
         run_store=runs,
         trace_store=skill_traces,
     )
-    runtime_factory = node_factory or AgentRuntimeFactory(tool_catalog_store=tools)
+    runtime_factory = node_factory or AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=model_connections)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -520,6 +566,7 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         token = auth.create_session(user.id)
+        _migrate_ownership(user.id)
         _set_session_cookie(response, token)
         return {"token": token, "user": user.to_dict()}
 
@@ -538,6 +585,59 @@ def create_app(
         if user is None:
             raise HTTPException(status_code=401, detail="请先登录")
         return {"user": user.to_dict()}
+
+    def _request_user_id(request: Request) -> str:
+        user = getattr(request.state, "user", None)
+        return user.id if user is not None else "local-user"
+
+    def _migrate_ownership(owner_id: str) -> None:
+        for record in applications.list():
+            if not record.owner_user_id:
+                record.owner_user_id=owner_id;applications.save(record)
+        for record in skills.list():
+            if record.visibility!="builtin" and not record.owner_user_id:
+                record.owner_user_id=owner_id;record.visibility="private";skills.save(record,versioned=False)
+        migration_marker.write_text(owner_id,encoding="utf-8")
+
+    def _owned_application(app_id: str, request: Request) -> ApplicationRecord:
+        record = applications.get(app_id)
+        if record.owner_user_id and record.owner_user_id != _request_user_id(request):
+            raise HTTPException(status_code=404, detail="application not found")
+        if not record.owner_user_id:
+            record.owner_user_id=_request_user_id(request);applications.save(record)
+        return record
+
+    def _visible_skill(skill_id: str, request: Request, *, mutable: bool = False):
+        record = skills.get(skill_id)
+        if record.visibility == "builtin":
+            if mutable:
+                raise HTTPException(status_code=403, detail="平台内置 Skill 为只读资源")
+            return record
+        if record.owner_user_id != _request_user_id(request):
+            raise HTTPException(status_code=404, detail="skill not found")
+        return record
+
+    def _validate_skill_selection(skill_ids: List[str], request: Request) -> None:
+        for skill_id in skill_ids:
+            try:
+                record = _visible_skill(skill_id, request)
+            except (KeyError, HTTPException) as exc:
+                raise ValueError(f"Skill {skill_id} 不存在或当前用户无权使用") from exc
+            if record.status != SkillStatus.PUBLISHED:
+                raise ValueError(f"Skill {record.name} 尚未发布，不能绑定到应用")
+
+    def _owned_app_for_workflow(workflow_id: str, request: Request) -> Optional[ApplicationRecord]:
+        record = next((item for item in applications.list() if item.workflow_id == workflow_id), None)
+        if record is not None:
+            return _owned_application(record.id, request)
+        return None
+
+    def _owned_run(run_id: str, request: Request):
+        record = runs.get(run_id)
+        owner_id = str(record.metadata.get("owner_user_id") or "")
+        if owner_id and owner_id != _request_user_id(request):
+            raise HTTPException(status_code=404, detail="run not found")
+        return record
 
     @app.post("/api/auth/logout")
     def logout(request: Request, response: Response) -> Dict[str, Any]:
@@ -583,6 +683,64 @@ def create_app(
         _apply_policy(target)
         return target
 
+    def _validate_application_workflow(graph: Dict[str, Any], *, runnable: bool = False) -> List[str]:
+        """Validate the product workflow contract without breaking legacy graphs."""
+        agents = [item for item in graph.get("agents", []) if isinstance(item, dict)]
+        connections = [item for item in graph.get("connections", []) if isinstance(item, dict)]
+        errors: List[str] = []
+        ids = {str(item.get("id")) for item in agents}
+        names = [str(item.get("name") or "").strip() for item in agents]
+        kinds = [str((item.get("config") or {}).get("node_kind") or "agent") for item in agents]
+        starts = [item for item, kind in zip(agents, kinds) if kind == "start"]
+        ends = [item for item, kind in zip(agents, kinds) if kind == "end"]
+        if len(starts) != 1:
+            errors.append("工作流必须且只能包含一个开始节点")
+        if len(ends) != 1:
+            errors.append("工作流必须且只能包含一个结束节点")
+        if any(not name for name in names) or len(names) != len(set(names)):
+            errors.append("节点名称不能为空且必须唯一")
+        if starts and graph.get("entry") != starts[0].get("id"):
+            errors.append("工作流入口必须指向开始节点")
+        for edge in connections:
+            source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
+            if source not in ids or (target != "END" and target not in ids):
+                errors.append("工作流包含指向不存在节点的连线")
+            if source == target:
+                errors.append("节点不能连接到自身")
+        edge_keys = [(str(edge.get("source")), str(edge.get("target")), bool(edge.get("conditional"))) for edge in connections]
+        if len(edge_keys) != len(set(edge_keys)):
+            errors.append("工作流不能包含重复连线")
+        if starts and any(edge.get("target") == starts[0].get("id") for edge in connections):
+            errors.append("开始节点不能有入边")
+        if ends and any(edge.get("source") == ends[0].get("id") for edge in connections):
+            errors.append("结束节点不能有出边")
+        if starts:
+            adjacency: Dict[str, set[str]] = {node_id: set() for node_id in ids}
+            for edge in connections:
+                source = str(edge.get("source") or "")
+                targets = list((edge.get("path_map") or {}).values()) if edge.get("conditional") else [edge.get("target")]
+                adjacency.setdefault(source, set()).update(str(target) for target in targets if target in ids)
+            reached, pending = set(), [str(starts[0].get("id"))]
+            while pending:
+                current_id = pending.pop()
+                if current_id in reached:
+                    continue
+                reached.add(current_id)
+                pending.extend(adjacency.get(current_id, set()) - reached)
+            if reached != ids:
+                errors.append("所有节点必须能够从开始节点到达")
+            if ends and str(ends[0].get("id")) not in reached:
+                errors.append("结束节点必须能够从开始节点到达")
+        if runnable and "knowledge" in kinds:
+            errors.append("知识库节点已完成配置保存，但检索运行能力尚未接入")
+        for item, kind in zip(agents, kinds):
+            config = item.get("config") or {}
+            if kind == "tool" and not config.get("tool_id"):
+                errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
+            if kind in {"condition", "intent", "loop"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
+                errors.append(f"逻辑节点“{item.get('name')}”尚未配置分支连线")
+        return list(dict.fromkeys(errors))
+
     def _append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
         enriched = {
             **event,
@@ -599,6 +757,39 @@ def create_app(
             if value not in (None, ""):
                 return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
         return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _validated_variables(definitions: List[Dict[str, Any]], supplied: Any) -> Dict[str, Any]:
+        values = supplied if isinstance(supplied, dict) else {}
+        result: Dict[str, Any] = {}
+        seen = set()
+        for definition in definitions:
+            name = str(definition.get("name") or "").strip()
+            if not name or not name.replace("_", "a").isalnum() or name[0].isdigit() or name in seen:
+                raise ValueError("提示词变量名称必须唯一且只能包含字母、数字和下划线")
+            seen.add(name)
+            value = values.get(name, definition.get("default"))
+            if definition.get("required") and value in {None, ""}:
+                raise ValueError(f"缺少必填提示词变量：{name}")
+            kind = str(definition.get("type") or "string")
+            if value not in {None, ""}:
+                try:
+                    if kind == "number": value = float(value)
+                    elif kind == "boolean": value = value if isinstance(value, bool) else str(value).lower() in {"1","true","yes","on"}
+                    else: value = str(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"提示词变量 {name} 的类型不正确") from exc
+            result[name] = value
+        return result
+
+    def _validate_variable_definitions(definitions: List[Dict[str, Any]]) -> None:
+        seen = set()
+        for definition in definitions:
+            name = str(definition.get("name") or "").strip()
+            if not name or not name.replace("_", "a").isalnum() or name[0].isdigit() or name in seen:
+                raise ValueError("提示词变量名称必须唯一且只能包含字母、数字和下划线")
+            if str(definition.get("type") or "string") not in {"string", "text", "number", "boolean"}:
+                raise ValueError(f"提示词变量 {name} 的类型不受支持")
+            seen.add(name)
 
     def _initial_plan(payload: Dict[str, Any], target: Orchestrator) -> List[str]:
         explicit = payload.get("current_plan") or payload.get("plan")
@@ -690,8 +881,12 @@ def create_app(
             runs.save(record)
             target = _orchestrator_for_run(record.workflow_id)
             _seed_todo_events(record, target)
+            is_visual_workflow = any(
+                (item.get("config") or {}).get("node_kind")
+                for item in target.to_dict().get("agents", [])
+            )
             compiled = target.build_graph(
-                node_factory=runtime_factory,
+                node_factory=workflow_runtime_factory if is_visual_workflow else runtime_factory,
                 recursion_limit=record.recursion_limit,
             )
             run_input = {**record.input, "run_id": record.id}
@@ -750,11 +945,17 @@ def create_app(
                 runs.save(record)
             record.status = "succeeded"
             record.finished_at = _utc_now()
+            used_skills=[]
+            for trace in skill_traces.list(record.id):
+                for item in trace.payload.get("skills") or []:
+                    if item.get("skill_id") and item not in used_skills:
+                        used_skills.append(item)
             record.metadata = {
                 **record.metadata,
                 "active_agent": None,
                 "duration_ms": round((time.perf_counter() - started_clock) * 1000, 2),
                 "summary": _build_run_summary(record),
+                "skills_used": used_skills,
             }
             runs.save(record)
         except Exception as e:  # noqa: BLE001 - API persists failures for polling
@@ -910,6 +1111,7 @@ def create_app(
     async def create_run(
         req: CreateRunReq,
         background_tasks: BackgroundTasks,
+        request: Request,
     ) -> Dict[str, Any]:
         try:
             if req.workflow_id:
@@ -920,6 +1122,7 @@ def create_app(
                 workflow_id=req.workflow_id,
             )
             record.status = "queued"
+            record.metadata["owner_user_id"] = _request_user_id(request)
             runs.save(record)
             background_tasks.add_task(_execute_run, record)
             return record.to_dict()
@@ -929,21 +1132,22 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/api/runs")
-    def list_runs(workflow_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        return [item.to_dict() for item in runs.list(workflow_id=workflow_id)]
+    def list_runs(request: Request, workflow_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        user_id = _request_user_id(request)
+        return [item.to_dict() for item in runs.list(workflow_id=workflow_id) if str(item.metadata.get("owner_user_id") or "") in {"", user_id}]
 
     @app.get("/api/runs/{run_id}")
-    def get_run(run_id: str) -> Dict[str, Any]:
+    def get_run(run_id: str, request: Request) -> Dict[str, Any]:
         try:
-            return runs.get(run_id).to_dict()
+            return _owned_run(run_id, request).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/runs/{run_id}/events")
-    async def stream_run_events(run_id: str, after: int = 0):
+    async def stream_run_events(run_id: str, request: Request, after: int = 0):
         """用 SSE 推送持久化运行事件；断线后可通过 after 继续。"""
         try:
-            runs.get(run_id)
+            _owned_run(run_id, request)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -979,18 +1183,21 @@ def create_app(
         )
 
     @app.post("/api/runs/{run_id}/cancel")
-    def cancel_run(run_id: str, req: CancelRunReq) -> Dict[str, Any]:
+    def cancel_run(run_id: str, req: CancelRunReq, request: Request) -> Dict[str, Any]:
         try:
+            _owned_run(run_id, request)
             return runs.mark_cancel_requested(run_id, reason=req.reason).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.post("/api/runs/{run_id}/approvals/{sequence}/approve")
-    def approve_tool_call(run_id: str, sequence: int, req: ApprovalDecisionReq) -> Dict[str, Any]:
+    def approve_tool_call(run_id: str, sequence: int, req: ApprovalDecisionReq, request: Request) -> Dict[str, Any]:
+        _owned_run(run_id, request)
         return _record_approval_decision(run_id, sequence, approved=True, reason=req.reason)
 
     @app.post("/api/runs/{run_id}/approvals/{sequence}/reject")
-    def reject_tool_call(run_id: str, sequence: int, req: ApprovalDecisionReq) -> Dict[str, Any]:
+    def reject_tool_call(run_id: str, sequence: int, req: ApprovalDecisionReq, request: Request) -> Dict[str, Any]:
+        _owned_run(run_id, request)
         return _record_approval_decision(run_id, sequence, approved=False, reason=req.reason)
 
     def _record_approval_decision(run_id: str, sequence: int, *, approved: bool, reason: str = "") -> Dict[str, Any]:
@@ -1058,8 +1265,9 @@ def create_app(
         return record.to_dict()
 
     @app.post("/api/runs/{run_id}/retry")
-    async def retry_run(run_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    async def retry_run(run_id: str, background_tasks: BackgroundTasks, request: Request) -> Dict[str, Any]:
         try:
+            _owned_run(run_id, request)
             record = runs.retry(run_id)
             record.status = "queued"
             runs.save(record)
@@ -1101,37 +1309,118 @@ def create_app(
         return {"ok": True, "agents": len(data.get("agents", []))}
 
     # ------------------------- 应用中心 ------------------------- #
+    @app.get("/api/model-presets")
+    def list_model_presets() -> List[Dict[str, Any]]:
+        return MODEL_PRESETS
+
+    @app.get("/api/model-connections")
+    def list_model_connections() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in model_connections.list()]
+
+    @app.post("/api/model-connections")
+    def create_model_connection(req: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return model_connections.create(req).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.put("/api/model-connections/{connection_id}")
+    def update_model_connection(connection_id: str, req: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            current = model_connections.get(connection_id)
+            return model_connections.save(ModelConnection.from_dict({**current.to_dict(), **req, "id": connection_id})).to_dict()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/model-connections/{connection_id}/test")
+    def test_model_connection(connection_id: str) -> Dict[str, Any]:
+        try:
+            item = model_connections.get(connection_id)
+            if not item.base_url:
+                raise ValueError("模型连接缺少 base_url")
+            headers = {"Accept": "application/json"}
+            if item.api_key_env and os.environ.get(item.api_key_env):
+                headers["Authorization"] = f"Bearer {os.environ[item.api_key_env]}"
+            request = urllib.request.Request(f"{item.base_url}/models", headers=headers)
+            with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310 - URL is administrator configured
+                if response.status >= 400: raise ValueError(f"模型服务返回 HTTP {response.status}")
+            item.test_status = "succeeded"
+            return model_connections.save(item).to_dict()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            try:
+                item.test_status = "failed"; model_connections.save(item)
+            except Exception:
+                pass
+            raise HTTPException(status_code=400, detail=f"模型连接测试失败：{exc}")
+
     @app.get("/api/apps")
-    def list_applications() -> List[Dict[str, Any]]:
-        return [item.to_dict() for item in applications.list()]
+    def list_applications(request: Request) -> List[Dict[str, Any]]:
+        user_id=_request_user_id(request)
+        return [item.to_dict() for item in applications.list() if item.owner_user_id in {"",user_id}]
 
     @app.post("/api/apps")
-    def create_application(req: CreateApplicationReq) -> Dict[str, Any]:
+    def create_application(req: CreateApplicationReq, request: Request) -> Dict[str, Any]:
         try:
+            _validate_skill_selection(req.skill_ids, request)
+            _validate_variable_definitions(req.prompt_variables)
+            if req.app_type not in {"agent", "workflow"}:
+                raise ValueError("app_type must be 'agent' or 'workflow'")
+            if req.model not in {"", "auto", "device", "edge", "cloud"}:
+                selected_model = model_connections.get(req.model)
+                if not selected_model.enabled or selected_model.test_status != "succeeded" or not selected_model.to_dict()["configured"]:
+                    raise ValueError("指定模型连接未启用或尚未测试成功")
             app_record = applications.create(
                 name=req.name,
                 app_type=req.app_type,
                 description=req.description,
                 model=req.model,
                 system_prompt=req.system_prompt,
+                avatar_url=req.avatar_url,
                 tool_ids=req.tool_ids,
                 skill_ids=req.skill_ids,
+                knowledge_base_ids=req.knowledge_base_ids,
+                memory_bank_ids=req.memory_bank_ids,
+                prompt_variables=req.prompt_variables,
+                owner_user_id=_request_user_id(request),
                 metadata=req.metadata,
             )
             draft = Orchestrator()
-            entry_id = draft.create_agent(
-                name=req.name,
-                sys_prompt=req.system_prompt,
-                model=req.model,
-                description=req.description or "负责应用入口任务理解、工具调用和最终答复。",
-                config={"tool_ids": req.tool_ids, "skill_ids": req.skill_ids},
-            )
+            if req.app_type == "workflow":
+                entry_id = draft.create_agent(
+                    name="开始", description="接收工作流输入", config={"node_kind": "start", "input_fields": ["input"]}
+                )
+                end_id = draft.create_agent(
+                    name="结束", description="返回工作流最终输出", config={"node_kind": "end", "output_field": "input"}
+                )
+                draft.connect(entry_id, end_id)
+            else:
+                entry_id = draft.create_agent(
+                    name=req.name,
+                    sys_prompt=req.system_prompt,
+                    model=req.model,
+                    description=req.description or "负责应用入口任务理解、工具调用和最终答复。",
+                    config={
+                        "tool_ids": req.tool_ids,
+                        "skill_ids": req.skill_ids,
+                        "knowledge_base_ids": req.knowledge_base_ids,
+                        "memory_bank_ids": req.memory_bank_ids,
+                        "prompt_variables": req.prompt_variables,
+                    },
+                )
             draft.set_entry(entry_id)
             workflow = workflows.create(
                 name=req.name,
                 description=req.description,
                 tags=[req.app_type, "application"],
-                metadata={"application_id": app_record.id, **req.metadata},
+                metadata={
+                    "application_id": app_record.id,
+                    **({"editor": {"positions": {entry_id: {"x": 120, "y": 240}, end_id: {"x": 520, "y": 240}}, "viewport": {"x": 0, "y": 0, "zoom": 1}}} if req.app_type == "workflow" else {}),
+                    **req.metadata,
+                },
                 graph=draft.to_dict(),
             )
             app_record.workflow_id = workflow.id
@@ -1141,11 +1430,13 @@ def create_app(
             return app_record.to_dict()
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/api/apps/{app_id}")
-    def get_application(app_id: str) -> Dict[str, Any]:
+    def get_application(app_id: str, request: Request) -> Dict[str, Any]:
         try:
-            app_record = applications.get(app_id)
+            app_record = _owned_application(app_id, request)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         payload = app_record.to_dict()
@@ -1157,9 +1448,17 @@ def create_app(
         return payload
 
     @app.put("/api/apps/{app_id}")
-    def update_application(app_id: str, req: UpdateApplicationReq) -> Dict[str, Any]:
+    def update_application(app_id: str, req: UpdateApplicationReq, request: Request) -> Dict[str, Any]:
         try:
-            current = applications.get(app_id)
+            current = _owned_application(app_id, request)
+            if req.skill_ids is not None:
+                _validate_skill_selection(req.skill_ids, request)
+            if req.prompt_variables is not None:
+                _validate_variable_definitions(req.prompt_variables)
+            if req.model is not None and req.model not in {"", "auto", "device", "edge", "cloud"}:
+                selected_model = model_connections.get(req.model)
+                if not selected_model.enabled or selected_model.test_status != "succeeded" or not selected_model.to_dict()["configured"]:
+                    raise ValueError("指定模型连接未启用或尚未测试成功")
             updated = ApplicationRecord.from_dict(
                 {
                     **current.to_dict(),
@@ -1168,22 +1467,32 @@ def create_app(
                     "status": req.status if req.status is not None else current.status,
                     "model": req.model if req.model is not None else current.model,
                     "system_prompt": req.system_prompt if req.system_prompt is not None else current.system_prompt,
+                    "avatar_url": req.avatar_url if req.avatar_url is not None else current.avatar_url,
                     "tool_ids": req.tool_ids if req.tool_ids is not None else current.tool_ids,
                     "skill_ids": req.skill_ids if req.skill_ids is not None else current.skill_ids,
+                    "knowledge_base_ids": req.knowledge_base_ids if req.knowledge_base_ids is not None else current.knowledge_base_ids,
+                    "memory_bank_ids": req.memory_bank_ids if req.memory_bank_ids is not None else current.memory_bank_ids,
+                    "prompt_variables": req.prompt_variables if req.prompt_variables is not None else current.prompt_variables,
                     "metadata": req.metadata if req.metadata is not None else current.metadata,
                 }
             )
             if updated.workflow_id:
                 workflow = workflows.get(updated.workflow_id)
                 graph = Orchestrator.from_dict(workflow.graph)
-                if updated.entry_agent_id:
+                if updated.entry_agent_id and updated.app_type == "agent":
                     graph.update_agent(
                         updated.entry_agent_id,
                         name=updated.name,
                         sys_prompt=updated.system_prompt,
                         model=updated.model,
                         description=updated.description,
-                        config={"tool_ids": updated.tool_ids, "skill_ids": updated.skill_ids},
+                        config={
+                            "tool_ids": updated.tool_ids,
+                            "skill_ids": updated.skill_ids,
+                            "knowledge_base_ids": updated.knowledge_base_ids,
+                            "memory_bank_ids": updated.memory_bank_ids,
+                            "prompt_variables": updated.prompt_variables,
+                        },
                     )
                 workflows.save(
                     WorkflowRecord.from_dict(
@@ -1202,27 +1511,43 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/apps/{app_id}/publish")
-    def publish_application(app_id: str) -> Dict[str, Any]:
+    def publish_application(app_id: str, request: Request) -> Dict[str, Any]:
         try:
-            app_record = applications.get(app_id)
+            app_record = _owned_application(app_id, request)
+            if app_record.app_type == "workflow":
+                workflow = workflows.get(app_record.workflow_id)
+                errors = _validate_application_workflow(workflow.graph, runnable=True)
+                if errors:
+                    raise ValueError("；".join(errors))
             app_record.status = "published"
             return applications.save(app_record).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/apps/{app_id}/runs")
     async def create_application_run(
         app_id: str,
         req: CreateApplicationRunReq,
         background_tasks: BackgroundTasks,
+        request: Request,
     ) -> Dict[str, Any]:
         """以应用为入口发起调试运行，前端无需理解内部 workflow_id。"""
         try:
-            app_record = applications.get(app_id)
+            app_record = _owned_application(app_id, request)
             if not app_record.workflow_id:
                 raise HTTPException(status_code=400, detail="应用尚未绑定工作流")
             workflows.get(app_record.workflow_id)
+            if app_record.app_type == "workflow":
+                errors = _validate_application_workflow(workflows.get(app_record.workflow_id).graph, runnable=True)
+                if errors:
+                    raise HTTPException(status_code=400, detail="；".join(errors))
             input_payload = dict(req.input or {})
+            try:
+                input_payload["variables"] = _validated_variables(app_record.prompt_variables, input_payload.get("variables"))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
             if "input" not in input_payload:
                 input_payload["input"] = f"请运行应用：{app_record.name}"
             record = runs.create(
@@ -1232,6 +1557,7 @@ def create_app(
             )
             record.metadata["application_id"] = app_record.id
             record.metadata["application_name"] = app_record.name
+            record.metadata["owner_user_id"] = app_record.owner_user_id
             record.status = "queued"
             runs.save(record)
             background_tasks.add_task(_execute_run, record)
@@ -1240,10 +1566,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/apps/{app_id}/runs")
-    def list_application_runs(app_id: str) -> List[Dict[str, Any]]:
+    def list_application_runs(app_id: str, request: Request) -> List[Dict[str, Any]]:
         """列出某个应用触发的运行记录，便于应用详情页做调试历史。"""
         try:
-            app_record = applications.get(app_id)
+            app_record = _owned_application(app_id, request)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         return [
@@ -1253,8 +1579,9 @@ def create_app(
         ]
 
     @app.delete("/api/apps/{app_id}")
-    def delete_application(app_id: str) -> Dict[str, Any]:
+    def delete_application(app_id: str, request: Request) -> Dict[str, Any]:
         try:
+            _owned_application(app_id, request)
             applications.delete(app_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1277,26 +1604,32 @@ def create_app(
         return record.to_dict()
 
     @app.get("/api/workflows")
-    def list_workflows() -> List[Dict[str, Any]]:
-        return [item.to_dict() for item in workflows.list()]
+    def list_workflows(request: Request) -> List[Dict[str, Any]]:
+        user_id = _request_user_id(request)
+        owned_workflow_ids = {item.workflow_id for item in applications.list() if item.owner_user_id in {"", user_id}}
+        foreign_workflow_ids = {item.workflow_id for item in applications.list() if item.owner_user_id not in {"", user_id}}
+        return [item.to_dict() for item in workflows.list() if item.id in owned_workflow_ids or item.id not in foreign_workflow_ids]
 
     @app.get("/api/workflows/{workflow_id}")
-    def get_workflow(workflow_id: str) -> Dict[str, Any]:
+    def get_workflow(workflow_id: str, request: Request) -> Dict[str, Any]:
         try:
+            _owned_app_for_workflow(workflow_id, request)
             return workflows.get(workflow_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/workflows/{workflow_id}/versions")
-    def list_workflow_versions(workflow_id: str) -> List[Dict[str, Any]]:
+    def list_workflow_versions(workflow_id: str, request: Request) -> List[Dict[str, Any]]:
         try:
+            _owned_app_for_workflow(workflow_id, request)
             return [item.to_dict() for item in workflows.list_versions(workflow_id)]
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/workflows/{workflow_id}/versions/{version}")
-    def get_workflow_version(workflow_id: str, version: int) -> Dict[str, Any]:
+    def get_workflow_version(workflow_id: str, version: int, request: Request) -> Dict[str, Any]:
         try:
+            _owned_app_for_workflow(workflow_id, request)
             return workflows.get_version(workflow_id, version).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1304,9 +1637,15 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.put("/api/workflows/{workflow_id}")
-    def update_workflow(workflow_id: str, req: UpdateWorkflowReq) -> Dict[str, Any]:
+    def update_workflow(workflow_id: str, req: UpdateWorkflowReq, request: Request) -> Dict[str, Any]:
         try:
+            _owned_app_for_workflow(workflow_id, request)
             current = workflows.get(workflow_id)
+            next_graph = req.graph if req.graph is not None else current.graph
+            if "workflow" in current.tags:
+                errors = _validate_application_workflow(next_graph)
+                if errors:
+                    raise ValueError("；".join(errors))
             updated = WorkflowRecord.from_dict(
                 {
                     **current.to_dict(),
@@ -1320,7 +1659,7 @@ def create_app(
                     "metadata": (
                         req.metadata if req.metadata is not None else current.metadata
                     ),
-                    "graph": req.graph if req.graph is not None else current.graph,
+                    "graph": next_graph,
                 }
             )
             return workflows.save(updated).to_dict()
@@ -1330,9 +1669,10 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/workflows/{workflow_id}/load")
-    def load_workflow(workflow_id: str) -> Dict[str, Any]:
+    def load_workflow(workflow_id: str, request: Request) -> Dict[str, Any]:
         nonlocal orch
         try:
+            _owned_app_for_workflow(workflow_id, request)
             record = workflows.get(workflow_id)
             orch = Orchestrator.from_dict(record.graph)
             _apply_policy(orch)
@@ -1343,8 +1683,9 @@ def create_app(
         return {"ok": True, "workflow": record.to_dict(), "graph": orch.to_dict()}
 
     @app.post("/api/workflows/{workflow_id}/rollback/{version}")
-    def rollback_workflow(workflow_id: str, version: int) -> Dict[str, Any]:
+    def rollback_workflow(workflow_id: str, version: int, request: Request) -> Dict[str, Any]:
         try:
+            _owned_app_for_workflow(workflow_id, request)
             return workflows.rollback(workflow_id, version).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1352,8 +1693,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.delete("/api/workflows/{workflow_id}")
-    def delete_workflow(workflow_id: str) -> Dict[str, Any]:
+    def delete_workflow(workflow_id: str, request: Request) -> Dict[str, Any]:
         try:
+            _owned_app_for_workflow(workflow_id, request)
             workflows.delete(workflow_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1361,52 +1703,98 @@ def create_app(
 
     # ------------------------- 技能生命周期 ------------------------- #
     @app.post("/api/skills")
-    def create_skill(req: CreateSkillReq) -> Dict[str, Any]:
+    def create_skill(req: CreateSkillReq, request: Request) -> Dict[str, Any]:
         try:
             return skills.create(
                 name=req.name,
                 content=req.content,
                 description=req.description,
                 tags=req.tags,
-                metadata=req.metadata,
+                metadata={**req.metadata,"source":"manual","validation":{"passed":True,"mode":"automatic"}},
+                status=SkillStatus.PUBLISHED,
+                owner_user_id=_request_user_id(request),
+                visibility="private",
+                source_type="manual",
+                validation_status="passed",
             ).to_dict()
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    @app.get("/api/skills")
-    def list_skills(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    @app.post("/api/skills/import/git")
+    def import_skill_git(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
         try:
-            return [item.to_dict() for item in skills.list(status=status)]
+            url = str(req.get("url") or "")
+            package = read_skill_git(url)
+            record = skills.create(name=package["name"],content=package["content"],description=str(req.get("description") or "从 Git 仓库导入"),status=SkillStatus.PUBLISHED,tags=["imported","git"],metadata={"source":"git","source_url":url,"revision":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},owner_user_id=_request_user_id(request),visibility="private",source_type="git",validation_status="passed",package_sha256=package["sha256"])
+            return record.to_dict()
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/skills/import/zip")
+    async def import_skill_zip(request: Request) -> Dict[str, Any]:
+        try:
+            package = read_skill_zip(await request.body())
+            record = skills.create(name=package["name"],content=package["content"],description=request.headers.get("x-skill-description","从 ZIP 包导入"),status=SkillStatus.PUBLISHED,tags=["imported","zip"],metadata={"source":"zip","sha256":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},owner_user_id=_request_user_id(request),visibility="private",source_type="zip",validation_status="passed",package_sha256=package["sha256"])
+            return record.to_dict()
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/skills")
+    def list_skills(request: Request, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            user_id=_request_user_id(request)
+            return [item.to_dict() for item in skills.list(status=status) if item.visibility=="builtin" or item.owner_user_id==user_id]
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/search")
-    def search_skills(req: SkillSearchReq) -> Dict[str, Any]:
+    def search_skills(req: SkillSearchReq, request: Request) -> Dict[str, Any]:
         matches = skill_retriever.retrieve(
             req.query,
             node=req.node,
             metadata=req.metadata,
             top_k=req.top_k,
         )
-        return {"matches": [item.to_dict() for item in matches]}
+        visible={item["id"] for item in list_skills(request)}
+        return {"matches": [item.to_dict() for item in matches if item.skill.id in visible]}
+
+    @app.put("/api/skills/{skill_id}")
+    def update_private_skill(skill_id: str, req: CreateSkillReq, request: Request) -> Dict[str, Any]:
+        try:
+            record=_visible_skill(skill_id,request,mutable=True)
+            record.name=req.name;record.content=req.content;record.description=req.description;record.tags=req.tags;record.metadata={**record.metadata,**req.metadata,"validation":{"passed":True,"mode":"automatic"}};record.status=SkillStatus.PUBLISHED;record.validation_status="passed"
+            return skills.save(record).to_dict()
+        except KeyError as exc:
+            raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400,detail=str(exc))
+
+    @app.delete("/api/skills/{skill_id}")
+    def delete_private_skill(skill_id: str, request: Request) -> Dict[str, Any]:
+        try:
+            _visible_skill(skill_id,request,mutable=True);skills.delete(skill_id);return {"ok":True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404,detail=str(exc))
 
     @app.get("/api/skills/{skill_id}")
-    def get_skill(skill_id: str) -> Dict[str, Any]:
+    def get_skill(skill_id: str, request: Request) -> Dict[str, Any]:
         try:
-            return skills.get(skill_id).to_dict()
+            return _visible_skill(skill_id, request).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/skills/{skill_id}/versions")
-    def list_skill_versions(skill_id: str) -> List[Dict[str, Any]]:
+    def list_skill_versions(skill_id: str, request: Request) -> List[Dict[str, Any]]:
         try:
+            _visible_skill(skill_id, request)
             return [item.to_dict() for item in skills.list_versions(skill_id)]
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/skills/{skill_id}/versions/{version}")
-    def get_skill_version(skill_id: str, version: int) -> Dict[str, Any]:
+    def get_skill_version(skill_id: str, version: int, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request)
             return skills.get_version(skill_id, version).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1414,23 +1802,31 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/candidates/from-run")
-    def create_skill_candidate(req: CreateSkillCandidateReq) -> Dict[str, Any]:
+    def create_skill_candidate(req: CreateSkillCandidateReq, request: Request) -> Dict[str, Any]:
         try:
-            return skill_evolution.create_candidate_from_run(
+            record = skill_evolution.create_candidate_from_run(
                 req.run_id,
                 name=req.name,
                 description=req.description,
                 tags=req.tags,
                 metadata=req.metadata,
-            ).to_dict()
+            )
+            record.owner_user_id=_request_user_id(request);record.visibility="private";record.source_type="run";skills.save(record)
+            report=skill_evolution.validate(record.id)
+            if not report.passed:
+                raise ValueError("Skill 自动验证失败："+"；".join(report.findings))
+            published=skill_evolution.publish(record.id,approved_by=_request_user_id(request))
+            published.validation_status="passed";published.metadata={**published.metadata,"validation_mode":"automatic"}
+            return skills.save(published).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/{skill_id}/validate")
-    def validate_skill(skill_id: str) -> Dict[str, Any]:
+    def validate_skill(skill_id: str, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request, mutable=True)
             return skill_evolution.validate(skill_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1438,8 +1834,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/{skill_id}/publish")
-    def publish_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
+    def publish_skill(skill_id: str, req: SkillDecisionReq, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request, mutable=True)
             return skill_evolution.publish(
                 skill_id,
                 approved_by=req.approved_by or "",
@@ -1450,8 +1847,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/{skill_id}/reject")
-    def reject_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
+    def reject_skill(skill_id: str, req: SkillDecisionReq, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request, mutable=True)
             return skill_evolution.reject(skill_id, reason=req.reason).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1459,8 +1857,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/{skill_id}/retire")
-    def retire_skill(skill_id: str, req: SkillDecisionReq) -> Dict[str, Any]:
+    def retire_skill(skill_id: str, req: SkillDecisionReq, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request, mutable=True)
             return skill_evolution.retire(skill_id, reason=req.reason).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1468,8 +1867,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/{skill_id}/rollback/{version}")
-    def rollback_skill(skill_id: str, version: int, req: SkillDecisionReq) -> Dict[str, Any]:
+    def rollback_skill(skill_id: str, version: int, req: SkillDecisionReq, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request, mutable=True)
             return skills.rollback(
                 skill_id,
                 version,
@@ -1482,8 +1882,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/{skill_id}/rollout")
-    def set_skill_rollout(skill_id: str, req: SkillRolloutReq) -> Dict[str, Any]:
+    def set_skill_rollout(skill_id: str, req: SkillRolloutReq, request: Request) -> Dict[str, Any]:
         try:
+            _visible_skill(skill_id, request, mutable=True)
             return skills.set_rollout(
                 skill_id,
                 req.percent,
@@ -1495,7 +1896,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/api/runs/{run_id}/skill-traces")
-    def get_skill_traces(run_id: str) -> Dict[str, Any]:
+    def get_skill_traces(run_id: str, request: Request) -> Dict[str, Any]:
+        _owned_run(run_id, request)
         return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
 
     # ------------------------- 百炼式资源市场 ------------------------- #
@@ -1517,6 +1919,7 @@ def create_app(
         {"slug": "web-design", "name": "网页设计", "category": "代码开发", "description": "把用户需求转为信息架构、界面层级和可实施的前端建议。", "content": "# 网页设计\n\n先给出页面目标、用户路径和组件清单，再输出可实施的视觉与交互建议。"},
         {"slug": "data-analysis", "name": "数据分析", "category": "金融", "description": "帮助解释指标、识别异常并给出可复现的分析路径。", "content": "# 数据分析\n\n明确数据范围与口径，区分计算结果和业务推断，给出复核步骤。"},
     ]
+    skill_market = BUILTIN_SKILLS
     app_templates = [
         {"slug": "blank-agent", "name": "空白智能体", "description": "最小化核心工具集，从零开始构建。", "system_prompt": "你是可靠的智能体助手。先澄清任务，再规划、执行和总结。"},
         {"slug": "article-polish", "name": "文章润色", "description": "改善表达和结构，不改变原意、不捏造事实。", "system_prompt": "你是文章润色助手。保留事实和原意，输出修改稿与修改说明。"},
@@ -1546,7 +1949,8 @@ def create_app(
 
     @app.get("/api/marketplace/skills")
     def list_skill_marketplace() -> List[Dict[str, Any]]:
-        return [{k: v for k, v in item.items() if k != "content"} for item in skill_market]
+        records={item.metadata.get("market_slug"):item for item in skills.list() if item.visibility=="builtin"}
+        return [{**{k:v for k,v in item.items() if k!="content"},"skill_id":records[item["slug"]].id if item["slug"] in records else "","status":"published","version":records[item["slug"]].version if item["slug"] in records else 1,"source_type":"builtin"} for item in skill_market]
 
     @app.post("/api/marketplace/skills/{slug}/install")
     def install_skill_template(slug: str) -> Dict[str, Any]:
@@ -1555,9 +1959,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="未找到 Skill 市场模板")
         existing = next((x for x in skills.list() if x.metadata.get("market_slug") == slug), None)
         if existing is not None:
-            return {"installed": False, "skill": existing.to_dict(), "message": "该 Skill 模板已经安装"}
-        record = skills.create(name=item["name"], content=item["content"], description=item["description"], tags=[item["category"], "market"], metadata={"market_slug": slug, "source": "market"})
-        return {"installed": True, "skill": record.to_dict(), "message": "Skill 模板已保存为草稿，可在 Skill 管理中发布"}
+            return {"installed": False, "skill": existing.to_dict(), "message": "平台内置 Skill 已可直接使用"}
+        record = skills.create(name=item["name"],content=item["content"],description=item["description"],tags=[item["category"],"market","builtin"],status=SkillStatus.PUBLISHED,visibility="builtin",source_type="builtin",validation_status="passed",metadata={"market_slug":slug,"source":"builtin","category":item["category"]})
+        return {"installed": True, "skill": record.to_dict(), "message": "平台内置 Skill 已可直接使用"}
 
     @app.get("/api/marketplace/apps")
     def list_application_templates() -> List[Dict[str, Any]]:
@@ -1676,6 +2080,65 @@ def create_app(
         return {"ok": True}
 
     # ------------------------- 工具目录 ------------------------- #
+    @app.post("/api/tool-connections/mcp")
+    def import_mcp_connection(req: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            url = validate_remote_url(str(req.get("url") or ""))
+            name = str(req.get("name") or "Remote MCP").strip()
+            credential_env = str(req.get("credential_env") or "")
+            timeout = min(30, max(1, int(req.get("timeout_seconds") or 8)))
+            connection_id = f"mcp-{int(time.time())}"
+            imported = []
+            for remote in discover_mcp_tools(url, credential_env, timeout):
+                remote_name = str(remote["name"])
+                slug = f"mcp_{connection_id}_{remote_name}".replace("-", "_")
+                metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection_id,"mcp_url":url,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or {},"credential_env":credential_env,"risk":str(req.get("risk") or "read"),"sync_status":"synced","timeout_seconds":timeout}
+                imported.append(tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or f"{name} MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata).to_dict())
+            return {"connection_id":connection_id,"tools":imported}
+        except (ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/tool-connections/openapi")
+    def import_openapi_connection(req: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            source_url = str(req.get("url") or "")
+            content = read_remote_document(source_url) if source_url else json.dumps(req.get("document") or {}).encode("utf-8")
+            document = parse_openapi(content)
+            imported = []
+            for operation in openapi_operations(document, source_url or "https://configured.invalid/openapi.json", str(req.get("credential_env") or "")):
+                existing = next((item for item in tools.list() if item.name == operation["name"]), None)
+                if existing:
+                    existing.display_name=operation["display_name"];existing.description=operation["description"];existing.metadata={**existing.metadata,**operation["metadata"]}; imported.append(tools.save(existing).to_dict())
+                else:
+                    imported.append(tools.create(name=operation["name"],display_name=operation["display_name"],description=operation["description"],category="openapi",tags=["openapi","external"],metadata=operation["metadata"]).to_dict())
+            return {"connection_id":f"openapi-{int(time.time())}","tools":imported}
+        except (ValueError, urllib.error.URLError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/tool-connections/{connection_id}/sync")
+    def sync_tool_connection(connection_id: str) -> Dict[str, Any]:
+        try:
+            connected = [item for item in tools.list() if item.metadata.get("connection_id") == connection_id]
+            if not connected:
+                raise KeyError(f"tool connection not found: {connection_id}")
+            seed = connected[0]
+            remote_tools = discover_mcp_tools(str(seed.metadata["mcp_url"]), str(seed.metadata.get("credential_env") or ""), float(seed.metadata.get("timeout_seconds") or 8))
+            synced = []
+            by_name = {str(item.metadata.get("remote_tool_name")): item for item in connected}
+            for remote in remote_tools:
+                remote_name = str(remote["name"])
+                item = by_name.get(remote_name)
+                metadata = {**seed.metadata,"remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or {},"sync_status":"synced"}
+                if item:
+                    item.display_name=str(remote.get("title") or remote_name);item.description=str(remote.get("description") or item.description);item.metadata=metadata;synced.append(tools.save(item).to_dict())
+                else:
+                    slug=f"mcp_{connection_id}_{remote_name}".replace("-","_");synced.append(tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or "MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata).to_dict())
+            return {"connection_id":connection_id,"tools":synced,"status":"synced"}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except (ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.post("/api/tools")
     def create_tool(req: CreateToolReq) -> Dict[str, Any]:
         try:

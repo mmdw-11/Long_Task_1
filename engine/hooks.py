@@ -57,7 +57,7 @@ from .modules.routing import (
     Router,
 )
 from .modules.security import AuditPackBuilder, SensitiveDataRedactor
-from .modules.skills import SKILL_CONTEXT_TEXT_KEY, SkillRetriever, SkillTraceEvent, SkillTraceStore
+from .modules.skills import SKILL_CONTEXT_KEY, SKILL_CONTEXT_TEXT_KEY, SkillRetriever, SkillTraceEvent, SkillTraceStore
 from .modules.scheduling import (
     NoOpResourceScheduler,
     ResourceAllocation,
@@ -368,7 +368,7 @@ class HookManager(ExecutionHook):
         self._record_skill_trace(
             ctx,
             "skill_retrieved",
-            {"skills": ctx.state.get(SKILL_CONTEXT_TEXT_KEY, "")},
+            {"skills": [{"skill_id":item.get("skill_id"),"version":item.get("version"),"source_type":(item.get("skill") or {}).get("source_type")} for item in ctx.state.get(SKILL_CONTEXT_KEY, [])]},
         )
 
     def _record_skill_trace(

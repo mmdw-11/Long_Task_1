@@ -274,8 +274,13 @@ class ApplicationRecord:
     entry_agent_id: str = ""
     model: str = ""
     system_prompt: str = ""
+    avatar_url: str = ""
     tool_ids: List[str] = field(default_factory=list)
     skill_ids: List[str] = field(default_factory=list)
+    knowledge_base_ids: List[str] = field(default_factory=list)
+    memory_bank_ids: List[str] = field(default_factory=list)
+    prompt_variables: List[Dict[str, Any]] = field(default_factory=list)
+    owner_user_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: _utc_now())
     updated_at: str = field(default_factory=lambda: _utc_now())
@@ -291,8 +296,13 @@ class ApplicationRecord:
             "entry_agent_id": self.entry_agent_id,
             "model": self.model,
             "system_prompt": self.system_prompt,
+            "avatar_url": self.avatar_url,
             "tool_ids": list(self.tool_ids),
             "skill_ids": list(self.skill_ids),
+            "knowledge_base_ids": list(self.knowledge_base_ids),
+            "memory_bank_ids": list(self.memory_bank_ids),
+            "prompt_variables": [dict(item) for item in self.prompt_variables],
+            "owner_user_id": self.owner_user_id,
             "metadata": dict(self.metadata),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -315,8 +325,13 @@ class ApplicationRecord:
             entry_agent_id=str(data.get("entry_agent_id") or ""),
             model=str(data.get("model") or ""),
             system_prompt=str(data.get("system_prompt") or ""),
+            avatar_url=str(data.get("avatar_url") or ""),
             tool_ids=[str(item) for item in data.get("tool_ids") or []],
             skill_ids=[str(item) for item in data.get("skill_ids") or []],
+            knowledge_base_ids=[str(item) for item in data.get("knowledge_base_ids") or []],
+            memory_bank_ids=[str(item) for item in data.get("memory_bank_ids") or []],
+            prompt_variables=[dict(item) for item in data.get("prompt_variables") or [] if isinstance(item, dict)],
+            owner_user_id=str(data.get("owner_user_id") or ""),
             metadata=dict(data.get("metadata") or {}),
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
@@ -338,8 +353,13 @@ class ApplicationStore:
         description: str = "",
         model: str = "",
         system_prompt: str = "",
+        avatar_url: str = "",
         tool_ids: Optional[List[str]] = None,
         skill_ids: Optional[List[str]] = None,
+        knowledge_base_ids: Optional[List[str]] = None,
+        memory_bank_ids: Optional[List[str]] = None,
+        prompt_variables: Optional[List[Dict[str, Any]]] = None,
+        owner_user_id: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ApplicationRecord:
         record = ApplicationRecord.from_dict(
@@ -349,8 +369,13 @@ class ApplicationStore:
                 "description": description,
                 "model": model,
                 "system_prompt": system_prompt,
+                "avatar_url": avatar_url,
                 "tool_ids": tool_ids or [],
                 "skill_ids": skill_ids or [],
+                "knowledge_base_ids": knowledge_base_ids or [],
+                "memory_bank_ids": memory_bank_ids or [],
+                "prompt_variables": prompt_variables or [],
+                "owner_user_id": owner_user_id,
                 "metadata": metadata or {},
             }
         )

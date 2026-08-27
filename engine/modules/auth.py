@@ -136,6 +136,11 @@ class AuthStore:
             ).fetchone()
         return self._user(row) if row else None
 
+    def first_user(self) -> Optional[AuthUser]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM users ORDER BY created_at ASC, id ASC LIMIT 1").fetchone()
+        return self._user(row) if row else None
+
     def revoke_session(self, token: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM sessions WHERE token_hash=?", (_hash_token(token),))
