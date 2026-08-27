@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from .mcp_integration import call_mcp_tool_sync
 from .product_ops import ToolCatalogStore, ToolRecord
 
 
@@ -63,6 +64,15 @@ class ToolRuntime:
                 continue
             if record.enabled:
                 records.append(record)
+        return records
+
+    def available_from_mcp(self, tools: Iterable[Dict[str, Any]] | None) -> List[ToolRecord]:
+        records: List[ToolRecord] = []
+        for item in tools or []:
+            try:
+                records.append(ToolRecord.from_dict(item))
+            except ValueError:
+                continue
         return records
 
     def select_for_task(self, tools: List[ToolRecord], text: str) -> List[ToolRecord]:
@@ -122,6 +132,12 @@ class ToolRuntime:
             elif adapter in {"mcp_http", "mcp_url", "mcp"}:
                 args = {"url": str(tool.metadata.get("mcp_url") or tool.metadata.get("url") or "")}
                 result = _call_mcp_http(tool.metadata, task_text)
+            elif adapter in {"mcp_tool", "agent_mcp_tool"}:
+                args = {
+                    "server": str(tool.metadata.get("mcp_name") or tool.metadata.get("mcp_server_id") or ""),
+                    "tool": str(tool.metadata.get("tool_name") or tool.name),
+                }
+                result = call_mcp_tool_sync(tool.metadata, task_text)
             elif adapter in {"script", "python_script"}:
                 args = {"language": str(tool.metadata.get("language") or "python")}
                 result = _run_script_tool(tool.metadata, task_text)

@@ -50,6 +50,12 @@ from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.auth import AuthStore
 from ..modules.context import ContextPolicy
 from ..modules.context.todo import TodoManager
+from ..modules.mcp_integration import (
+    MCPConfigStore,
+    MCPToolRecord,
+    list_mcp_tools,
+    test_mcp_connection,
+)
 from ..modules.product_ops import (
     ApiKeyStore,
     ApplicationRecord,
@@ -245,6 +251,26 @@ class UpdateApplicationReq(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class TestMCPReq(BaseModel):
+    endpoint: str
+    auth_type: str = "none"
+    token: str = ""
+
+
+class AddAgentMCPReq(BaseModel):
+    name: str
+    endpoint: str
+    auth_type: str = "none"
+    token: str = ""
+    enabled_tools: List[str] = Field(default_factory=list)
+    discovered_tools: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class UpdateAgentMCPReq(BaseModel):
+    enabled: Optional[bool] = None
+    enabled_tools: Optional[List[str]] = None
+
+
 class CreateApplicationRunReq(BaseModel):
     input: Dict[str, Any] = Field(default_factory=dict)
     recursion_limit: int = 50
@@ -354,6 +380,7 @@ def create_app(
     console_resource_store: Optional[ConsoleResourceStore] = None,
     api_key_store: Optional[ApiKeyStore] = None,
     api_audit_store: Optional[ApiAuditStore] = None,
+    mcp_config_store: Optional[MCPConfigStore] = None,
     auth_store: Optional[AuthStore] = None,
     auth_required: bool = False,
 ) -> "FastAPI":
@@ -387,6 +414,7 @@ def create_app(
     api_audit = api_audit_store or ApiAuditStore(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
+    mcp_configs = mcp_config_store or MCPConfigStore(os.environ.get("MCP_CONFIG_ROOT") or "runs/mcp")
     auth = auth_store or AuthStore(os.environ.get("AUTH_DB_PATH") or "runs/auth/users.sqlite3")
     skill_traces = skill_trace_store or SkillTraceStore(
         os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
@@ -397,7 +425,10 @@ def create_app(
         run_store=runs,
         trace_store=skill_traces,
     )
-    runtime_factory = node_factory or AgentRuntimeFactory(tool_catalog_store=tools)
+    runtime_factory = node_factory or AgentRuntimeFactory(
+        tool_catalog_store=tools,
+        mcp_config_store=mcp_configs,
+    )
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -788,6 +819,21 @@ def create_app(
     def list_agents() -> List[Dict[str, Any]]:
         return [a.to_dict() for a in orch.list_agents()]
 
+    @app.post("/api/mcp/test")
+    async def test_mcp(req: TestMCPReq) -> Dict[str, Any]:
+        try:
+            return await test_mcp_connection(
+                endpoint=req.endpoint,
+                auth_type=req.auth_type,
+                token=req.token,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:  # noqa: BLE001 - show remote MCP failures to UI
+            raise HTTPException(status_code=502, detail=f"MCP 连接失败：{e}")
+
     @app.get("/api/system/status")
     def get_system_status() -> Dict[str, Any]:
         snapshot = system_status.snapshot()
@@ -816,6 +862,133 @@ def create_app(
             return orch.get_agent(agent_id).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/agents/{agent_id}/mcp")
+    def list_agent_mcp(agent_id: str) -> Dict[str, Any]:
+        try:
+            orch.get_agent(agent_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"items": mcp_configs.agent_payload(agent_id)}
+
+    @app.post("/api/agents/{agent_id}/mcp")
+    async def add_agent_mcp(agent_id: str, req: AddAgentMCPReq, request: Request) -> Dict[str, Any]:
+        try:
+            orch.get_agent(agent_id)
+            tools_payload = req.discovered_tools
+            if not tools_payload:
+                discovered = await list_mcp_tools(
+                    endpoint=req.endpoint,
+                    auth_type=req.auth_type,
+                    token=req.token,
+                )
+            else:
+                discovered = [MCPToolRecord.from_dict(item) for item in tools_payload]
+            enabled_tools = req.enabled_tools or [tool.name for tool in discovered]
+            user = getattr(request.state, "user", None)
+            server = mcp_configs.create_server(
+                name=req.name,
+                endpoint=req.endpoint,
+                auth_type=req.auth_type,
+                token=req.token,
+                tools=discovered,
+                enabled_tools=enabled_tools,
+                user_id=getattr(user, "id", "") if user else "",
+            )
+            binding = mcp_configs.bind_agent(
+                agent_id=agent_id,
+                mcp_server_id=server.id,
+                enabled_tools=enabled_tools,
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"MCP 保存失败：{e}")
+        return {
+            "ok": True,
+            "item": {
+                **binding.to_dict(),
+                "server": server.to_dict(),
+                "tools": [
+                    {**tool.to_dict(), "enabled_for_agent": tool.name in set(binding.enabled_tools)}
+                    for tool in server.tools
+                ],
+            },
+        }
+
+    @app.put("/api/agents/{agent_id}/mcp/{binding_id}")
+    def update_agent_mcp(agent_id: str, binding_id: str, req: UpdateAgentMCPReq) -> Dict[str, Any]:
+        try:
+            orch.get_agent(agent_id)
+            binding = mcp_configs.get_binding(binding_id)
+            if binding.agent_id != agent_id:
+                raise KeyError(f"agent mcp binding {binding_id!r} not found")
+            if req.enabled is not None:
+                binding.enabled = req.enabled
+            if req.enabled_tools is not None:
+                binding.enabled_tools = req.enabled_tools
+            binding = mcp_configs.save_binding(binding)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "item": mcp_configs.agent_payload(agent_id)}
+
+    @app.post("/api/agents/{agent_id}/mcp/{binding_id}/sync")
+    async def sync_agent_mcp(agent_id: str, binding_id: str) -> Dict[str, Any]:
+        try:
+            orch.get_agent(agent_id)
+            binding = mcp_configs.get_binding(binding_id)
+            if binding.agent_id != agent_id:
+                raise KeyError(f"agent mcp binding {binding_id!r} not found")
+            server = mcp_configs.get_server(binding.mcp_server_id)
+            token = mcp_configs.decrypt_secret(server.auth_secret)
+            discovered = await list_mcp_tools(
+                endpoint=server.endpoint,
+                auth_type=server.auth_type,
+                token=token,
+            )
+            existing_enabled = set(binding.enabled_tools)
+            server.tools = [
+                MCPToolRecord(
+                    name=tool.name,
+                    title=tool.title,
+                    description=tool.description,
+                    input_schema=tool.input_schema,
+                    enabled=tool.name in existing_enabled or not existing_enabled,
+                )
+                for tool in discovered
+            ]
+            server.last_synced_at = _utc_now()
+            server.status = "active"
+            server = mcp_configs.save_server(server)
+            binding.enabled_tools = [tool.name for tool in server.tools if tool.enabled]
+            binding = mcp_configs.save_binding(binding)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"MCP 同步失败：{e}")
+        return {"ok": True, "item": mcp_configs.agent_payload(agent_id)}
+
+    @app.delete("/api/agents/{agent_id}/mcp/{binding_id}")
+    def delete_agent_mcp(agent_id: str, binding_id: str) -> Dict[str, Any]:
+        try:
+            orch.get_agent(agent_id)
+            binding = mcp_configs.get_binding(binding_id)
+            if binding.agent_id != agent_id:
+                raise KeyError(f"agent mcp binding {binding_id!r} not found")
+            mcp_configs.delete_server(binding.mcp_server_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"ok": True}
 
     @app.put("/api/agents/{agent_id}")
     def update_agent(agent_id: str, req: UpdateAgentReq) -> Dict[str, Any]:

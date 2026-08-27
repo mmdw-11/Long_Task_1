@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 from ..hooks import MEMORY_CONTEXT_TEXT_KEY
 from ..modules.context import CONTEXT_INJECTION_TEXT_KEY
 from ..modules.execution import ExecutorRegistry, ResilientInferenceRunner
+from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
 from ..modules.scheduling import AdaptiveResourceScheduler, ResourceRequest, ResourceScheduler, ResourceTier
 from ..modules.tool_runtime import ToolRuntime
@@ -32,11 +33,13 @@ class AgentRuntimeFactory:
         scheduler: Optional[ResourceScheduler] = None,
         registry: Optional[ExecutorRegistry] = None,
         tool_catalog_store: Optional[ToolCatalogStore] = None,
+        mcp_config_store: Optional[MCPConfigStore] = None,
         max_attempts: int = 3,
     ) -> None:
         self.scheduler = scheduler or AdaptiveResourceScheduler()
         self.registry = registry or ExecutorRegistry.default()
         self.tool_runtime = ToolRuntime(tool_catalog_store) if tool_catalog_store is not None else None
+        self.mcp_config_store = mcp_config_store
         self.max_attempts = max(1, max_attempts)
 
     def __call__(self, spec: "AgentSpec") -> Node:
@@ -128,6 +131,8 @@ class AgentRuntimeFactory:
             return []
         tool_ids = spec.config.get("tool_ids") or spec.config.get("tools") or []
         available = self.tool_runtime.available_for_agent(tool_ids)
+        if self.mcp_config_store is not None:
+            available.extend(self.tool_runtime.available_from_mcp(self.mcp_config_store.runtime_tools_for_agent(spec.id)))
         selected = self.tool_runtime.select_for_task(available, task_text)
         return [self.tool_runtime.execute(tool, task_text).to_dict() for tool in selected]
 
