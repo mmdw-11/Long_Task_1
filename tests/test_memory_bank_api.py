@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from engine.modules.product_ops import ApplicationStore, MemoryBankStore, ToolCatalogStore
+from engine.modules.skills import SkillRepository
 from engine.modules.workflows import RunStore, WorkflowStore
 from engine.server.app import create_app
 
@@ -14,6 +15,7 @@ def make_client(tmp_path, monkeypatch):
         tool_catalog_store=ToolCatalogStore(tmp_path / "tools"),
         application_store=ApplicationStore(tmp_path / "apps"),
         memory_bank_store=MemoryBankStore(tmp_path / "banks"),
+        skill_repository=SkillRepository(tmp_path / "skills"),
     ))
 
 
