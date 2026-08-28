@@ -90,6 +90,9 @@ class AgentRuntimeFactory:
                 if rewritten.success and not rewritten.metadata.get("simulated"):
                     rewritten.metadata = {**rewritten.metadata, "answer_rewrite": True, "prompt_echo_detected": True}
                     result = rewritten
+            if result.success and not result.metadata.get("simulated") and self._looks_like_prompt_echo(result.text):
+                result.text = self._safe_user_fallback(self._state_input_text(state), spec.name)
+                result.metadata = {**result.metadata, "prompt_echo_blocked": True}
             if not result.success:
                 raise RuntimeError(result.error or "agent inference failed")
             # LocalEcho 是开发环境的链路兜底，不是真实对话模型。它会回显完整的
@@ -136,6 +139,13 @@ class AgentRuntimeFactory:
     def _looks_like_prompt_echo(text: str) -> bool:
         markers = ("当前 Agent：", "Agent 描述：", "任务输入：", "上下文账本：", "Context Injection:", "Original Goal:", "Current Step Objective:")
         return sum(marker in (text or "") for marker in markers) >= 2
+
+    @staticmethod
+    def _safe_user_fallback(user_input: str, agent_name: str) -> str:
+        normalized = user_input.strip().lower().strip("!！?？。,.，")
+        if normalized in {"hi", "hello", "你好", "您好", "嗨", "哈喽"}:
+            return f"你好！我是{agent_name}，很高兴见到你。有什么可以帮你？"
+        return "抱歉，模型这次没有生成有效的自然语言回答。内部运行信息已被隐藏，请重新描述问题后再试。"
 
     def _build_prompt(self, spec: "AgentSpec", state: Dict[str, Any]) -> str:
         # 将运行时上下文拼成一个稳定输入，便于本地 fallback 和真实模型共用。
