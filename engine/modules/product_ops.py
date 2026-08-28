@@ -431,6 +431,27 @@ class ApplicationStore:
         return self.root_dir / f"{clean}.json"
 
 
+DEFAULT_MEMORY_RETRIEVAL_CONFIG: Dict[str, Any] = {"top_k":5,"similarity_threshold":0.3,"mode":"hybrid","temporal_weight":0.15,"scopes":["working","task","project","global"],"expand_project":True}
+
+
+def normalize_memory_retrieval_config(value: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config={**DEFAULT_MEMORY_RETRIEVAL_CONFIG,**dict(value or {})}
+    config["top_k"]=max(1,min(20,int(config.get("top_k") or 5)))
+    config["similarity_threshold"]=max(0.0,min(1.0,float(config.get("similarity_threshold") or 0)))
+    config["temporal_weight"]=max(0.0,min(1.0,float(config.get("temporal_weight") or 0)))
+    config["mode"]=config["mode"] if config.get("mode") in {"dense","sparse","hybrid","hybrid_temporal"} else "hybrid"
+    config["scopes"]=[scope for scope in config.get("scopes",[]) if scope in {"working","task","project","global"}] or list(DEFAULT_MEMORY_RETRIEVAL_CONFIG["scopes"])
+    config["expand_project"]=bool(config.get("expand_project",True))
+    return config
+
+
+def default_memory_rules() -> List[Dict[str, Any]]:
+    return [
+        {"id":f"rule-{uuid.uuid4().hex[:12]}","type":"fragment","name":"默认记忆片段规则","description":"提取稳定偏好、长期事实、项目决策和可复用经验","instruction":"仅提取对未来任务仍有价值的稳定信息，忽略临时请求和工具原始输出。","source_types":["user","assistant","trusted_tool"],"update_policy":"merge","retention_days":180,"target_scope":"project","enabled":True},
+        {"id":f"rule-{uuid.uuid4().hex[:12]}","type":"profile","name":"默认用户画像规则","description":"提取语言、格式偏好、专业背景、长期目标和项目角色","instruction":"提取非敏感用户画像；禁止密码、密钥、身份凭据和敏感属性。","source_types":["user"],"update_policy":"merge","retention_days":0,"target_scope":"project","enabled":True},
+    ]
+
+
 @dataclass
 class MemoryBankRecord:
     """控制台记忆库资源；不替代运行时上下文账本，只保存其可配置入口。"""
@@ -440,6 +461,7 @@ class MemoryBankRecord:
     description: str = ""
     status: str = "ready"
     metadata: Dict[str, Any] = field(default_factory=dict)
+    retrieval_config: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: _utc_now())
     updated_at: str = field(default_factory=lambda: _utc_now())
 
@@ -447,6 +469,7 @@ class MemoryBankRecord:
         return {
             "id": self.id, "name": self.name, "description": self.description,
             "status": self.status, "metadata": dict(self.metadata),
+            "retrieval_config": normalize_memory_retrieval_config(self.retrieval_config),
             "created_at": self.created_at, "updated_at": self.updated_at,
         }
 
@@ -459,6 +482,7 @@ class MemoryBankRecord:
             id=_clean_id(str(data.get("id") or "")) or f"memory-{uuid.uuid4().hex[:12]}",
             name=name, description=str(data.get("description") or ""),
             status=str(data.get("status") or "ready"), metadata=dict(data.get("metadata") or {}),
+            retrieval_config=normalize_memory_retrieval_config(data.get("retrieval_config")),
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
         )
@@ -472,7 +496,8 @@ class MemoryBankStore:
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
     def create(self, *, name: str, description: str = "", metadata: Optional[Dict[str, Any]] = None) -> MemoryBankRecord:
-        return self.save(MemoryBankRecord.from_dict({"name": name, "description": description, "metadata": metadata or {}}))
+        effective_metadata={**(metadata or {}),"rules":default_memory_rules()}
+        return self.save(MemoryBankRecord.from_dict({"name": name, "description": description, "metadata": effective_metadata}))
 
     def save(self, record: MemoryBankRecord) -> MemoryBankRecord:
         now = _utc_now()
@@ -701,6 +726,7 @@ DEFAULT_MEMORY_CONFIG: Dict[str, Any] = {
     "auto_write": True,
     "deduplicate": True,
     "sensitive_filter": True,
+    "retrieval_override_enabled": False,
 }
 
 
@@ -712,6 +738,6 @@ def normalize_memory_config(value: Optional[Dict[str, Any]] = None) -> Dict[str,
     level = config.get("wakeup_level", 1)
     aliases = {"silent":0,"standard":1,"deep":2,"recovery":3}
     config["wakeup_level"] = max(0, min(3, int(aliases.get(str(level).lower(), level))))
-    for key in ("short_term_enabled","rolling_summary_enabled","long_term_enabled","auto_write","deduplicate","sensitive_filter"):
+    for key in ("short_term_enabled","rolling_summary_enabled","long_term_enabled","auto_write","deduplicate","sensitive_filter","retrieval_override_enabled"):
         config[key] = bool(config[key])
     return config

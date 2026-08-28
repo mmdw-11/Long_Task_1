@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
 from ._types import MemoryContext, MemoryItem, MemoryScope, WakeupProfile, WakeupResult, wakeup_profile
@@ -71,7 +72,7 @@ def list_bank_memories(root_dir: str | Path, bank_id: str, *, query: str = "", s
         scopes = [scope] if scope else MemoryScope.hierarchy()
         items: List[MemoryItem] = []
         for item_scope in scopes:
-            items.extend(store.read(query, scope=item_scope, top_k=limit))
+            items.extend(item for item in store.read(query, scope=item_scope, top_k=limit) if not _expired(item))
         return sorted(_dedupe(items), key=lambda item: item.ts, reverse=True)[:limit]
     finally:
         store.close()
@@ -87,3 +88,10 @@ def _dedupe(items: Iterable[MemoryItem]) -> List[MemoryItem]:
         seen.update({item.id, key})
         result.append(item)
     return result
+
+
+def _expired(item: MemoryItem) -> bool:
+    value=item.metadata.get("expires_at")
+    if not value:return False
+    try:return datetime.fromisoformat(str(value).replace("Z","+00:00"))<=datetime.now(timezone.utc)
+    except ValueError:return False

@@ -46,6 +46,38 @@ def test_memory_crud_and_scope_stats(tmp_path, monkeypatch):
     assert client.delete(f"/api/memory-banks/{bank['id']}/memories/{created.json()['id']}").status_code == 200
 
 
+def test_memory_bank_rules_and_retrieval_config(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    bank = client.post("/api/memory-banks", json={"name":"Governed","description":"Project memory"}).json()
+    rules = client.get(f"/api/memory-banks/{bank['id']}/rules").json()
+    assert {item["type"] for item in rules} == {"fragment", "profile"}
+    created = client.post(f"/api/memory-banks/{bank['id']}/rules", json={
+        "type":"fragment", "name":"Decisions", "instruction":"Extract stable project decisions",
+    })
+    assert created.status_code == 200
+    copied = client.post(f"/api/memory-banks/{bank['id']}/rules/{created.json()['id']}/copy")
+    assert copied.status_code == 200
+    updated = client.put(f"/api/memory-banks/{bank['id']}", json={
+        "name":"Governed Memory", "description":"Project memory rules",
+        "retrieval_config":{"top_k":9,"similarity_threshold":0.45,"scopes":["project","global"]},
+    })
+    assert updated.status_code == 200
+    assert updated.json()["retrieval_config"]["top_k"] == 9
+    assert updated.json()["retrieval_config"]["scopes"] == ["project", "global"]
+
+
+def test_memory_search_and_manual_global_promotion(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    bank = client.post("/api/memory-banks", json={"name":"Search","description":"Search tests"}).json()
+    item = client.post(f"/api/memory-banks/{bank['id']}/memories", json={"content":"Use concise Chinese reports","scope":"project"}).json()
+    searched = client.post(f"/api/memory-banks/{bank['id']}/search", json={"query":"Chinese"})
+    assert searched.status_code == 200
+    assert searched.json()["items"]
+    promoted = client.post(f"/api/memory-banks/{bank['id']}/memories/{item['id']}/promote")
+    assert promoted.status_code == 200
+    assert promoted.json()["scope"] == "global"
+
+
 def test_application_run_writes_only_primary_bank(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     primary = client.post("/api/memory-banks", json={"name":"Writable"}).json()

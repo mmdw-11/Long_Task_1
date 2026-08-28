@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -68,6 +68,7 @@ from ..modules.product_ops import (
     normalize_memory_config,
     ConsoleResourceStore,
     MemoryBankStore,
+    normalize_memory_retrieval_config,
     ProjectSnapshotService,
     ProductStatusService,
     ToolCatalogStore,
@@ -315,6 +316,24 @@ class CreateMemoryBankReq(BaseModel):
     name: str
     description: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateMemoryBankReq(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    retrieval_config: Optional[Dict[str, Any]] = None
+
+
+class MemoryRuleReq(BaseModel):
+    type: str = "fragment"
+    name: str
+    description: str = ""
+    instruction: str
+    source_types: List[str] = Field(default_factory=lambda:["user"])
+    update_policy: str = "merge"
+    retention_days: int = Field(180, ge=0, le=3650)
+    target_scope: str = "project"
+    enabled: bool = True
 
 
 class CreateMemoryReq(BaseModel):
@@ -743,7 +762,8 @@ def create_app(
             if primary and primary in bound and normalize_memory_config(app_record.memory_config)["long_term_enabled"]:
                 target.set_memory(MemoryBankRuntime(memory_data_root, primary, [bank_id for bank_id in bound if bank_id != primary]))
                 memory_config=normalize_memory_config(app_record.memory_config)
-                target.set_memory_options(top_k=memory_config["memory_top_k"], wakeup_level=memory_config["wakeup_level"])
+                bank_config=normalize_memory_retrieval_config(memory_banks.get(primary).retrieval_config)
+                target.set_memory_options(top_k=memory_config["memory_top_k"] if memory_config["retrieval_override_enabled"] else bank_config["top_k"], wakeup_level=memory_config["wakeup_level"])
         return target
 
     def _validate_application_workflow(graph: Dict[str, Any], *, runnable: bool = False) -> List[str]:
@@ -945,6 +965,28 @@ def create_app(
             },
         )
 
+    def _rule_memory_candidates(app_record: ApplicationRecord, source_text: str, answer_text: str, rules: List[Dict[str,Any]]) -> tuple[List[Dict[str,str]],str]:
+        if not app_record.model or app_record.model in {"auto","device","edge","cloud"}:
+            return [],"应用未选择已测试的真实模型连接"
+        try:
+            connection=model_connections.get(app_record.model)
+            if not connection.enabled or connection.test_status!="succeeded" or not connection.to_dict()["configured"]:
+                return [],"模型连接未配置、未启用或尚未测试成功"
+            rule_text="\n".join(f"- {item['id']} | {item['name']}: {item['instruction']}" for item in rules if item.get("enabled"))
+            prompt=f"""你是长期记忆提取器。只提取对未来仍有价值且符合规则的信息，禁止密码、密钥、令牌和敏感身份属性。\n规则：\n{rule_text}\n用户消息：{source_text}\n助手回复：{answer_text}\n只返回 JSON 对象 {{\"items\":[{{\"rule_id\":\"...\",\"content\":\"...\"}}]}}；没有候选时 items 为空数组。"""
+            headers={"Content-Type":"application/json","Accept":"application/json"}
+            if connection.api_key_env and os.environ.get(connection.api_key_env):headers["Authorization"]=f"Bearer {os.environ[connection.api_key_env]}"
+            body=json.dumps({"model":connection.model_id,"messages":[{"role":"user","content":prompt}],"temperature":0,"response_format":{"type":"json_object"}}).encode("utf-8")
+            req=urllib.request.Request(f"{connection.base_url}/chat/completions",data=body,headers=headers,method="POST")
+            with urllib.request.urlopen(req,timeout=60) as response:payload=json.loads(response.read().decode("utf-8"))
+            raw=str((((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")).strip().removeprefix("```json").removesuffix("```").strip()
+            parsed=json.loads(raw);parsed=parsed.get("items",[]) if isinstance(parsed,dict) else parsed
+            if not isinstance(parsed,list):raise ValueError("模型输出不是数组")
+            allowed={str(item.get("id")) for item in rules if item.get("enabled")}
+            return [{"rule_id":str(item.get("rule_id") or ""),"content":str(item.get("content") or "").strip()} for item in parsed if isinstance(item,dict) and str(item.get("rule_id")) in allowed and str(item.get("content") or "").strip()],""
+        except Exception as exc:
+            return [],str(exc)
+
     async def _execute_run(record: RunRecord) -> None:
         started_clock = time.perf_counter()
         try:
@@ -1058,20 +1100,28 @@ def create_app(
                 actions = []
                 source_text = str(record.input.get("input") or "")
                 if memory_config["long_term_enabled"] and memory_config["auto_write"] and app_record.primary_memory_bank_id:
+                    primary_bank=memory_banks.get(app_record.primary_memory_bank_id)
+                    enabled_rules=[item for item in primary_bank.metadata.get("rules",[]) if item.get("enabled")]
+                    candidates,extract_error=_rule_memory_candidates(app_record,source_text,str(summary.get("final_output") or ""),enabled_rules)
+                    if extract_error:
+                        actions.append(memory_audit.append(app_record.id,{"action":"pending","reason":"model_extraction_failed","failure_reason":extract_error,"model_connection_id":app_record.model,"run_id":record.id,"conversation_id":conversation_id,"bank_id":app_record.primary_memory_bank_id}))
                     store = HybridTieredMemoryStore(os.path.join(memory_data_root, app_record.primary_memory_bank_id))
                     try:
                         existing = list_bank_memories(memory_data_root, app_record.primary_memory_bank_id, limit=500)
                         existing_text = {str(item.content).strip().casefold() for item in existing}
-                        for candidate in durable_memory_candidates(source_text):
+                        for extracted in candidates:
+                            candidate,rule_id=extracted["content"],extracted["rule_id"]
+                            matched_rule=next((item for item in enabled_rules if item.get("id")==rule_id),{})
+                            retention_days=int(matched_rule.get("retention_days") or 0)
                             if memory_config["sensitive_filter"] and SENSITIVE_PATTERN.search(candidate):
                                 action = {"action":"blocked","reason":"sensitive_information","candidate":candidate}
                             elif memory_config["deduplicate"] and candidate.strip().casefold() in existing_text:
                                 action = {"action":"ignored","reason":"duplicate","candidate":candidate}
                             else:
-                                item = store.append(candidate, MemoryScope.PROJECT, context=MemoryContext(project_id=app_record.id, global_id=app_record.owner_user_id or "default"), tags=["automatic"], source_run_id=record.id, source_conversation_id=conversation_id)
+                                item = store.append(candidate, MemoryScope.PROJECT, context=MemoryContext(project_id=app_record.id, global_id=app_record.owner_user_id or "default"), tags=["automatic"], source_run_id=record.id, source_conversation_id=conversation_id, rule_id=rule_id, model_connection_id=app_record.model, expires_at=(datetime.now(timezone.utc)+timedelta(days=retention_days)).isoformat() if retention_days else None)
                                 action = {"action":"added","reason":"durable_project_memory","candidate":candidate,"memory_id":item.id,"scope":"project"}
                                 existing_text.add(candidate.strip().casefold())
-                            action = memory_audit.append(app_record.id, {**action,"run_id":record.id,"conversation_id":conversation_id,"bank_id":app_record.primary_memory_bank_id})
+                            action = memory_audit.append(app_record.id, {**action,"rule_id":rule_id,"model_connection_id":app_record.model,"run_id":record.id,"conversation_id":conversation_id,"bank_id":app_record.primary_memory_bank_id})
                             actions.append(action)
                     finally:
                         store.close()
@@ -1603,6 +1653,7 @@ def create_app(
     @app.post("/api/model-connections/{connection_id}/test")
     def test_model_connection(connection_id: str) -> Dict[str, Any]:
         try:
+            test_started=time.perf_counter()
             item = model_connections.get(connection_id)
             if not item.base_url:
                 raise ValueError("模型连接缺少 base_url")
@@ -1612,8 +1663,16 @@ def create_app(
             request = urllib.request.Request(f"{item.base_url}/models", headers=headers)
             with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310 - URL is administrator configured
                 if response.status >= 400: raise ValueError(f"模型服务返回 HTTP {response.status}")
+            chat_body=json.dumps({"model":item.model_id,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"temperature":0,"max_tokens":8}).encode("utf-8")
+            chat_headers={**headers,"Content-Type":"application/json"}
+            chat_request=urllib.request.Request(f"{item.base_url}/chat/completions",data=chat_body,headers=chat_headers,method="POST")
+            with urllib.request.urlopen(chat_request,timeout=30) as response:  # noqa: S310 - administrator configured
+                payload=json.loads(response.read().decode("utf-8"))
+            answer=str((((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")).strip()
+            if not answer:raise ValueError("模型推理未返回文本")
             item.test_status = "succeeded"
-            return model_connections.save(item).to_dict()
+            saved=model_connections.save(item).to_dict()
+            return {**saved,"test_result":{"model":item.model_id,"latency_ms":round((time.perf_counter()-test_started)*1000,2),"response":answer[:120],"real_inference":True}}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         except Exception as exc:
@@ -2363,6 +2422,90 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.put("/api/memory-banks/{bank_id}")
+    def update_memory_bank(bank_id: str, req: UpdateMemoryBankReq) -> Dict[str, Any]:
+        try:
+            bank=memory_banks.get(bank_id)
+            if req.name is not None:
+                value=req.name.strip()
+                if not value or len(value)>32: raise ValueError("记忆库名称长度必须为 1–32")
+                bank.name=value
+            if req.description is not None:
+                value=req.description.strip()
+                if not value or len(value)>128: raise ValueError("记忆库描述长度必须为 1–128")
+                bank.description=value
+            if req.retrieval_config is not None: bank.retrieval_config=normalize_memory_retrieval_config(req.retrieval_config)
+            return memory_banks.save(bank).to_dict()
+        except KeyError as exc: raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc: raise HTTPException(status_code=400,detail=str(exc))
+
+    def _bank_rules(bank_id: str) -> tuple[Any,List[Dict[str,Any]]]:
+        bank=memory_banks.get(bank_id);return bank,list(bank.metadata.get("rules") or [])
+
+    @app.get("/api/memory-banks/{bank_id}/rules")
+    def list_memory_rules(bank_id: str) -> List[Dict[str,Any]]:
+        try:return _bank_rules(bank_id)[1]
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+
+    @app.post("/api/memory-banks/{bank_id}/rules")
+    def create_memory_rule(bank_id: str, req: MemoryRuleReq) -> Dict[str,Any]:
+        try:
+            bank,rules=_bank_rules(bank_id)
+            if req.type not in {"fragment","profile"}:raise ValueError("规则类型必须为 fragment 或 profile")
+            if sum(1 for item in rules if item.get("type")==req.type)>=50:raise ValueError("同类记忆规则最多 50 条")
+            item={"id":f"rule-{os.urandom(6).hex()}",**req.model_dump(),"target_scope":"project"}
+            rules.append(item);bank.metadata={**bank.metadata,"rules":rules};memory_banks.save(bank);return item
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:raise HTTPException(status_code=400,detail=str(exc))
+
+    @app.put("/api/memory-banks/{bank_id}/rules/{rule_id}")
+    def update_memory_rule(bank_id: str, rule_id: str, req: MemoryRuleReq) -> Dict[str,Any]:
+        try:
+            bank,rules=_bank_rules(bank_id);index=next((i for i,x in enumerate(rules) if x.get("id")==rule_id),-1)
+            if index<0:raise KeyError("memory rule not found")
+            rules[index]={"id":rule_id,**req.model_dump(),"target_scope":"project"};bank.metadata={**bank.metadata,"rules":rules};memory_banks.save(bank);return rules[index]
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+
+    @app.post("/api/memory-banks/{bank_id}/rules/{rule_id}/copy")
+    def copy_memory_rule(bank_id: str, rule_id: str) -> Dict[str,Any]:
+        try:
+            bank,rules=_bank_rules(bank_id);source=next(x for x in rules if x.get("id")==rule_id)
+            if sum(1 for x in rules if x.get("type")==source.get("type"))>=50:raise ValueError("同类记忆规则最多 50 条")
+            item={**source,"id":f"rule-{os.urandom(6).hex()}","name":f"{source.get('name')} 副本"};rules.append(item);bank.metadata={**bank.metadata,"rules":rules};memory_banks.save(bank);return item
+        except StopIteration:raise HTTPException(status_code=404,detail="memory rule not found")
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:raise HTTPException(status_code=400,detail=str(exc))
+
+    @app.delete("/api/memory-banks/{bank_id}/rules/{rule_id}")
+    def delete_memory_rule(bank_id: str, rule_id: str) -> Dict[str,Any]:
+        try:
+            bank,rules=_bank_rules(bank_id);filtered=[x for x in rules if x.get("id")!=rule_id]
+            if len(filtered)==len(rules):raise KeyError("memory rule not found")
+            bank.metadata={**bank.metadata,"rules":filtered};memory_banks.save(bank);return {"ok":True}
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+
+    @app.post("/api/memory-banks/{bank_id}/search")
+    async def test_memory_search(bank_id: str, request: Request) -> Dict[str,Any]:
+        try:
+            bank=memory_banks.get(bank_id);body=await request.json();query=str(body.get("query") or "").strip();config=normalize_memory_retrieval_config({**bank.retrieval_config,**dict(body.get("config") or {})})
+            items=[]
+            for scope_name in config["scopes"]:
+                items.extend(list_bank_memories(memory_data_root,bank_id,query=query,scope=MemoryScope(scope_name),limit=config["top_k"]))
+            items=sorted({item.id:item for item in items}.values(),key=lambda item:(item.importance,item.ts),reverse=True)[:config["top_k"]]
+            return {"query":query,"config":config,"items":[{**item.to_dict(),"bank_id":bank_id,"bank_role":"bank","score":item.importance} for item in items]}
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+
+    @app.get("/api/memory-banks/{bank_id}/audit")
+    def list_memory_bank_audit(bank_id: str, action: str = "", rule_id: str = "", limit: int = 200) -> List[Dict[str,Any]]:
+        try:memory_banks.get(bank_id)
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+        rows=[]
+        for app_item in applications.list():
+            rows.extend(item for item in memory_audit.list(app_item.id,limit) if item.get("bank_id")==bank_id)
+        if action:rows=[item for item in rows if item.get("action")==action]
+        if rule_id:rows=[item for item in rows if item.get("rule_id")==rule_id]
+        return sorted(rows,key=lambda item:str(item.get("timestamp") or ""),reverse=True)[:max(1,min(limit,500))]
+
     @app.get("/api/memory-banks/{bank_id}")
     def get_memory_bank(bank_id: str) -> Dict[str, Any]:
         try:
@@ -2413,6 +2556,27 @@ def create_app(
             return {"ok":True}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post("/api/memory-banks/{bank_id}/memories/{memory_id}/promote")
+    def promote_memory(bank_id: str, memory_id: str) -> Dict[str,Any]:
+        try:
+            memory_banks.get(bank_id);source=next((item for item in list_bank_memories(memory_data_root,bank_id,limit=500) if item.id==memory_id),None)
+            if source is None:raise KeyError("memory not found")
+            store=HybridTieredMemoryStore(os.path.join(memory_data_root,bank_id))
+            try:
+                promoted=store.append(source.content,MemoryScope.GLOBAL,tags=list(source.tags)+["promoted"],**{**source.metadata,"promoted_from":source.id,"source":"manual_promotion"});store.delete(source.id)
+            finally:store.close()
+            return promoted.to_dict()
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+
+    @app.post("/api/apps/{app_id}/memory-audit/{audit_id}/undo")
+    def undo_memory_audit(app_id: str, audit_id: str, request: Request) -> Dict[str,Any]:
+        app_record=_owned_application(app_id,request);event=next((item for item in memory_audit.list(app_id,500) if item.get("id")==audit_id),None)
+        if not event or event.get("action")!="added" or not event.get("memory_id"):raise HTTPException(status_code=400,detail="该审计记录不可撤销")
+        store=HybridTieredMemoryStore(os.path.join(memory_data_root,str(event.get("bank_id") or app_record.primary_memory_bank_id)))
+        try:store.delete(str(event["memory_id"]))
+        finally:store.close()
+        return memory_audit.append(app_id,{"action":"undo","reason":"manual_undo","memory_id":event["memory_id"],"undo_of":audit_id,"bank_id":event.get("bank_id")})
 
     @app.delete("/api/memory-banks/{bank_id}/memories")
     def clear_memories(bank_id: str, confirm: bool = False) -> Dict[str, Any]:
