@@ -114,6 +114,29 @@ def read_skill_zip(content: bytes) -> Dict[str, Any]:
     return {"name":name,"content":content_text,"references":{k:v for k,v in safe.items() if k!=skill_path},"sha256":hashlib.sha256(content).hexdigest()}
 
 
+def read_skill_file(content: bytes, filename: str) -> Dict[str, Any]:
+    """Read a supported Skill upload without executing any embedded content."""
+    if len(content) > MAX_SKILL_BYTES:
+        raise ValueError("Skill 文件超过 5MB 限制")
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".zip":
+        return read_skill_zip(content)
+    if suffix != ".md":
+        raise ValueError("仅支持 .zip 或 .md Skill 文件")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Skill Markdown 必须使用 UTF-8 编码") from exc
+    if not text.strip() or not any(line.startswith("# ") for line in text.splitlines()):
+        raise ValueError("Skill Markdown 必须包含一级标题")
+    return {
+        "name": _skill_name(text) or Path(filename).stem or "Imported Skill",
+        "content": text,
+        "references": {},
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
 def read_skill_git(url: str) -> Dict[str, Any]:
     validate_remote_url(url)
     with tempfile.TemporaryDirectory() as temp:

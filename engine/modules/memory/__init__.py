@@ -39,6 +39,7 @@ from .judge import MemoryLLMJudge, OpenAIMemoryJudge, build_default_memory_judge
 
 # Store implementation
 from .store import HybridTieredMemoryStore
+from .banks import MemoryBankRuntime, list_bank_memories
 
 __all__ = [
     # Types
@@ -67,4 +68,6 @@ __all__ = [
     "build_default_memory_judge",
     # Store
     "HybridTieredMemoryStore",
+    "MemoryBankRuntime",
+    "list_bank_memories",
 ]

@@ -279,6 +279,7 @@ class ApplicationRecord:
     skill_ids: List[str] = field(default_factory=list)
     knowledge_base_ids: List[str] = field(default_factory=list)
     memory_bank_ids: List[str] = field(default_factory=list)
+    primary_memory_bank_id: Optional[str] = None
     prompt_variables: List[Dict[str, Any]] = field(default_factory=list)
     owner_user_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -301,6 +302,7 @@ class ApplicationRecord:
             "skill_ids": list(self.skill_ids),
             "knowledge_base_ids": list(self.knowledge_base_ids),
             "memory_bank_ids": list(self.memory_bank_ids),
+            "primary_memory_bank_id": self.primary_memory_bank_id,
             "prompt_variables": [dict(item) for item in self.prompt_variables],
             "owner_user_id": self.owner_user_id,
             "metadata": dict(self.metadata),
@@ -330,6 +332,7 @@ class ApplicationRecord:
             skill_ids=[str(item) for item in data.get("skill_ids") or []],
             knowledge_base_ids=[str(item) for item in data.get("knowledge_base_ids") or []],
             memory_bank_ids=[str(item) for item in data.get("memory_bank_ids") or []],
+            primary_memory_bank_id=(str(data.get("primary_memory_bank_id")) if data.get("primary_memory_bank_id") else None),
             prompt_variables=[dict(item) for item in data.get("prompt_variables") or [] if isinstance(item, dict)],
             owner_user_id=str(data.get("owner_user_id") or ""),
             metadata=dict(data.get("metadata") or {}),
@@ -358,6 +361,7 @@ class ApplicationStore:
         skill_ids: Optional[List[str]] = None,
         knowledge_base_ids: Optional[List[str]] = None,
         memory_bank_ids: Optional[List[str]] = None,
+        primary_memory_bank_id: Optional[str] = None,
         prompt_variables: Optional[List[Dict[str, Any]]] = None,
         owner_user_id: str = "",
         metadata: Optional[Dict[str, Any]] = None,
@@ -374,6 +378,7 @@ class ApplicationStore:
                 "skill_ids": skill_ids or [],
                 "knowledge_base_ids": knowledge_base_ids or [],
                 "memory_bank_ids": memory_bank_ids or [],
+                "primary_memory_bank_id": primary_memory_bank_id or ((memory_bank_ids or [None])[0]),
                 "prompt_variables": prompt_variables or [],
                 "owner_user_id": owner_user_id,
                 "metadata": metadata or {},

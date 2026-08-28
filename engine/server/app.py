@@ -36,6 +36,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -71,7 +72,8 @@ from ..modules.product_ops import (
     ToolRecord,
 )
 from ..modules.model_connections import MODEL_PRESETS, ModelConnection, ModelConnectionStore
-from ..modules.external_imports import discover_mcp_tools, openapi_operations, parse_openapi, read_remote_document, read_skill_git, read_skill_zip, validate_remote_url
+from ..modules.external_imports import discover_mcp_tools, openapi_operations, parse_openapi, read_remote_document, read_skill_file, read_skill_git, read_skill_zip, validate_remote_url
+from ..modules.memory import HybridTieredMemoryStore, MemoryBankRuntime, MemoryContext, MemoryScope, list_bank_memories
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
@@ -256,6 +258,7 @@ class CreateApplicationReq(BaseModel):
     skill_ids: List[str] = Field(default_factory=list)
     knowledge_base_ids: List[str] = Field(default_factory=list)
     memory_bank_ids: List[str] = Field(default_factory=list)
+    primary_memory_bank_id: Optional[str] = None
     prompt_variables: List[Dict[str, Any]] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -271,6 +274,7 @@ class UpdateApplicationReq(BaseModel):
     skill_ids: Optional[List[str]] = None
     knowledge_base_ids: Optional[List[str]] = None
     memory_bank_ids: Optional[List[str]] = None
+    primary_memory_bank_id: Optional[str] = None
     prompt_variables: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -305,6 +309,14 @@ class CreateMemoryBankReq(BaseModel):
 
     name: str
     description: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateMemoryReq(BaseModel):
+    content: Any
+    scope: str = "project"
+    scope_id: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -433,6 +445,7 @@ def create_app(
     memory_banks = memory_bank_store or MemoryBankStore(
         os.environ.get("MEMORY_BANK_STORE_ROOT") or "runs/memory_banks"
     )
+    memory_data_root = os.environ.get("MEMORY_DATA_ROOT") or str(memory_banks.root_dir.parent / "memory_data")
     console_resources = console_resource_store or ConsoleResourceStore(
         os.environ.get("CONSOLE_RESOURCE_STORE_ROOT") or "runs/console_resources"
     )
@@ -707,12 +720,20 @@ def create_app(
         target.set_skill_retriever(skill_retriever)
         target.set_skill_trace_store(skill_traces)
 
-    def _orchestrator_for_run(workflow_id: Optional[str]) -> Orchestrator:
+    def _orchestrator_for_run(workflow_id: Optional[str], record: Optional[RunRecord] = None) -> Orchestrator:
         if workflow_id:
             target = Orchestrator.from_dict(workflows.get(workflow_id).graph)
         else:
             target = Orchestrator.from_dict(orch.to_dict())
         _apply_policy(target)
+        application_id = str((record.metadata if record else {}).get("application_id") or "")
+        if application_id:
+            app_record = applications.get(application_id)
+            bound = [bank_id for bank_id in app_record.memory_bank_ids if memory_banks.exists(bank_id)]
+            primary = app_record.primary_memory_bank_id or (bound[0] if bound else None)
+            if primary and primary in bound:
+                target.set_memory(MemoryBankRuntime(memory_data_root, primary, [bank_id for bank_id in bound if bank_id != primary]))
+                target.set_memory_options(top_k=int(app_record.metadata.get("memory_top_k") or 5), wakeup_level=app_record.metadata.get("memory_wakeup_level") or 1)
         return target
 
     def _validate_application_workflow(graph: Dict[str, Any], *, runnable: bool = False) -> List[str]:
@@ -823,6 +844,20 @@ def create_app(
                 raise ValueError(f"提示词变量 {name} 的类型不受支持")
             seen.add(name)
 
+    def _memory_binding(ids: List[str], primary: Optional[str]) -> tuple[List[str], Optional[str]]:
+        bound = list(dict.fromkeys(str(item) for item in ids if str(item)))
+        effective_primary = primary or (bound[0] if bound else None)
+        if effective_primary and effective_primary not in bound:
+            raise ValueError("主记忆库必须同时包含在已绑定记忆库中")
+        return bound, effective_primary
+
+    def _scope_counts(items: List[Any]) -> Dict[str, int]:
+        counts = {scope.value: 0 for scope in MemoryScope.hierarchy()}
+        for item in items:
+            key = item.scope.value
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def _initial_plan(payload: Dict[str, Any], target: Orchestrator) -> List[str]:
         explicit = payload.get("current_plan") or payload.get("plan")
         if isinstance(explicit, list) and explicit:
@@ -911,7 +946,7 @@ def create_app(
                 "summary": None,
             }
             runs.save(record)
-            target = _orchestrator_for_run(record.workflow_id)
+            target = _orchestrator_for_run(record.workflow_id, record)
             _seed_todo_events(record, target)
             is_visual_workflow = any(
                 (item.get("config") or {}).get("node_kind")
@@ -921,7 +956,13 @@ def create_app(
                 node_factory=workflow_runtime_factory if is_visual_workflow else runtime_factory,
                 recursion_limit=record.recursion_limit,
             )
-            run_input = {**record.input, "run_id": record.id}
+            run_input = {
+                **record.input,
+                "run_id": record.id,
+                "task_id": record.id,
+                "project_id": str(record.metadata.get("application_id") or record.workflow_id or "default-project"),
+                "global_id": str(record.metadata.get("owner_user_id") or "default"),
+            }
             async for event in compiled.astream(
                 run_input,
                 record.recursion_limit,
@@ -1001,6 +1042,11 @@ def create_app(
                 "summary": _build_run_summary(record),
             }
             runs.save(record)
+        finally:
+            target_or_none = locals().get("target")
+            memory_or_none = getattr(target_or_none, "_memory", None)
+            if memory_or_none is not None:
+                memory_or_none.close()
 
     # ------------------------- Agent 管理 ------------------------- #
     @app.post("/api/agents")
@@ -1541,6 +1587,7 @@ def create_app(
         try:
             _validate_skill_selection(req.skill_ids, request)
             _validate_variable_definitions(req.prompt_variables)
+            memory_ids, primary_memory_id = _memory_binding(req.memory_bank_ids, req.primary_memory_bank_id)
             if req.app_type not in {"agent", "workflow"}:
                 raise ValueError("app_type must be 'agent' or 'workflow'")
             if req.model not in {"", "auto", "device", "edge", "cloud"}:
@@ -1557,7 +1604,8 @@ def create_app(
                 tool_ids=req.tool_ids,
                 skill_ids=req.skill_ids,
                 knowledge_base_ids=req.knowledge_base_ids,
-                memory_bank_ids=req.memory_bank_ids,
+                memory_bank_ids=memory_ids,
+                primary_memory_bank_id=primary_memory_id,
                 prompt_variables=req.prompt_variables,
                 owner_user_id=_request_user_id(request),
                 metadata=req.metadata,
@@ -1581,7 +1629,8 @@ def create_app(
                         "tool_ids": req.tool_ids,
                         "skill_ids": req.skill_ids,
                         "knowledge_base_ids": req.knowledge_base_ids,
-                        "memory_bank_ids": req.memory_bank_ids,
+                        "memory_bank_ids": memory_ids,
+                        "primary_memory_bank_id": primary_memory_id,
                         "prompt_variables": req.prompt_variables,
                     },
                 )
@@ -1629,6 +1678,12 @@ def create_app(
                 _validate_skill_selection(req.skill_ids, request)
             if req.prompt_variables is not None:
                 _validate_variable_definitions(req.prompt_variables)
+            requested_memory_ids = req.memory_bank_ids if req.memory_bank_ids is not None else current.memory_bank_ids
+            primary_was_supplied = "primary_memory_bank_id" in req.model_fields_set
+            requested_primary = req.primary_memory_bank_id if primary_was_supplied else current.primary_memory_bank_id
+            if req.memory_bank_ids is not None and requested_primary not in requested_memory_ids:
+                requested_primary = requested_memory_ids[0] if requested_memory_ids else None
+            memory_ids, primary_memory_id = _memory_binding(requested_memory_ids, requested_primary)
             if req.model is not None and req.model not in {"", "auto", "device", "edge", "cloud"}:
                 selected_model = model_connections.get(req.model)
                 if not selected_model.enabled or selected_model.test_status != "succeeded" or not selected_model.to_dict()["configured"]:
@@ -1645,7 +1700,8 @@ def create_app(
                     "tool_ids": req.tool_ids if req.tool_ids is not None else current.tool_ids,
                     "skill_ids": req.skill_ids if req.skill_ids is not None else current.skill_ids,
                     "knowledge_base_ids": req.knowledge_base_ids if req.knowledge_base_ids is not None else current.knowledge_base_ids,
-                    "memory_bank_ids": req.memory_bank_ids if req.memory_bank_ids is not None else current.memory_bank_ids,
+                    "memory_bank_ids": memory_ids,
+                    "primary_memory_bank_id": primary_memory_id,
                     "prompt_variables": req.prompt_variables if req.prompt_variables is not None else current.prompt_variables,
                     "metadata": req.metadata if req.metadata is not None else current.metadata,
                 }
@@ -1665,6 +1721,7 @@ def create_app(
                             "skill_ids": updated.skill_ids,
                             "knowledge_base_ids": updated.knowledge_base_ids,
                             "memory_bank_ids": updated.memory_bank_ids,
+                            "primary_memory_bank_id": updated.primary_memory_bank_id,
                             "prompt_variables": updated.prompt_variables,
                         },
                     )
@@ -1913,6 +1970,23 @@ def create_app(
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @app.post("/api/skills/import/file")
+    async def import_skill_file(filename: str, request: Request) -> Dict[str, Any]:
+        try:
+            package = read_skill_file(await request.body(), filename)
+            source_type = "zip" if filename.lower().endswith(".zip") else "manual"
+            record = skills.create(
+                name=package["name"], content=package["content"],
+                description=request.headers.get("x-skill-description", "从文件导入"),
+                status=SkillStatus.PUBLISHED, tags=["imported", "file"],
+                metadata={"source":"file","filename":filename,"sha256":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},
+                owner_user_id=_request_user_id(request), visibility="private",
+                source_type=source_type, validation_status="passed", package_sha256=package["sha256"],
+            )
+            return record.to_dict()
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.get("/api/skills")
     def list_skills(request: Request, status: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
@@ -2157,7 +2231,12 @@ def create_app(
     # ------------------------- 记忆库目录 ------------------------- #
     @app.get("/api/memory-banks")
     def list_memory_banks() -> List[Dict[str, Any]]:
-        return [item.to_dict() for item in memory_banks.list()]
+        result = []
+        for bank in memory_banks.list():
+            items = list_bank_memories(memory_data_root, bank.id, limit=500)
+            bindings = [app_item for app_item in applications.list() if bank.id in app_item.memory_bank_ids]
+            result.append({**bank.to_dict(), "memory_count":len(items), "scope_counts":_scope_counts(items), "binding_count":len(bindings)})
+        return result
 
     @app.post("/api/memory-banks")
     def create_memory_bank(req: CreateMemoryBankReq) -> Dict[str, Any]:
@@ -2166,9 +2245,76 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.get("/api/memory-banks/{bank_id}")
+    def get_memory_bank(bank_id: str) -> Dict[str, Any]:
+        try:
+            bank = memory_banks.get(bank_id)
+            items = list_bank_memories(memory_data_root, bank_id, limit=500)
+            bindings = [{"id":item.id,"name":item.name,"primary":item.primary_memory_bank_id==bank_id} for item in applications.list() if bank_id in item.memory_bank_ids]
+            return {**bank.to_dict(),"memory_count":len(items),"scope_counts":_scope_counts(items),"bindings":bindings}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/api/memory-banks/{bank_id}/memories")
+    def list_memories(bank_id: str, query: str = "", scope: Optional[str] = None, offset: int = 0, limit: int = 100) -> Dict[str, Any]:
+        try:
+            memory_banks.get(bank_id)
+            effective_scope = MemoryScope(scope) if scope else None
+            items = list_bank_memories(memory_data_root, bank_id, query=query, scope=effective_scope, limit=500)
+            bounded_limit = max(1, min(limit, 200))
+            return {"items":[item.to_dict() for item in items[max(0,offset):max(0,offset)+bounded_limit]],"total":len(items)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/memory-banks/{bank_id}/memories")
+    def create_memory(bank_id: str, req: CreateMemoryReq) -> Dict[str, Any]:
+        try:
+            memory_banks.get(bank_id)
+            scope = MemoryScope(req.scope)
+            context = MemoryContext(**{f"{scope.value}_id": req.scope_id}) if req.scope_id else None
+            store = HybridTieredMemoryStore(os.path.join(memory_data_root, bank_id))
+            try:
+                item = store.append(req.content, scope, context=context, tags=req.tags, **{**req.metadata,"source":"manual","memory_bank_id":bank_id})
+                return item.to_dict()
+            finally:
+                store.close()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/memory-banks/{bank_id}/memories/{memory_id}")
+    def delete_memory(bank_id: str, memory_id: str) -> Dict[str, Any]:
+        try:
+            memory_banks.get(bank_id)
+            store = HybridTieredMemoryStore(os.path.join(memory_data_root, bank_id))
+            try: store.delete(memory_id)
+            finally: store.close()
+            return {"ok":True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.delete("/api/memory-banks/{bank_id}/memories")
+    def clear_memories(bank_id: str, confirm: bool = False) -> Dict[str, Any]:
+        if not confirm:
+            raise HTTPException(status_code=400, detail="清空记忆库必须显式传入 confirm=true")
+        try:
+            memory_banks.get(bank_id)
+            store = HybridTieredMemoryStore(os.path.join(memory_data_root, bank_id))
+            try: store.clear()
+            finally: store.close()
+            return {"ok":True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
     @app.delete("/api/memory-banks/{bank_id}")
     def delete_memory_bank(bank_id: str) -> Dict[str, Any]:
         try:
+            bindings = [{"id":item.id,"name":item.name} for item in applications.list() if bank_id in item.memory_bank_ids]
+            if bindings:
+                raise HTTPException(status_code=409, detail={"message":"记忆库仍被应用绑定","applications":bindings})
             memory_banks.delete(bank_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -2384,7 +2530,10 @@ def _load_context_policy(context_policy_path: Optional[str]) -> Optional[Context
     path = context_policy_path or os.environ.get("CONTEXT_POLICY_PATH")
     if not path:
         return None
-    return ContextPolicy.from_file(path)
+    resolved = Path(path)
+    if not resolved.is_absolute() and not resolved.exists():
+        resolved = Path(__file__).resolve().parents[2] / resolved
+    return ContextPolicy.from_file(resolved)
 
 
 # 便于 `uvicorn engine.server.app:app` 直接启动。
