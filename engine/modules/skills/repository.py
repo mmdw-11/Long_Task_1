@@ -39,6 +39,11 @@ class SkillRepository:
         metadata: Optional[Dict[str, Any]] = None,
         source_run_ids: Optional[List[str]] = None,
         skill_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+        visibility: str = "private",
+        source_type: str = "manual",
+        validation_status: str = "pending",
+        package_sha256: str = "",
     ) -> SkillRecord:
         record = SkillRecord.from_dict(
             {
@@ -50,19 +55,25 @@ class SkillRepository:
                 "tags": tags or [],
                 "metadata": metadata or {},
                 "source_run_ids": source_run_ids or [],
+                "owner_user_id": owner_user_id,
+                "visibility": visibility,
+                "source_type": source_type,
+                "validation_status": validation_status,
+                "package_sha256": package_sha256,
             }
         )
         return self.save(record)
 
-    def save(self, record: SkillRecord | Skill) -> SkillRecord:
+    def save(self, record: SkillRecord | Skill, *, versioned: bool = True) -> SkillRecord:
         if isinstance(record, Skill):
             record = self._from_legacy_skill(record)
         now = _utc_now()
         existing = self.get(record.id) if record.id and self.exists(record.id) else None
         if existing is not None:
-            self._archive_version(existing)
+            if versioned:
+                self._archive_version(existing)
             record.created_at = existing.created_at
-            record.version = existing.version + 1
+            record.version = existing.version + 1 if versioned else existing.version
         else:
             record.created_at = record.created_at or now
             record.version = max(1, record.version)

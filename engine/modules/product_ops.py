@@ -274,8 +274,15 @@ class ApplicationRecord:
     entry_agent_id: str = ""
     model: str = ""
     system_prompt: str = ""
+    avatar_url: str = ""
     tool_ids: List[str] = field(default_factory=list)
     skill_ids: List[str] = field(default_factory=list)
+    knowledge_base_ids: List[str] = field(default_factory=list)
+    memory_bank_ids: List[str] = field(default_factory=list)
+    primary_memory_bank_id: Optional[str] = None
+    memory_config: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_MEMORY_CONFIG))
+    prompt_variables: List[Dict[str, Any]] = field(default_factory=list)
+    owner_user_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: _utc_now())
     updated_at: str = field(default_factory=lambda: _utc_now())
@@ -291,8 +298,15 @@ class ApplicationRecord:
             "entry_agent_id": self.entry_agent_id,
             "model": self.model,
             "system_prompt": self.system_prompt,
+            "avatar_url": self.avatar_url,
             "tool_ids": list(self.tool_ids),
             "skill_ids": list(self.skill_ids),
+            "knowledge_base_ids": list(self.knowledge_base_ids),
+            "memory_bank_ids": list(self.memory_bank_ids),
+            "primary_memory_bank_id": self.primary_memory_bank_id,
+            "memory_config": normalize_memory_config(self.memory_config),
+            "prompt_variables": [dict(item) for item in self.prompt_variables],
+            "owner_user_id": self.owner_user_id,
             "metadata": dict(self.metadata),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -315,8 +329,15 @@ class ApplicationRecord:
             entry_agent_id=str(data.get("entry_agent_id") or ""),
             model=str(data.get("model") or ""),
             system_prompt=str(data.get("system_prompt") or ""),
+            avatar_url=str(data.get("avatar_url") or ""),
             tool_ids=[str(item) for item in data.get("tool_ids") or []],
             skill_ids=[str(item) for item in data.get("skill_ids") or []],
+            knowledge_base_ids=[str(item) for item in data.get("knowledge_base_ids") or []],
+            memory_bank_ids=[str(item) for item in data.get("memory_bank_ids") or []],
+            primary_memory_bank_id=(str(data.get("primary_memory_bank_id")) if data.get("primary_memory_bank_id") else None),
+            memory_config=normalize_memory_config(data.get("memory_config")),
+            prompt_variables=[dict(item) for item in data.get("prompt_variables") or [] if isinstance(item, dict)],
+            owner_user_id=str(data.get("owner_user_id") or ""),
             metadata=dict(data.get("metadata") or {}),
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
@@ -338,8 +359,15 @@ class ApplicationStore:
         description: str = "",
         model: str = "",
         system_prompt: str = "",
+        avatar_url: str = "",
         tool_ids: Optional[List[str]] = None,
         skill_ids: Optional[List[str]] = None,
+        knowledge_base_ids: Optional[List[str]] = None,
+        memory_bank_ids: Optional[List[str]] = None,
+        primary_memory_bank_id: Optional[str] = None,
+        memory_config: Optional[Dict[str, Any]] = None,
+        prompt_variables: Optional[List[Dict[str, Any]]] = None,
+        owner_user_id: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ApplicationRecord:
         record = ApplicationRecord.from_dict(
@@ -349,8 +377,15 @@ class ApplicationStore:
                 "description": description,
                 "model": model,
                 "system_prompt": system_prompt,
+                "avatar_url": avatar_url,
                 "tool_ids": tool_ids or [],
                 "skill_ids": skill_ids or [],
+                "knowledge_base_ids": knowledge_base_ids or [],
+                "memory_bank_ids": memory_bank_ids or [],
+                "primary_memory_bank_id": primary_memory_bank_id or ((memory_bank_ids or [None])[0]),
+                "memory_config": normalize_memory_config(memory_config),
+                "prompt_variables": prompt_variables or [],
+                "owner_user_id": owner_user_id,
                 "metadata": metadata or {},
             }
         )
@@ -655,3 +690,28 @@ def _utc_now() -> str:
 
 def _clean_id(raw: str) -> str:
     return "".join(ch for ch in raw.strip() if ch.isalnum() or ch in {"-", "_"})
+DEFAULT_MEMORY_CONFIG: Dict[str, Any] = {
+    "short_term_enabled": True,
+    "context_rounds": 8,
+    "context_token_budget": 0,
+    "rolling_summary_enabled": True,
+    "long_term_enabled": True,
+    "memory_top_k": 5,
+    "wakeup_level": 1,
+    "auto_write": True,
+    "deduplicate": True,
+    "sensitive_filter": True,
+}
+
+
+def normalize_memory_config(value: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = {**DEFAULT_MEMORY_CONFIG, **dict(value or {})}
+    config["context_rounds"] = max(0, min(30, int(config["context_rounds"])))
+    config["context_token_budget"] = max(0, int(config["context_token_budget"]))
+    config["memory_top_k"] = max(1, min(20, int(config["memory_top_k"])))
+    level = config.get("wakeup_level", 1)
+    aliases = {"silent":0,"standard":1,"deep":2,"recovery":3}
+    config["wakeup_level"] = max(0, min(3, int(aliases.get(str(level).lower(), level))))
+    for key in ("short_term_enabled","rolling_summary_enabled","long_term_enabled","auto_write","deduplicate","sensitive_filter"):
+        config[key] = bool(config[key])
+    return config

@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from ..hooks import MEMORY_CONTEXT_TEXT_KEY
 from ..modules.context import CONTEXT_INJECTION_TEXT_KEY
-from ..modules.execution import ExecutorRegistry, ResilientInferenceRunner
+from ..modules.execution import ExecutorRegistry, InferenceResult, ResilientInferenceRunner
+from ..modules.model_connections import ModelConnectionStore
 from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
 from ..modules.scheduling import AdaptiveResourceScheduler, ResourceRequest, ResourceScheduler, ResourceTier
@@ -33,12 +36,14 @@ class AgentRuntimeFactory:
         scheduler: Optional[ResourceScheduler] = None,
         registry: Optional[ExecutorRegistry] = None,
         tool_catalog_store: Optional[ToolCatalogStore] = None,
+        model_connection_store: Optional[ModelConnectionStore] = None,
         mcp_config_store: Optional[MCPConfigStore] = None,
         max_attempts: int = 3,
     ) -> None:
         self.scheduler = scheduler or AdaptiveResourceScheduler()
         self.registry = registry or ExecutorRegistry.default()
         self.tool_runtime = ToolRuntime(tool_catalog_store) if tool_catalog_store is not None else None
+        self.model_connections = model_connection_store
         self.mcp_config_store = mcp_config_store
         self.max_attempts = max(1, max_attempts)
 
@@ -65,14 +70,20 @@ class AgentRuntimeFactory:
                 },
                 state=state,
             )
-            result = runner.run(
+            system_prompt = self._render_variables(spec.sys_prompt, state)
+            result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else runner.run(
                 resource_request=request,
                 prompt=prompt,
-                system_prompt=spec.sys_prompt,
+                system_prompt=system_prompt,
                 metadata={"agent_id": spec.id, "agent_name": spec.name},
             )
             if not result.success:
                 raise RuntimeError(result.error or "agent inference failed")
+            # LocalEcho 是开发环境的链路兜底，不是真实对话模型。它会回显完整的
+            # 运行 Prompt（其中包含上下文账本、TODO 等内部信息），这些内容只能用于
+            # 调试，不能作为面向用户的回答返回。
+            if result.metadata.get("simulated"):
+                result.text = self._fallback_user_response(state, tool_calls)
             return {
                 "input": result.text,
                 spec.name: result.text,
@@ -118,6 +129,9 @@ class AgentRuntimeFactory:
         context_injection = state.get(CONTEXT_INJECTION_TEXT_KEY)
         skill_context = state.get(SKILL_CONTEXT_TEXT_KEY)
         memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
+        conversation_context = state.get("__conversation_context_text__")
+        if conversation_context:
+            sections.append(f"短期会话上下文：\n{conversation_context}")
         if context_injection:
             sections.append(f"上下文账本：\n{context_injection}")
         if skill_context:
@@ -142,6 +156,31 @@ class AgentRuntimeFactory:
             return value
         return json.dumps(value, ensure_ascii=False, default=str)
 
+    def _fallback_user_response(
+        self,
+        state: Dict[str, Any],
+        tool_calls: list[Dict[str, Any]],
+    ) -> str:
+        """为无真实模型的开发环境生成安全、简洁的用户可见结果。"""
+        completed = [item for item in tool_calls if item.get("status") == "succeeded"]
+        if completed:
+            lines = []
+            for item in completed:
+                name = item.get("display_name") or item.get("name") or "工具"
+                value = item.get("result")
+                rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+                lines.append(f"{name}：{rendered}")
+            return "已完成工具调用，结果如下：\n" + "\n".join(lines)
+
+        waiting = [item for item in tool_calls if item.get("status") == "approval_required"]
+        if waiting:
+            names = "、".join(str(item.get("display_name") or item.get("name") or "工具") for item in waiting)
+            return f"{names}需要你的批准，批准后才能继续执行。"
+
+        user_input = self._state_input_text(state).strip()
+        subject = f"“{user_input[:80]}{'…' if len(user_input) > 80 else ''}”" if user_input else "你的消息"
+        return f"已收到{subject}。当前未配置可用的推理模型，暂时无法生成智能回答，请先配置端侧、边缘或云端模型后再试。"
+
     def _tier_preference(self, spec: "AgentSpec") -> list[ResourceTier]:
         raw = spec.config.get("tier_preference") or spec.config.get("resource_tier")
         if raw is None:
@@ -154,3 +193,28 @@ class AgentRuntimeFactory:
             except ValueError:
                 continue
         return tiers or [ResourceTier.DEVICE, ResourceTier.EDGE, ResourceTier.CLOUD]
+
+    def _render_variables(self, template: str, state: Dict[str, Any]) -> str:
+        values = state.get("variables") or {}
+        rendered = template
+        if isinstance(values, dict):
+            for name, value in values.items():
+                rendered = rendered.replace("${" + str(name) + "}", str(value).lower() if isinstance(value, bool) else str(value))
+        unresolved = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", rendered)
+        if unresolved:
+            raise ValueError(f"未解析的提示词变量：{', '.join(sorted(set(unresolved)))}")
+        return rendered
+
+    def _run_pinned_model(self, connection_id: str, prompt: str, system_prompt: str) -> InferenceResult:
+        if self.model_connections is None:
+            return InferenceResult(text="", executor="ModelConnectionExecutor", endpoint="", success=False, error="模型连接目录未启用")
+        try:
+            connection = self.model_connections.get(connection_id)
+            if not connection.enabled or connection.test_status != "succeeded":
+                raise ValueError("指定模型连接未启用或尚未测试成功")
+            from openai import OpenAI
+            api_key = os.environ.get(connection.api_key_env, "") if connection.api_key_env else "not-needed"
+            response = OpenAI(api_key=api_key or "not-needed", base_url=connection.base_url, timeout=60).chat.completions.create(model=connection.model_id,messages=[{"role":"system","content":system_prompt or "Answer concisely and accurately."},{"role":"user","content":prompt}],temperature=0)
+            return InferenceResult(text=response.choices[0].message.content or "",executor="ModelConnectionExecutor",endpoint=connection.base_url,model=connection.model_id,metadata={"provider":connection.provider,"connection_id":connection.id})
+        except Exception as exc:
+            return InferenceResult(text="",executor="ModelConnectionExecutor",endpoint="",success=False,error=str(exc),retryable=False)
