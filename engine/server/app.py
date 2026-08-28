@@ -72,6 +72,8 @@ from ..modules.product_ops import (
     ProjectSnapshotService,
     ProductStatusService,
     ToolCatalogStore,
+    ToolConnectionRecord,
+    ToolConnectionStore,
     ToolRecord,
 )
 from ..modules.model_connections import MODEL_PRESETS, ModelConnection, ModelConnectionStore
@@ -435,6 +437,7 @@ def create_app(
     skill_trace_store: Optional[SkillTraceStore] = None,
     node_factory: Optional[NodeFactory] = None,
     tool_catalog_store: Optional[ToolCatalogStore] = None,
+    tool_connection_store: Optional[ToolConnectionStore] = None,
     application_store: Optional[ApplicationStore] = None,
     memory_bank_store: Optional[MemoryBankStore] = None,
     console_resource_store: Optional[ConsoleResourceStore] = None,
@@ -470,6 +473,9 @@ def create_app(
     model_connections = model_connection_store or ModelConnectionStore(os.environ.get("MODEL_CONNECTION_ROOT") or "runs/model_connections")
     memory_banks = memory_bank_store or MemoryBankStore(
         os.environ.get("MEMORY_BANK_STORE_ROOT") or "runs/memory_banks"
+    )
+    tool_connections = tool_connection_store or ToolConnectionStore(
+        os.environ.get("TOOL_CONNECTION_ROOT") or str(tools.root_dir.parent / "tool_connections")
     )
     conversations = conversation_store or ConversationStore(os.environ.get("CONVERSATION_STORE_ROOT") or "runs/conversations")
     memory_audit = memory_audit_store or MemoryAuditStore(os.environ.get("MEMORY_AUDIT_ROOT") or "runs/memory_audit")
@@ -2328,14 +2334,42 @@ def create_app(
     # ------------------------- 百炼式资源市场 ------------------------- #
     # 这些条目是可安装的本地模板，不声明为已接入第三方云服务。
     mcp_market = [
-        {"slug": "local-demo", "name": "本地演示 MCP", "provider": "AgentForge", "category": "演示", "description": "零权限 JSON-RPC 演示服务，用于验证 MCP URL、工具发现与调用链。", "installs": 1, "cover": "violet", "mcp_url": "http://127.0.0.1:8000/mcp/demo"},
-        {"slug": "web-search", "name": "联网检索", "provider": "示例市场", "category": "通用办公", "description": "为 Agent 提供检索与网页摘要能力；安装后仍需配置实际 MCP URL。", "installs": 129, "cover": "mint"},
-        {"slug": "calendar", "name": "日历与会议", "provider": "示例市场", "category": "通用办公", "description": "查询可用时间、创建会议和发送日程提醒的 MCP 接入模板。", "installs": 88, "cover": "violet"},
-        {"slug": "email", "name": "邮件发送", "provider": "示例市场", "category": "通用办公", "description": "起草、确认并发送邮件。真实发送前将进入工具审批流程。", "installs": 201, "cover": "blue"},
-        {"slug": "maps", "name": "地图与路线", "provider": "示例市场", "category": "生活服务", "description": "地点搜索、路线规划和行程建议的 MCP 接入模板。", "installs": 109, "cover": "warm"},
-        {"slug": "contract", "name": "合同信息抽取", "provider": "示例市场", "category": "法律", "description": "从合同正文中抽取关键字段；可替换为企业内的 MCP 服务地址。", "installs": 66, "cover": "rose"},
-        {"slug": "knowledge", "name": "企业知识检索", "provider": "示例市场", "category": "知识库", "description": "面向企业文档的检索问答 MCP 接入模板。", "installs": 55, "cover": "cyan"},
+        {"slug":"local-demo","name":"本地演示 MCP","provider":"AgentForge","category":"开发测试","description":"零权限 JSON-RPC 演示服务，用于验证 MCP 发现、选择与调用链。","cover":"violet","mcp_url":"http://127.0.0.1:8000/mcp/demo","verified":True,"tools":[{"name":"preview_email","title":"邮件预览","description":"仅生成邮件预览，不发送真实邮件"},{"name":"lookup_demo","title":"演示检索","description":"返回本地演示检索结果"}]},
+        {"slug":"web-search","name":"联网检索 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入组织已采购的检索 MCP；安装后需要填写实际服务地址和凭据。","cover":"mint","verified":False},
+        {"slug":"calendar","name":"日历与会议 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入日历服务，用于查询空闲时间和创建会议；安装后需要配置。","cover":"violet","verified":False},
+        {"slug":"enterprise-knowledge","name":"企业知识检索 MCP 模板","provider":"项目精选目录","category":"知识库","description":"接入企业文档检索服务；安装后需要填写实际 MCP 地址。","cover":"cyan","verified":False},
     ]
+    def _tool_connection_payload(connection: ToolConnectionRecord) -> Dict[str, Any]:
+        child_tools = []
+        for tool_id in connection.tool_ids:
+            try:
+                child_tools.append(tools.get(tool_id).to_dict())
+            except KeyError:
+                continue
+        return {**connection.to_dict(), "tools": child_tools, "tool_count": len(child_tools)}
+
+    def _ensure_legacy_tool_connections() -> None:
+        """把旧版扁平外部工具按连接信息归组，保持工具 ID 不变。"""
+        known_tool_ids = {tool_id for item in tool_connections.list() for tool_id in item.tool_ids}
+        groups: Dict[str, List[ToolRecord]] = {}
+        for tool in tools.list():
+            source = str(tool.metadata.get("source") or "")
+            if source not in {"mcp", "openapi"} or tool.id in known_tool_ids:
+                continue
+            key = str(tool.metadata.get("connection_id") or tool.metadata.get("market_slug") or tool.metadata.get("mcp_url") or tool.metadata.get("operation_url") or tool.id)
+            groups.setdefault(key, []).append(tool)
+        for key, children in groups.items():
+            seed = children[0]
+            source = str(seed.metadata.get("source") or "mcp")
+            market_slug = str(seed.metadata.get("market_slug") or "")
+            connection_id = str(seed.metadata.get("connection_id") or (f"market-{market_slug}" if market_slug else f"legacy-{seed.id}"))
+            if tool_connections.exists(connection_id):
+                continue
+            connection = tool_connections.create(id=connection_id,type=source,name=str(seed.metadata.get("connection_name") or seed.display_name),source="market" if market_slug else "custom",market_slug=market_slug,endpoint=str(seed.metadata.get("mcp_url") or seed.metadata.get("operation_url") or ""),status="configuration_required" if seed.metadata.get("needs_configuration") else "installed",credential_env=str(seed.metadata.get("credential_env") or ""),tool_ids=[item.id for item in children],last_synced_at=str(seed.updated_at))
+            for child in children:
+                child.metadata={**child.metadata,"connection_id":connection.id,"connection_name":connection.name};tools.save(child)
+
+    _ensure_legacy_tool_connections()
     skill_market = [
         {"slug": "email-writer", "name": "商务邮件撰写", "category": "通用办公", "description": "根据收件人、目的和语气起草清晰、可发送的商务邮件。", "content": "# 商务邮件撰写\n\n先确认收件人、主题、目的和语气；给出结构化邮件草稿。发送前必须请求用户确认。"},
         {"slug": "research-report", "name": "研究报告", "category": "内容创意", "description": "把研究主题拆解为目标、证据、结论与待验证项，避免虚构来源。", "content": "# 研究报告\n\n先列出研究问题和证据需求，输出结论时标识事实、推断和待核验项。"},
@@ -2354,23 +2388,26 @@ def create_app(
 
     @app.get("/api/marketplace/mcp")
     def list_mcp_marketplace() -> List[Dict[str, Any]]:
-        return mcp_market
+        installed = {item.market_slug:item for item in tool_connections.list() if item.market_slug}
+        return [{**{k:v for k,v in item.items() if k != "tools"},"tool_count":len(item.get("tools") or []),"requires_configuration":not bool(item.get("mcp_url")),"availability":"ready" if item.get("verified") and item.get("mcp_url") else "configuration_required","installed":item["slug"] in installed,"connection_id":installed[item["slug"]].id if item["slug"] in installed else ""} for item in mcp_market]
 
     @app.post("/api/marketplace/mcp/{slug}/install")
     def install_mcp_template(slug: str) -> Dict[str, Any]:
         item = next((x for x in mcp_market if x["slug"] == slug), None)
         if item is None:
             raise HTTPException(status_code=404, detail="未找到 MCP 市场模板")
-        existing = next((x for x in tools.list() if x.name == f"mcp_{slug}"), None)
+        existing = next((x for x in tool_connections.list() if x.market_slug == slug), None)
         if existing is not None:
-            return {"installed": False, "tool": existing.to_dict(), "message": "该 MCP 模板已经安装"}
-        record = tools.create(
-            name=f"mcp_{slug}", display_name=item["name"], description=item["description"],
-            category="mcp", tags=["mcp", item["category"]],
-            metadata={"source": "mcp", "adapter": "mcp_http", "market_slug": slug, "risk": "read", "mcp_url": item.get("mcp_url", ""), "needs_configuration": not bool(item.get("mcp_url"))},
-        )
-        message = "本地演示 MCP 已安装，可直接在 MCP 管理中测试" if item.get("mcp_url") else "MCP 模板已安装，请在 MCP 管理中填写服务地址"
-        return {"installed": True, "tool": record.to_dict(), "message": message}
+            payload=_tool_connection_payload(existing)
+            return {"installed":False,"connection":payload,"tool":payload["tools"][0] if payload["tools"] else None,"message":"该 MCP 已安装到工作区"}
+        connection = tool_connections.create(id=f"market-{slug}",type="mcp",name=item["name"],source="market",market_slug=slug,endpoint=item.get("mcp_url", ""),status="installed" if item.get("mcp_url") else "configuration_required",metadata={"provider":item.get("provider", ""),"verified":bool(item.get("verified"))})
+        for remote in item.get("tools") or []:
+            record = tools.create(name=f"mcp_{slug}_{remote['name']}",display_name=str(remote.get("title") or remote["name"]),description=str(remote.get("description") or "MCP 工具"),category="mcp",tags=["mcp","market"],metadata={"source":"mcp","adapter":"mcp_http","connection_id":connection.id,"market_slug":slug,"mcp_url":connection.endpoint,"method":"tools/call","remote_tool_name":remote["name"],"input_schema":remote.get("inputSchema") or {"type":"object"},"risk":"read","sync_status":"synced","needs_configuration":False})
+            connection.tool_ids.append(record.id)
+        connection.last_synced_at=_utc_now() if connection.tool_ids else "";tool_connections.save(connection)
+        message = "MCP 已安装到工作区，请按需添加子工具" if connection.tool_ids else "MCP 模板已安装，请先完成服务配置"
+        payload=_tool_connection_payload(connection)
+        return {"installed":True,"connection":payload,"tool":payload["tools"][0] if payload["tools"] else None,"message":message}
 
     @app.get("/api/marketplace/skills")
     def list_skill_marketplace() -> List[Dict[str, Any]]:
@@ -2689,15 +2726,18 @@ def create_app(
             name = str(req.get("name") or "Remote MCP").strip()
             credential_env = str(req.get("credential_env") or "")
             timeout = min(30, max(1, int(req.get("timeout_seconds") or 8)))
-            connection_id = f"mcp-{int(time.time())}"
+            connection_id = f"mcp-{time.time_ns()}"
+            connection = tool_connections.create(id=connection_id,type="mcp",name=name,source="custom",endpoint=url,status="syncing",credential_env=credential_env)
             imported = []
             for remote in discover_mcp_tools(url, credential_env, timeout):
                 remote_name = str(remote["name"])
                 slug = f"mcp_{connection_id}_{remote_name}".replace("-", "_")
-                metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection_id,"mcp_url":url,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or {},"credential_env":credential_env,"risk":str(req.get("risk") or "read"),"sync_status":"synced","timeout_seconds":timeout}
-                imported.append(tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or f"{name} MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata).to_dict())
-            return {"connection_id":connection_id,"tools":imported}
-        except (ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection_id,"connection_name":name,"mcp_url":url,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or {},"credential_env":credential_env,"risk":str(req.get("risk") or "read"),"sync_status":"synced","timeout_seconds":timeout}
+                record=tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or f"{name} MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata);imported.append(record.to_dict());connection.tool_ids.append(record.id)
+            connection.status="installed";connection.last_synced_at=_utc_now();tool_connections.save(connection)
+            return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":imported}
+        except (ValueError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            if 'connection' in locals() and tool_connections.exists(connection.id): tool_connections.delete(connection.id)
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.post("/api/tool-connections/openapi")
@@ -2706,20 +2746,46 @@ def create_app(
             source_url = str(req.get("url") or "")
             content = read_remote_document(source_url) if source_url else json.dumps(req.get("document") or {}).encode("utf-8")
             document = parse_openapi(content)
-            imported = []
+            connection_id=f"openapi-{time.time_ns()}";connection=tool_connections.create(id=connection_id,type="openapi",name=str(req.get("name") or document.get("info",{}).get("title") or "OpenAPI 服务"),source="custom",endpoint=source_url,status="syncing",credential_env=str(req.get("credential_env") or ""));imported = []
             for operation in openapi_operations(document, source_url or "https://configured.invalid/openapi.json", str(req.get("credential_env") or "")):
+                operation["metadata"]={**operation["metadata"],"connection_id":connection_id,"connection_name":connection.name}
                 existing = next((item for item in tools.list() if item.name == operation["name"]), None)
-                if existing:
+                if existing and existing.metadata.get("connection_id") == connection_id:
                     existing.display_name=operation["display_name"];existing.description=operation["description"];existing.metadata={**existing.metadata,**operation["metadata"]}; imported.append(tools.save(existing).to_dict())
                 else:
                     imported.append(tools.create(name=operation["name"],display_name=operation["display_name"],description=operation["description"],category="openapi",tags=["openapi","external"],metadata=operation["metadata"]).to_dict())
-            return {"connection_id":f"openapi-{int(time.time())}","tools":imported}
-        except (ValueError, urllib.error.URLError) as exc:
+            connection.tool_ids=[item["id"] for item in imported];connection.status="installed";connection.last_synced_at=_utc_now();tool_connections.save(connection)
+            return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":imported}
+        except (ValueError, OSError, urllib.error.URLError) as exc:
+            if 'connection' in locals() and tool_connections.exists(connection.id): tool_connections.delete(connection.id)
             raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/tool-connections")
+    def list_tool_connections() -> List[Dict[str, Any]]:
+        _ensure_legacy_tool_connections()
+        return [_tool_connection_payload(item) for item in tool_connections.list()]
+
+    @app.get("/api/tool-connections/{connection_id}")
+    def get_tool_connection(connection_id: str) -> Dict[str, Any]:
+        try: return _tool_connection_payload(tool_connections.get(connection_id))
+        except KeyError as exc: raise HTTPException(status_code=404,detail=str(exc))
+
+    @app.post("/api/tool-connections/{connection_id}/test")
+    def test_tool_catalog_connection(connection_id: str) -> Dict[str, Any]:
+        try:
+            connection=tool_connections.get(connection_id)
+            if not connection.endpoint: raise ValueError("该连接尚未配置服务地址")
+            if connection.type=="mcp": count=len(discover_mcp_tools(connection.endpoint,connection.credential_env,8))
+            else: count=len(openapi_operations(parse_openapi(read_remote_document(connection.endpoint)),connection.endpoint,connection.credential_env))
+            return {"ok":True,"connection_id":connection.id,"tool_count":count,"message":f"连接成功，发现 {count} 个工具"}
+        except KeyError as exc: raise HTTPException(status_code=404,detail=str(exc))
+        except (ValueError,OSError,urllib.error.URLError,json.JSONDecodeError) as exc: raise HTTPException(status_code=400,detail=str(exc))
 
     @app.post("/api/tool-connections/{connection_id}/sync")
     def sync_tool_connection(connection_id: str) -> Dict[str, Any]:
         try:
+            connection=tool_connections.get(connection_id)
+            if connection.type != "mcp": raise ValueError("当前仅支持同步 MCP 连接")
             connected = [item for item in tools.list() if item.metadata.get("connection_id") == connection_id]
             if not connected:
                 raise KeyError(f"tool connection not found: {connection_id}")
@@ -2734,12 +2800,29 @@ def create_app(
                 if item:
                     item.display_name=str(remote.get("title") or remote_name);item.description=str(remote.get("description") or item.description);item.metadata=metadata;synced.append(tools.save(item).to_dict())
                 else:
-                    slug=f"mcp_{connection_id}_{remote_name}".replace("-","_");synced.append(tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or "MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata).to_dict())
-            return {"connection_id":connection_id,"tools":synced,"status":"synced"}
+                    slug=f"mcp_{connection_id}_{remote_name}".replace("-","_");record=tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or "MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata);synced.append(record.to_dict());connection.tool_ids.append(record.id)
+            remote_names={str(item["name"]) for item in remote_tools}
+            for stale in connected:
+                if str(stale.metadata.get("remote_tool_name")) not in remote_names:
+                    stale.enabled=False;stale.metadata={**stale.metadata,"sync_status":"missing"};tools.save(stale)
+            connection.status="installed";connection.last_synced_at=_utc_now();connection.tool_ids=list(dict.fromkeys(connection.tool_ids));tool_connections.save(connection)
+            return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":synced,"status":"synced"}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
-        except (ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        except (ValueError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/tool-connections/{connection_id}")
+    def delete_tool_connection(connection_id: str) -> Dict[str, Any]:
+        try:
+            connection=tool_connections.get(connection_id)
+            bound=[item.name for item in applications.list() if any(tool_id in item.tool_ids for tool_id in connection.tool_ids)]
+            if bound: raise HTTPException(status_code=409,detail={"message":"连接仍被智能体应用使用","applications":bound})
+            for tool_id in connection.tool_ids:
+                if tools.exists(tool_id): tools.delete(tool_id)
+            tool_connections.delete(connection_id)
+            return {"ok":True}
+        except KeyError as exc: raise HTTPException(status_code=404,detail=str(exc))
 
     @app.post("/api/tools")
     def create_tool(req: CreateToolReq) -> Dict[str, Any]:

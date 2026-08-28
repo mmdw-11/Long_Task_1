@@ -145,6 +145,96 @@ class ToolCatalogStore:
 
 
 @dataclass
+class ToolConnectionRecord:
+    """工作区级工具连接；一个连接可以包含多个 MCP/OpenAPI 子工具。"""
+
+    id: str
+    type: str
+    name: str
+    source: str = "custom"
+    market_slug: str = ""
+    endpoint: str = ""
+    status: str = "installed"
+    credential_env: str = ""
+    tool_ids: List[str] = field(default_factory=list)
+    last_synced_at: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: _utc_now())
+    updated_at: str = field(default_factory=lambda: _utc_now())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "type": self.type, "name": self.name,
+            "source": self.source, "market_slug": self.market_slug,
+            "endpoint": self.endpoint, "status": self.status,
+            "credential_env": self.credential_env, "tool_ids": list(self.tool_ids),
+            "last_synced_at": self.last_synced_at, "metadata": dict(self.metadata),
+            "created_at": self.created_at, "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ToolConnectionRecord":
+        connection_type = str(data.get("type") or "").strip().lower()
+        name = str(data.get("name") or "").strip()
+        if connection_type not in {"mcp", "openapi"}:
+            raise ValueError("tool connection type must be mcp or openapi")
+        if not name:
+            raise ValueError("tool connection name is required")
+        return cls(
+            id=_clean_id(str(data.get("id") or "")) or f"tc-{uuid.uuid4().hex[:12]}",
+            type=connection_type, name=name, source=str(data.get("source") or "custom"),
+            market_slug=str(data.get("market_slug") or ""), endpoint=str(data.get("endpoint") or ""),
+            status=str(data.get("status") or "installed"), credential_env=str(data.get("credential_env") or ""),
+            tool_ids=[str(item) for item in data.get("tool_ids") or []],
+            last_synced_at=str(data.get("last_synced_at") or ""), metadata=dict(data.get("metadata") or {}),
+            created_at=str(data.get("created_at") or _utc_now()), updated_at=str(data.get("updated_at") or _utc_now()),
+        )
+
+
+class ToolConnectionStore:
+    """文件型工具连接仓库，不保存真实凭据。"""
+
+    def __init__(self, root_dir: str | Path = "runs/tool_connections") -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self, record: ToolConnectionRecord) -> ToolConnectionRecord:
+        now = _utc_now()
+        if self.exists(record.id):
+            record.created_at = self.get(record.id).created_at
+        record.updated_at = now
+        self._path(record.id).write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return record
+
+    def create(self, **data: Any) -> ToolConnectionRecord:
+        return self.save(ToolConnectionRecord.from_dict(data))
+
+    def get(self, connection_id: str) -> ToolConnectionRecord:
+        path = self._path(connection_id)
+        if not path.exists():
+            raise KeyError(f"tool connection {connection_id!r} not found")
+        return ToolConnectionRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def list(self) -> List[ToolConnectionRecord]:
+        return sorted([self.get(path.stem) for path in self.root_dir.glob("*.json")], key=lambda item: item.updated_at, reverse=True)
+
+    def delete(self, connection_id: str) -> None:
+        path = self._path(connection_id)
+        if not path.exists():
+            raise KeyError(f"tool connection {connection_id!r} not found")
+        path.unlink()
+
+    def exists(self, connection_id: str) -> bool:
+        return self._path(connection_id).exists()
+
+    def _path(self, connection_id: str) -> Path:
+        clean = _clean_id(connection_id)
+        if not clean:
+            raise ValueError("tool connection id is required")
+        return self.root_dir / f"{clean}.json"
+
+
+@dataclass
 class ApiKeyRecord:
     """控制台 API Key 记录，只持久化哈希和前缀，不保存完整密钥。"""
 
