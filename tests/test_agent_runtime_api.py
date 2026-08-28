@@ -103,6 +103,26 @@ def test_background_run_streams_plan_todo_and_tool_events(tmp_path, monkeypatch)
     assert "Context Injection" not in record["state"]["messages"][0]["content"]
 
 
+def test_calculator_accepts_full_width_operators_and_returns_natural_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.delenv("DEVICE_BASE_URL", raising=False)
+    monkeypatch.delenv("DEVICE_MODEL", raising=False)
+    tool_store = ToolCatalogStore(tmp_path / "tools")
+    calculator = tool_store.create(
+        name="calculator", display_name="计算器", description="执行安全四则运算",
+        metadata={"adapter":"calculator", "risk":"low"},
+    )
+    app = create_app(workflow_store=WorkflowStore(tmp_path / "workflows"), run_store=RunStore(tmp_path / "runs"), tool_catalog_store=tool_store)
+    client = TestClient(app)
+    agent_id = client.post("/api/agents", json={"name":"calculator_agent", "config":{"tool_ids":[calculator.id]}}).json()["id"]
+    client.post("/api/graph/entry", json={"agent_id":agent_id})
+    created = client.post("/api/runs", json={"input":{"input":"计算3＋5=？"}}).json()
+    record = client.get(f"/api/runs/{created['id']}").json()
+    tool_event = next(event for event in record["events"] if event["type"] == "tool_result")
+    assert tool_event["tool_call"]["result"] == 8.0
+    assert record["state"]["messages"][0]["content"] == "计算结果是 8。"
+
+
 def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
     monkeypatch.delenv("DEVICE_BASE_URL", raising=False)

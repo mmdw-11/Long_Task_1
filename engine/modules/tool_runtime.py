@@ -78,7 +78,7 @@ class ToolRuntime:
     def select_for_task(self, tools: List[ToolRecord], text: str) -> List[ToolRecord]:
         if not tools:
             return []
-        normalized = text.lower()
+        normalized = _normalize_math_text(text.lower())
         scored: List[tuple[int, ToolRecord]] = []
         for tool in tools:
             blob = " ".join(
@@ -307,10 +307,15 @@ def _run_script_tool(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]
 
 
 def _extract_expression(text: str) -> str:
-    match = re.search(r"[-+*/().\d\s]{3,}", text)
+    match = re.search(r"[-+*/().\d\s]{3,}", _normalize_math_text(text))
     if not match:
         raise ValueError("no arithmetic expression found")
     return match.group(0).strip()
+
+
+def _normalize_math_text(text: str) -> str:
+    """把常见全角和中文数学符号转换为安全计算器可识别的半角形式。"""
+    return text.translate(str.maketrans({"＋":"+","－":"-","−":"-","×":"*","＊":"*","÷":"/","／":"/","（":"(","）":")","．":".","＝":"=","？":"?"}))
 
 
 _OPS = {

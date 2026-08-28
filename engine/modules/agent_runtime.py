@@ -100,6 +100,12 @@ class AgentRuntimeFactory:
             # 调试，不能作为面向用户的回答返回。
             if result.metadata.get("simulated"):
                 result.text = self._fallback_user_response(state, tool_calls)
+            calculator_call = next((item for item in tool_calls if item.get("status") == "succeeded" and item.get("name") == "calculator"), None)
+            if calculator_call is not None:
+                value = calculator_call.get("result")
+                rendered = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+                result.text = f"计算结果是 {rendered}。"
+                result.metadata = {**result.metadata, "answer_from_tool": "calculator"}
             return {
                 "input": result.text,
                 spec.name: result.text,
