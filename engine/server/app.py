@@ -1974,13 +1974,17 @@ def create_app(
     async def import_skill_file(filename: str, request: Request) -> Dict[str, Any]:
         try:
             package = read_skill_file(await request.body(), filename)
+            user_id = _request_user_id(request)
+            existing = next((item for item in skills.list() if item.package_sha256 == package["sha256"] and item.owner_user_id == user_id), None)
+            if existing is not None:
+                return existing.to_dict()
             source_type = "zip" if filename.lower().endswith(".zip") else "manual"
             record = skills.create(
                 name=package["name"], content=package["content"],
                 description=request.headers.get("x-skill-description", "从文件导入"),
                 status=SkillStatus.PUBLISHED, tags=["imported", "file"],
                 metadata={"source":"file","filename":filename,"sha256":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},
-                owner_user_id=_request_user_id(request), visibility="private",
+                owner_user_id=user_id, visibility="private",
                 source_type=source_type, validation_status="passed", package_sha256=package["sha256"],
             )
             return record.to_dict()

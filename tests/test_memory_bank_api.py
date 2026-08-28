@@ -69,5 +69,11 @@ def test_markdown_skill_file_import(tmp_path, monkeypatch):
     )
     assert response.status_code == 200
     assert response.json()["status"] == "published"
+    duplicate = client.post(
+        "/api/skills/import/file?filename=meeting-copy.md",
+        content="# Meeting Notes\n\nSummarize decisions and owners.",
+        headers={"Content-Type":"text/markdown"},
+    )
+    assert duplicate.json()["id"] == response.json()["id"]
     invalid = client.post("/api/skills/import/file?filename=bad.txt", content="hello")
     assert invalid.status_code == 400
