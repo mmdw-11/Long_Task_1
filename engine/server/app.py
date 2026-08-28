@@ -52,6 +52,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.auth import AuthStore
+from ..modules.conversations import ConversationStore, MemoryAuditStore, SENSITIVE_PATTERN, build_conversation_context, durable_memory_candidates
 from ..modules.context import ContextPolicy
 from ..modules.context.todo import TodoManager
 from ..modules.mcp_integration import (
@@ -64,6 +65,7 @@ from ..modules.product_ops import (
     ApiKeyStore,
     ApplicationRecord,
     ApplicationStore,
+    normalize_memory_config,
     ConsoleResourceStore,
     MemoryBankStore,
     ProjectSnapshotService,
@@ -259,6 +261,7 @@ class CreateApplicationReq(BaseModel):
     knowledge_base_ids: List[str] = Field(default_factory=list)
     memory_bank_ids: List[str] = Field(default_factory=list)
     primary_memory_bank_id: Optional[str] = None
+    memory_config: Dict[str, Any] = Field(default_factory=dict)
     prompt_variables: List[Dict[str, Any]] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -275,6 +278,7 @@ class UpdateApplicationReq(BaseModel):
     knowledge_base_ids: Optional[List[str]] = None
     memory_bank_ids: Optional[List[str]] = None
     primary_memory_bank_id: Optional[str] = None
+    memory_config: Optional[Dict[str, Any]] = None
     prompt_variables: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -302,6 +306,7 @@ class UpdateAgentMCPReq(BaseModel):
 class CreateApplicationRunReq(BaseModel):
     input: Dict[str, Any] = Field(default_factory=dict)
     recursion_limit: int = 50
+    conversation_id: Optional[str] = None
 
 
 class CreateMemoryBankReq(BaseModel):
@@ -420,6 +425,8 @@ def create_app(
     auth_store: Optional[AuthStore] = None,
     auth_required: bool = False,
     model_connection_store: Optional[ModelConnectionStore] = None,
+    conversation_store: Optional[ConversationStore] = None,
+    memory_audit_store: Optional[MemoryAuditStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -445,6 +452,8 @@ def create_app(
     memory_banks = memory_bank_store or MemoryBankStore(
         os.environ.get("MEMORY_BANK_STORE_ROOT") or "runs/memory_banks"
     )
+    conversations = conversation_store or ConversationStore(os.environ.get("CONVERSATION_STORE_ROOT") or "runs/conversations")
+    memory_audit = memory_audit_store or MemoryAuditStore(os.environ.get("MEMORY_AUDIT_ROOT") or "runs/memory_audit")
     memory_data_root = os.environ.get("MEMORY_DATA_ROOT") or str(memory_banks.root_dir.parent / "memory_data")
     console_resources = console_resource_store or ConsoleResourceStore(
         os.environ.get("CONSOLE_RESOURCE_STORE_ROOT") or "runs/console_resources"
@@ -731,9 +740,10 @@ def create_app(
             app_record = applications.get(application_id)
             bound = [bank_id for bank_id in app_record.memory_bank_ids if memory_banks.exists(bank_id)]
             primary = app_record.primary_memory_bank_id or (bound[0] if bound else None)
-            if primary and primary in bound:
+            if primary and primary in bound and normalize_memory_config(app_record.memory_config)["long_term_enabled"]:
                 target.set_memory(MemoryBankRuntime(memory_data_root, primary, [bank_id for bank_id in bound if bank_id != primary]))
-                target.set_memory_options(top_k=int(app_record.metadata.get("memory_top_k") or 5), wakeup_level=app_record.metadata.get("memory_wakeup_level") or 1)
+                memory_config=normalize_memory_config(app_record.memory_config)
+                target.set_memory_options(top_k=memory_config["memory_top_k"], wakeup_level=memory_config["wakeup_level"])
         return target
 
     def _validate_application_workflow(graph: Dict[str, Any], *, runnable: bool = False) -> List[str]:
@@ -1030,6 +1040,42 @@ def create_app(
                 "summary": _build_run_summary(record),
                 "skills_used": used_skills,
             }
+            summary = record.metadata["summary"]
+            conversation_id = record.metadata.get("conversation_id")
+            if conversation_id:
+                try:
+                    conversation = conversations.get(str(conversation_id))
+                    final_output = str(summary.get("final_output") or "")
+                    if final_output:
+                        conversation.messages.append({"role":"assistant","content":final_output,"created_at":_utc_now(),"run_id":record.id})
+                        conversations.save(conversation)
+                except KeyError:
+                    pass
+            app_id = str(record.metadata.get("application_id") or "")
+            app_record = applications.get(app_id) if app_id else None
+            if app_record:
+                memory_config = normalize_memory_config(app_record.memory_config)
+                actions = []
+                source_text = str(record.input.get("input") or "")
+                if memory_config["long_term_enabled"] and memory_config["auto_write"] and app_record.primary_memory_bank_id:
+                    store = HybridTieredMemoryStore(os.path.join(memory_data_root, app_record.primary_memory_bank_id))
+                    try:
+                        existing = list_bank_memories(memory_data_root, app_record.primary_memory_bank_id, limit=500)
+                        existing_text = {str(item.content).strip().casefold() for item in existing}
+                        for candidate in durable_memory_candidates(source_text):
+                            if memory_config["sensitive_filter"] and SENSITIVE_PATTERN.search(candidate):
+                                action = {"action":"blocked","reason":"sensitive_information","candidate":candidate}
+                            elif memory_config["deduplicate"] and candidate.strip().casefold() in existing_text:
+                                action = {"action":"ignored","reason":"duplicate","candidate":candidate}
+                            else:
+                                item = store.append(candidate, MemoryScope.PROJECT, context=MemoryContext(project_id=app_record.id, global_id=app_record.owner_user_id or "default"), tags=["automatic"], source_run_id=record.id, source_conversation_id=conversation_id)
+                                action = {"action":"added","reason":"durable_project_memory","candidate":candidate,"memory_id":item.id,"scope":"project"}
+                                existing_text.add(candidate.strip().casefold())
+                            action = memory_audit.append(app_record.id, {**action,"run_id":record.id,"conversation_id":conversation_id,"bank_id":app_record.primary_memory_bank_id})
+                            actions.append(action)
+                    finally:
+                        store.close()
+                record.metadata["memory_actions"] = actions
             runs.save(record)
         except Exception as e:  # noqa: BLE001 - API persists failures for polling
             record.status = "failed"
@@ -1606,6 +1652,7 @@ def create_app(
                 knowledge_base_ids=req.knowledge_base_ids,
                 memory_bank_ids=memory_ids,
                 primary_memory_bank_id=primary_memory_id,
+                memory_config=normalize_memory_config(req.memory_config),
                 prompt_variables=req.prompt_variables,
                 owner_user_id=_request_user_id(request),
                 metadata=req.metadata,
@@ -1631,6 +1678,7 @@ def create_app(
                         "knowledge_base_ids": req.knowledge_base_ids,
                         "memory_bank_ids": memory_ids,
                         "primary_memory_bank_id": primary_memory_id,
+                        "memory_config": normalize_memory_config(req.memory_config),
                         "prompt_variables": req.prompt_variables,
                     },
                 )
@@ -1702,6 +1750,7 @@ def create_app(
                     "knowledge_base_ids": req.knowledge_base_ids if req.knowledge_base_ids is not None else current.knowledge_base_ids,
                     "memory_bank_ids": memory_ids,
                     "primary_memory_bank_id": primary_memory_id,
+                    "memory_config": normalize_memory_config(req.memory_config if req.memory_config is not None else current.memory_config),
                     "prompt_variables": req.prompt_variables if req.prompt_variables is not None else current.prompt_variables,
                     "metadata": req.metadata if req.metadata is not None else current.metadata,
                 }
@@ -1722,6 +1771,7 @@ def create_app(
                             "knowledge_base_ids": updated.knowledge_base_ids,
                             "memory_bank_ids": updated.memory_bank_ids,
                             "primary_memory_bank_id": updated.primary_memory_bank_id,
+                            "memory_config": updated.memory_config,
                             "prompt_variables": updated.prompt_variables,
                         },
                     )
@@ -1775,12 +1825,25 @@ def create_app(
                 if errors:
                     raise HTTPException(status_code=400, detail="；".join(errors))
             input_payload = dict(req.input or {})
+            memory_config = normalize_memory_config(app_record.memory_config)
+            conversation = None
+            if memory_config["short_term_enabled"]:
+                conversation = conversations.get(req.conversation_id) if req.conversation_id else conversations.create(app_record.id, app_record.owner_user_id)
+                if conversation.application_id != app_record.id or conversation.owner_user_id not in {"", app_record.owner_user_id}:
+                    raise HTTPException(status_code=404, detail="会话不存在")
             try:
                 input_payload["variables"] = _validated_variables(app_record.prompt_variables, input_payload.get("variables"))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             if "input" not in input_payload:
                 input_payload["input"] = f"请运行应用：{app_record.name}"
+            current_text = str(input_payload.get("input") or "")
+            context_usage = build_conversation_context(conversation, memory_config, current_text) if conversation else {"text":"","messages":[],"summary":"","rounds":0,"estimated_tokens":0,"compressed":False}
+            input_payload["__conversation_context_text__"] = context_usage.pop("text")
+            if conversation:
+                conversation.messages.append({"role":"user","content":current_text,"created_at":_utc_now()})
+                conversation.rolling_summary = context_usage.get("summary") or conversation.rolling_summary
+                conversations.save(conversation)
             record = runs.create(
                 input=input_payload,
                 recursion_limit=req.recursion_limit,
@@ -1789,12 +1852,63 @@ def create_app(
             record.metadata["application_id"] = app_record.id
             record.metadata["application_name"] = app_record.name
             record.metadata["owner_user_id"] = app_record.owner_user_id
+            record.metadata["conversation_id"] = conversation.id if conversation else None
+            record.metadata["context_usage"] = context_usage
             record.status = "queued"
             runs.save(record)
             background_tasks.add_task(_execute_run, record)
             return record.to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/api/apps/{app_id}/conversations")
+    def create_conversation(app_id: str, request: Request) -> Dict[str, Any]:
+        app_record = _owned_application(app_id, request)
+        return conversations.create(app_record.id, app_record.owner_user_id).to_dict()
+
+    @app.get("/api/apps/{app_id}/conversations")
+    def list_conversations(app_id: str, request: Request) -> List[Dict[str, Any]]:
+        app_record = _owned_application(app_id, request)
+        return [item.to_dict() for item in conversations.list(app_record.id, app_record.owner_user_id)]
+
+    @app.get("/api/apps/{app_id}/conversations/{conversation_id}")
+    def get_conversation(app_id: str, conversation_id: str, request: Request) -> Dict[str, Any]:
+        app_record = _owned_application(app_id, request)
+        try:
+            item = conversations.get(conversation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        if item.application_id != app_record.id or item.owner_user_id not in {"", app_record.owner_user_id}:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return item.to_dict()
+
+    @app.delete("/api/apps/{app_id}/conversations/{conversation_id}")
+    def clear_conversation(app_id: str, conversation_id: str, request: Request) -> Dict[str, Any]:
+        get_conversation(app_id, conversation_id, request)
+        return conversations.clear(conversation_id).to_dict()
+
+    @app.post("/api/apps/{app_id}/memory-preview")
+    async def preview_application_memory(app_id: str, request: Request) -> Dict[str, Any]:
+        app_record = _owned_application(app_id, request)
+        body = await request.json()
+        query = str(body.get("query") or "")
+        conversation = None
+        if body.get("conversation_id"):
+            conversation = conversations.get(str(body["conversation_id"]))
+            if conversation.application_id != app_record.id:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        context = build_conversation_context(conversation, normalize_memory_config(app_record.memory_config), query) if conversation else {"text":"","messages":[],"summary":"","rounds":0,"estimated_tokens":0,"compressed":False}
+        recalled = []
+        top_k = normalize_memory_config(app_record.memory_config)["memory_top_k"]
+        for bank_id in app_record.memory_bank_ids:
+            for item in list_bank_memories(memory_data_root, bank_id, query=query, limit=top_k):
+                recalled.append({**item.to_dict(),"bank_id":bank_id,"bank_role":"primary" if bank_id==app_record.primary_memory_bank_id else "reference"})
+        return {"query":query,"context":context,"memory_banks":[{"id":bank_id,"role":"primary" if bank_id==app_record.primary_memory_bank_id else "reference"} for bank_id in app_record.memory_bank_ids],"recalled_memories":recalled[:top_k]}
+
+    @app.get("/api/apps/{app_id}/memory-audit")
+    def list_application_memory_audit(app_id: str, request: Request, limit: int = 100) -> List[Dict[str, Any]]:
+        _owned_application(app_id, request)
+        return memory_audit.list(app_id, limit)
 
     @app.get("/api/apps/{app_id}/runs")
     def list_application_runs(app_id: str, request: Request) -> List[Dict[str, Any]]:

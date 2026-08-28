@@ -129,6 +129,9 @@ class AgentRuntimeFactory:
         context_injection = state.get(CONTEXT_INJECTION_TEXT_KEY)
         skill_context = state.get(SKILL_CONTEXT_TEXT_KEY)
         memory_context = state.get(MEMORY_CONTEXT_TEXT_KEY)
+        conversation_context = state.get("__conversation_context_text__")
+        if conversation_context:
+            sections.append(f"短期会话上下文：\n{conversation_context}")
         if context_injection:
             sections.append(f"上下文账本：\n{context_injection}")
         if skill_context:
