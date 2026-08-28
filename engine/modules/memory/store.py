@@ -107,6 +107,11 @@ class HybridTieredMemoryStore(MemoryStore):
         ]
         self.memory_search_top_k = memory_search_top_k
         self.memory_search_min_similarity = memory_search_min_similarity
+        # Per-store observability used by controlled experiments and production
+        # diagnostics. Keys follow MemoryUpdateAction names in uppercase.
+        self.memory_update_action_counts = {
+            action.value.upper(): 0 for action in MemoryUpdateAction
+        }
         # Persistent SQLite connection (WAL mode for better concurrency)
         self._sqlite_conn = sqlite3.connect(
             str(self.sqlite_path), check_same_thread=False,
@@ -127,6 +132,7 @@ class HybridTieredMemoryStore(MemoryStore):
             updated = self._check_and_update_memory(item, context=context)
             if updated:
                 return
+        self.memory_update_action_counts[MemoryUpdateAction.ADD.value.upper()] += 1
         self._dispatch_write(item)
 
     def route(self, item: MemoryItem) -> MediaRoute:
@@ -729,17 +735,20 @@ class HybridTieredMemoryStore(MemoryStore):
             old_item = similar_map[mem_id]
 
             if action == MemoryUpdateAction.UPDATE.value:
+                self.memory_update_action_counts[MemoryUpdateAction.UPDATE.value.upper()] += 1
                 self._replace_memory(old_item, new_item, context=context)
                 return True  # Memory was updated, skip normal write
             elif action == MemoryUpdateAction.DELETE.value:
+                self.memory_update_action_counts[MemoryUpdateAction.DELETE.value.upper()] += 1
                 # New memory is redundant with existing one, discard it
                 return True  # Memory handled (discarded), skip normal write
             elif action == MemoryUpdateAction.ADD.value:
                 has_add = True
-            # NOOP: skip this decision, continue checking others
+            elif action == MemoryUpdateAction.NOOP.value:
+                self.memory_update_action_counts[MemoryUpdateAction.NOOP.value.upper()] += 1
 
         # If ADD was requested (and no UPDATE/DELETE), let normal write proceed
-        return has_add
+        return False
 
     def _find_similar_in_scope(
         self,

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Dict, List
 
 from engine import END, Orchestrator, StateGraph, add_messages
@@ -31,9 +32,15 @@ async def run_workflow_experiment(
     cfg = config or WorkflowExperimentConfig()
     rows: List[ExperimentRow] = []
     for example in examples:
+        started = time.perf_counter()
         state = await _run_one(example, cfg)
+        elapsed_ms = (time.perf_counter() - started) * 1000
         agents = [str(item.get("agent")) for item in state.get("messages") or [] if isinstance(item, dict)]
         passed = _matches_expected(example.expected_agents, agents)
+        sequence_ok = _matches_expected(example.expected_agents, agents)
+        branch_ok = example.pattern != "conditional" or agents[-1:] == example.expected_agents[-1:]
+        loop_ok = example.pattern != "loop" or agents.count("worker") == 3
+        trace_complete = len(agents) == len(example.expected_agents) and all(agents)
         rows.append(
             ExperimentRow(
                 id=example.id,
@@ -41,7 +48,15 @@ async def run_workflow_experiment(
                 score=1.0 if passed else 0.0,
                 prediction=" -> ".join(agents),
                 expected=" -> ".join(example.expected_agents),
-                metrics={"steps": len(agents), "expected_steps": len(example.expected_agents)},
+                metrics={
+                    "steps": len(agents),
+                    "expected_steps": len(example.expected_agents),
+                    "sequence_accuracy": 1 if sequence_ok else 0,
+                    "branch_accuracy": 1 if branch_ok else 0,
+                    "loop_stop_success": 1 if loop_ok else 0,
+                    "trace_complete": 1 if trace_complete else 0,
+                    "execution_ms": elapsed_ms,
+                },
                 metadata={"pattern": example.pattern, "branch": example.branch},
             )
         )

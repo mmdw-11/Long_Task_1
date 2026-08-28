@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from engine import (
+    PseudoCascadeTeacher,
     benchmark_router,
     build_route_dataset,
     default_training_texts,
@@ -19,7 +20,7 @@ def main() -> None:
     parser.add_argument("--output", default="runs/router_learning/benchmark.md")
     args = parser.parse_args()
 
-    dataset = build_route_dataset(default_training_texts())
+    dataset = build_route_dataset(default_training_texts(), teacher=PseudoCascadeTeacher())
     rows = benchmark_router(dataset)
     report = render_experiment_report(rows)
     save_experiment_report(rows, Path(args.output))
