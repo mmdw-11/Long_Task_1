@@ -28,8 +28,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from .constants import END, START
 from .checkpoint import GraphCheckpoint, GraphCheckpointStore
-from .failure import FAILURES_KEY, FailureRecord
+from .failure import (
+    FAILURES_KEY, RECOVERY_TRACE_KEY, SIDE_EFFECT_JOURNAL_KEY, FailureRecord,
+)
 from .hooks import ExecutionHook, NodeContext
+from .modules.communication import COMMUNICATION_STATE_KEY
+from .modules.reasoning import COMPLETED_SUBTASKS_KEY, PLAN_IR_KEY, PLAN_REVISIONS_KEY, PLAN_VALIDATION_KEY
 from .modules.context import (
     CONTEXT_INJECTION_KEY,
     CONTEXT_INJECTION_TEXT_KEY,
@@ -332,6 +336,7 @@ class CompiledGraph:
                     state=state.snapshot(),
                     status="running",
                     checkpoint_id=f"step_{step:04d}_before",
+                    metadata=self._checkpoint_metadata(state.snapshot()),
                 )
             step += 1
             if step > limit:
@@ -341,8 +346,18 @@ class CompiledGraph:
 
             snapshot = state.snapshot()
             self.hooks.on_step_start(step, list(frontier), snapshot)
+            runtime_keys = (
+                PLAN_IR_KEY, PLAN_VALIDATION_KEY, PLAN_REVISIONS_KEY,
+                COMPLETED_SUBTASKS_KEY,
+                RECOVERY_TRACE_KEY, SIDE_EFFECT_JOURNAL_KEY,
+                RUN_STATUS_KEY, "__pause_reason__",
+            )
+            runtime_patch = {key: snapshot[key] for key in runtime_keys if key in snapshot}
+            if runtime_patch:
+                state.update(runtime_patch)
+            for hook_event in self.hooks.drain_events():
+                yield hook_event
             if snapshot.get(RUN_STATUS_KEY):
-                state.update(snapshot)
                 break
 
             # 流控：逐节点决定 执行 / 跳过 / 延迟。
@@ -381,6 +396,18 @@ class CompiledGraph:
                         metadata=dict(self.nodes[name].metadata),
                     )
                     repair = self.hooks.on_node_error(err_ctx, error)
+                    state.update({
+                        key: value for key, value in err_ctx.state.items()
+                        if key in {
+                            RECOVERY_TRACE_KEY, SIDE_EFFECT_JOURNAL_KEY, RUN_STATUS_KEY,
+                            "__pause_reason__", "__failure_context__", "__degrade_mode__",
+                            "__resource_degradation__", "__retry_policy__",
+                            "__fallback_binding__", "__compensation_pending__",
+                            "__checkpoint_resume_request__",
+                        }
+                    })
+                    for hook_event in self.hooks.drain_events():
+                        yield hook_event
                     if repair is None:
                         raise GraphExecutionError(
                             f"节点 {name!r} 执行失败：{error}"
@@ -391,6 +418,9 @@ class CompiledGraph:
                         error_type=type(error).__name__,
                         message=str(error),
                         step=step,
+                        kind=str((err_ctx.state.get("__failure_context__") or {}).get("kind") or "agent"),
+                        severity=str((err_ctx.state.get("__failure_context__") or {}).get("severity") or "critical"),
+                        attempt=int((err_ctx.state.get("__failure_context__") or {}).get("attempt") or 1),
                     )
                     state.update({FAILURES_KEY: [rec.to_dict()]})
                     for tgt in repair:
@@ -409,6 +439,10 @@ class CompiledGraph:
                     SKILL_CONTEXT_TEXT_KEY,
                     "__context_drift__",
                     "__evaluation__",
+                    COMMUNICATION_STATE_KEY,
+                    RECOVERY_TRACE_KEY,
+                    SIDE_EFFECT_JOURNAL_KEY,
+                    COMPLETED_SUBTASKS_KEY,
                 ):
                     if key in node_snapshots.get(name, {}):
                         end_state[key] = node_snapshots[name][key]
@@ -419,6 +453,7 @@ class CompiledGraph:
                     metadata=dict(self.nodes[name].metadata),
                 )
                 self.hooks.on_node_end(end_ctx, update)
+                hook_events = self.hooks.drain_events()
                 validation_targets = self.hooks.handle_validation_failure(end_ctx, update)
                 runtime_context_update = {}
                 for key in (
@@ -429,6 +464,10 @@ class CompiledGraph:
                     SKILL_CONTEXT_TEXT_KEY,
                     "__context_drift__",
                     "__evaluation__",
+                    COMMUNICATION_STATE_KEY,
+                    RECOVERY_TRACE_KEY,
+                    SIDE_EFFECT_JOURNAL_KEY,
+                    COMPLETED_SUBTASKS_KEY,
                 ):
                     if key in end_ctx.state:
                         runtime_context_update[key] = end_ctx.state[key]
@@ -455,6 +494,8 @@ class CompiledGraph:
                 state.update(update)
                 executed_ok.append(name)
                 yield {"type": "node_end", "node": name, "update": update or {}}
+                for hook_event in hook_events:
+                    yield hook_event
 
             # 计算下一个前沿。
             next_frontier: List[str] = []
@@ -470,6 +511,8 @@ class CompiledGraph:
                     "candidates": list(base_succ),
                     "targets": list(succ_list),
                 }
+                for hook_event in self.hooks.drain_events():
+                    yield hook_event
                 for succ in succ_list:
                     if succ == END:
                         continue  # 该路径结束
@@ -493,6 +536,7 @@ class CompiledGraph:
                 state=state.snapshot(),
                 status="completed",
                 checkpoint_id="final",
+                metadata=self._checkpoint_metadata(state.snapshot()),
             )
         yield {"type": "final", "state": state.to_dict()}
 
@@ -508,7 +552,10 @@ class CompiledGraph:
         )
         allocation = self.hooks.acquire_resource(ctx)
         try:
-            update = await self.nodes[name].invoke(ctx.state)
+            await self.hooks.before_node_invoke(ctx)
+            invocation = self.nodes[name].invoke(ctx.state)
+            timeout = float(ctx.metadata.get("timeout_seconds") or 0)
+            update = await asyncio.wait_for(invocation, timeout=timeout) if timeout > 0 else await invocation
             return name, update, None
         except Exception as exc:  # noqa: BLE001 - 交由恢复策略处理
             return name, None, exc
@@ -531,6 +578,18 @@ class CompiledGraph:
                 if tgt not in successors:
                     successors.append(tgt)
         return successors
+
+    def _checkpoint_metadata(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = dict(self.hooks.checkpoint_metadata())
+        plan = state.get(PLAN_IR_KEY) or {}
+        validation = state.get(PLAN_VALIDATION_KEY) or {}
+        metadata.update({
+            "verified_plan_revision": plan.get("revision") if validation.get("passed") else None,
+            "completed_subtasks": list(state.get(COMPLETED_SUBTASKS_KEY) or []),
+            "recovery_episode_count": len(state.get(RECOVERY_TRACE_KEY) or []),
+            "side_effect_journal_size": len(state.get(SIDE_EFFECT_JOURNAL_KEY) or []),
+        })
+        return metadata
 
     @staticmethod
     def _normalize_targets(targets: List[str]) -> List[str]:

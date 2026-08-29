@@ -52,7 +52,10 @@ class ContextLedgerRenderer:
             if fact.verified != verified:
                 continue
             result.append(
-                f"{fact.text} (source={fact.source}, node={fact.node}, step={fact.step}, confidence={fact.confidence:.2f})"
+                f"{fact.text} (source={fact.source}, node={fact.node}, step={fact.step}, "
+                f"confidence={fact.confidence:.2f}, status={fact.status}"
+                f"{', fact_id=' + fact.fact_id if fact.fact_id else ''}"
+                f"{', valid=[' + str(fact.valid_from) + ',' + str(fact.valid_to) + ')' if fact.valid_from is not None else ''})"
             )
         return result
 

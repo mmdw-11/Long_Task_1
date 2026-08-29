@@ -16,7 +16,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .failure import FAILURES_KEY, FailureRecord, FailureTrace
+from .failure import (
+    FAILURES_KEY, RECOVERY_TRACE_KEY, SIDE_EFFECT_JOURNAL_KEY,
+    FailureContext, FailureRecord, FailureTrace,
+)
 from .modules.flow import FlowController, FlowDecision, NoOpFlowController
 from .modules.evaluation import Evaluator, EvaluationResult, RuleEvaluator
 from .modules.context import (
@@ -28,6 +31,7 @@ from .modules.context import (
     PAUSE_REASON_KEY,
     RUN_STATUS_KEY,
     ContextBudgetController,
+    ContextFact,
     ContextInjector,
     ContextLedgerStore,
     DriftDetector,
@@ -64,6 +68,18 @@ from .modules.scheduling import (
     ResourceRequest,
     ResourceScheduler,
 )
+from .modules.communication import (
+    CAPSULE_EVENTS_KEY,
+    COMMUNICATION_STATE_KEY,
+    CommunicationManager,
+    MessageCapsule,
+)
+from .modules.memory import TemporalEvidenceMemoryStore
+from .modules.reasoning import (
+    COMPLETED_SUBTASKS_KEY, PLAN_IR_KEY, PLAN_REVISIONS_KEY, PLAN_VALIDATION_KEY, REASONING_CONTEXT_KEY,
+    NeuroSymbolicReasoner, PlanIR,
+)
+from .modules.fault_injection import FaultInjector
 
 MEMORY_CONTEXT_KEY = "__memory_context__"
 MEMORY_CONTEXT_ITEMS_KEY = "__memory_context_items__"
@@ -128,6 +144,17 @@ class ExecutionHook:
         """对后继候选做动态调整（默认返回 None → 使用原候选）。"""
         return None
 
+    def drain_events(self) -> List[Dict[str, Any]]:
+        """Return extension events accumulated since the previous drain."""
+        return []
+
+    def checkpoint_metadata(self) -> Dict[str, Any]:
+        """Serializable runtime watermarks for graph checkpoints."""
+        return {}
+
+    async def before_node_invoke(self, ctx: NodeContext) -> None:
+        return None
+
 
 class HookManager(ExecutionHook):
     """把各扩展模块桥接到引擎扩展点。
@@ -161,6 +188,10 @@ class HookManager(ExecutionHook):
         extra_hooks: Optional[List[ExecutionHook]] = None,
         memory_top_k: int = 5,
         wakeup_level: int | str = WakeupLevel.STANDARD,
+        communication: Optional[CommunicationManager] = None,
+        temporal_memory: Optional[TemporalEvidenceMemoryStore] = None,
+        reasoner: Optional[NeuroSymbolicReasoner] = None,
+        fault_injector: Optional[FaultInjector] = None,
     ) -> None:
         self.memory = memory or NoOpMemoryStore()
         self.router = router or NoOpRouter()
@@ -183,17 +214,33 @@ class HookManager(ExecutionHook):
         self.extra_hooks: List[ExecutionHook] = list(extra_hooks or [])
         self.memory_top_k = memory_top_k
         self.wakeup_profile = wakeup_profile(wakeup_level)
+        self.communication = communication
+        self.temporal_memory = temporal_memory
+        self._pending_capsules: Dict[str, MessageCapsule] = {}
+        self._runtime_events: List[Dict[str, Any]] = []
+        self._communication_restored = False
+        self.reasoner = reasoner
+        self.fault_injector = fault_injector
+        self._reasoned_runs: set[str] = set()
+        self._recovery_episode_counter = 0
 
     # ------------------------------------------------------------------ #
     # 扩展点实现（桥接到各模块）
     # ------------------------------------------------------------------ #
     def on_step_start(self, step: int, frontier: List[str], state: Dict[str, Any]) -> None:
+        if self.communication is not None and not self._communication_restored and isinstance(state.get(COMMUNICATION_STATE_KEY), dict):
+            self.communication.restore(state[COMMUNICATION_STATE_KEY])
+            self._communication_restored = True
+        self._ensure_verified_plan(state)
         self._update_context_on_step_start(step, frontier, state)
         self._check_context_budget(state)
         for h in self.extra_hooks:
             h.on_step_start(step, frontier, state)
 
     def on_node_start(self, ctx: NodeContext) -> FlowDecision:
+        if self.communication is not None:
+            self.communication.inject(ctx.state, ctx.node)
+        self._inject_reasoning_context(ctx)
         self._inject_memory_context(ctx)
         self._inject_skill_context(ctx)
         deps = self.flow_controller.resolve_dependencies(ctx.node, self.graph_view)
@@ -201,6 +248,11 @@ class HookManager(ExecutionHook):
         decision = self.flow_controller.decide(
             ctx.node, state=ctx.state, deps_satisfied=deps_satisfied
         )
+        reasoning = ctx.state.get(REASONING_CONTEXT_KEY) or {}
+        planned_task = reasoning.get("subtask") or {}
+        completed = set(ctx.state.get(COMPLETED_SUBTASKS_KEY) or [])
+        if planned_task and any(dep not in completed for dep in planned_task.get("depends_on") or []):
+            decision = FlowDecision.DEFER
         for h in self.extra_hooks:
             h.on_node_start(ctx)
         return decision
@@ -243,6 +295,55 @@ class HookManager(ExecutionHook):
                 node=ctx.node,
                 step=ctx.step,
             )
+            if self.communication is not None:
+                capsule = self.communication.capsule_from_update(
+                    update, sender=ctx.node, recipients=None, state=ctx.state, step=ctx.step
+                )
+                self._pending_capsules[ctx.node] = capsule
+                self._runtime_events.append({"type": "capsule_created", "capsule": capsule.to_dict()})
+                ctx.state[COMMUNICATION_STATE_KEY] = self.communication.snapshot()
+                if self.temporal_memory is not None:
+                    facts = self.temporal_memory.extract_from_capsule(capsule)
+                    if facts:
+                        if self.context_ledger is not None:
+                            ledger = self.context_ledger.load_or_create(self._run_id_from_state(ctx.state), ctx.state)
+                            known = {item.fact_id for item in ledger.key_facts if item.fact_id}
+                            for fact in facts:
+                                if fact.id in known:
+                                    continue
+                                ledger.key_facts.append(ContextFact(
+                                    text=f"{fact.subject} {fact.predicate} {fact.object}",
+                                    source="temporal_evidence",
+                                    confidence=fact.confidence,
+                                    verified=evaluation.passed,
+                                    node=ctx.node,
+                                    step=ctx.step,
+                                    fact_id=fact.id,
+                                    evidence_ids=list(fact.evidence_ids),
+                                    valid_from=fact.valid_from,
+                                    valid_to=fact.valid_to,
+                                    status=fact.status.value,
+                                ))
+                            self.context_ledger.save(ledger)
+                            ctx.state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+                        self._runtime_events.append({
+                            "type": "temporal_facts_updated",
+                            "node": ctx.node,
+                            "facts": [fact.to_dict() for fact in facts],
+                        })
+        episodes = list(ctx.state.get(RECOVERY_TRACE_KEY) or [])
+        if episodes and episodes[-1].get("status") == "planned" and episodes[-1].get("failure", {}).get("node") == ctx.node:
+            episodes[-1] = {**episodes[-1], "status": "succeeded"}
+            ctx.state[RECOVERY_TRACE_KEY] = episodes
+            self._runtime_events.append({"type": "recovery_succeeded", "episode": episodes[-1]})
+        side_effect_class = str(ctx.metadata.get("idempotency") or "idempotent")
+        if side_effect_class in {"compensatable", "non_idempotent"}:
+            journal = list(ctx.state.get(SIDE_EFFECT_JOURNAL_KEY) or [])
+            journal.append({
+                "node": ctx.node, "step": ctx.step, "side_effect_class": side_effect_class,
+                "idempotency_key": ctx.metadata.get("idempotency_key"), "status": "committed",
+            })
+            ctx.state[SIDE_EFFECT_JOURNAL_KEY] = journal
         self._record_skill_trace(ctx, "node_end", {"update": update or {}})
         for h in self.extra_hooks:
             h.on_node_end(ctx, update)
@@ -268,10 +369,52 @@ class HookManager(ExecutionHook):
 
     def on_node_error(self, ctx: NodeContext, error: BaseException) -> Optional[List[str]]:
         trace = FailureTrace.from_state(ctx.state)
-        trace.record(ctx.node, error, step=ctx.step)
+        attempts = len(trace.by_node(ctx.node)) + 1
+        failure_ctx = FailureContext.from_error(
+            error, node=ctx.node, step=ctx.step, metadata=ctx.metadata, attempt=attempts
+        )
+        reasoning = ctx.state.get(REASONING_CONTEXT_KEY) or {}
+        planned_task = reasoning.get("subtask") or {}
+        if planned_task and evaluation.passed:
+            update_dict = update if isinstance(update, dict) else {}
+            missing = [
+                criterion for criterion in planned_task.get("acceptance_criteria") or []
+                if criterion not in update_dict and criterion not in str(update_dict)
+            ]
+            if missing:
+                evaluation.passed = False
+                evaluation.score = 0.0
+                evaluation.findings.extend(f"missing acceptance evidence: {item}" for item in missing)
+                evaluation.retryable = True
+            else:
+                completed = list(ctx.state.get(COMPLETED_SUBTASKS_KEY) or [])
+                task_id = str(planned_task.get("id") or "")
+                if task_id and task_id not in completed:
+                    completed.append(task_id)
+                    ctx.state[COMPLETED_SUBTASKS_KEY] = completed
+        ctx.state["__failure_context__"] = failure_ctx.to_dict()
+        rec = trace.record(
+            ctx.node, error, step=ctx.step,
+            metadata={**ctx.metadata, "failure_context": failure_ctx.to_dict()},
+        )
+        rec.kind = failure_ctx.kind.value
+        rec.severity = failure_ctx.severity.value
+        rec.attempt = attempts
         plan: RepairPlan = self.recovery_strategy.plan(
             trace, node=ctx.node, state=ctx.state
         )
+        self._recovery_episode_counter += 1
+        episode = {
+            "id": f"recovery-{self._recovery_episode_counter:04d}",
+            "failure": failure_ctx.to_dict(),
+            "action": plan.to_dict(),
+            "status": "planned",
+        }
+        ctx.state[RECOVERY_TRACE_KEY] = list(ctx.state.get(RECOVERY_TRACE_KEY) or []) + [episode]
+        self._runtime_events.extend([
+            {"type": "failure_detected", "failure": failure_ctx.to_dict()},
+            {"type": "recovery_planned", "episode": episode},
+        ])
         for h in self.extra_hooks:
             h.on_node_error(ctx, error)
         self._record_skill_trace(
@@ -283,10 +426,61 @@ class HookManager(ExecutionHook):
             ctx, error, recoverable=not plan.should_abort
         )
         if plan.should_abort:
+            self._runtime_events.append({"type": "recovery_failed", "episode_id": episode["id"], "reason": plan.reason})
             return None
         if plan.action == RecoveryAction.RETRY:
+            ctx.state["__retry_policy__"] = plan.metadata
             return [ctx.node]
+        if plan.action in {RecoveryAction.FALLBACK_MODEL, RecoveryAction.FALLBACK_TOOL}:
+            binding_key = "model" if plan.action == RecoveryAction.FALLBACK_MODEL else "tool"
+            ctx.state["__fallback_binding__"] = {
+                "type": binding_key,
+                binding_key: plan.metadata.get(f"fallback_{binding_key}"),
+                "source_node": ctx.node,
+            }
+            self._runtime_events.append({
+                "type": "fallback_selected", "fallback_type": binding_key,
+                "binding": ctx.state["__fallback_binding__"],
+            })
+            return plan.targets or [ctx.node]
+        if plan.action == RecoveryAction.FALLBACK_NODE:
+            self._runtime_events.append({"type": "fallback_selected", "fallback_type": "node", "targets": plan.targets})
+            return list(plan.targets)
+        if plan.action == RecoveryAction.COMPENSATE:
+            ctx.state["__compensation_pending__"] = {"failed_node": ctx.node, **plan.metadata}
+            return list(plan.targets)
+        if plan.action == RecoveryAction.RESUME_CHECKPOINT:
+            ctx.state["__checkpoint_resume_request__"] = plan.metadata
+            self._runtime_events.append({"type": "checkpoint_resumed", "status": "requested", "metadata": plan.metadata})
+            return list(plan.targets)
+        if plan.action == RecoveryAction.HUMAN_REVIEW:
+            ctx.state[RUN_STATUS_KEY] = "recovery_paused"
+            ctx.state[PAUSE_REASON_KEY] = plan.reason
+            return []
+        if plan.action == RecoveryAction.MIGRATE_RESOURCE:
+            ctx.state["__resource_degradation__"] = plan.metadata
+            self._runtime_events.append({"type": "fallback_selected", "fallback_type": "resource", "metadata": plan.metadata})
+            return plan.targets or [ctx.node]
+        if plan.action == RecoveryAction.DEGRADE:
+            ctx.state["__degrade_mode__"] = plan.metadata.get("degrade_contract") or {}
+            self._runtime_events.append({"type": "degrade_entered", "contract": ctx.state["__degrade_mode__"]})
+            return plan.targets or [ctx.node]
+        if plan.action == RecoveryAction.SIBLING_TAKEOVER:
+            self._runtime_events.append({"type": "takeover_assigned", "source": ctx.node, "targets": plan.targets})
+        if plan.action == RecoveryAction.REPLAN:
+            self._runtime_events.append({"type": "plan_revised", "reason": plan.reason, "targets": plan.targets, "checkpoint_id": plan.metadata.get("checkpoint_id")})
+            if not plan.targets:
+                ctx.state[RUN_STATUS_KEY] = "recovery_paused"
+                ctx.state[PAUSE_REASON_KEY] = "replan requested but no replan node configured"
         return list(plan.targets)
+
+    async def before_node_invoke(self, ctx: NodeContext) -> None:
+        if self.fault_injector is None:
+            return
+        attempt = len(FailureTrace.from_state(ctx.state).by_node(ctx.node)) + 1
+        await self.fault_injector.inject(
+            node=ctx.node, step=ctx.step, attempt=attempt, state=ctx.state
+        )
 
     def resolve_successors(
         self, node: str, candidates: List[str], state: Dict[str, Any]
@@ -306,11 +500,77 @@ class HookManager(ExecutionHook):
             },
         )
         result = decision.targets
+        if self.communication is not None and node in self._pending_capsules:
+            capsule = self._pending_capsules.pop(node)
+            roles = {
+                target: str(self._node_metadata(target).get("role") or self._node_metadata(target).get("agent_role") or "")
+                for target in result
+            }
+            deliverable = [target for target in result if target != "__end__"]
+            _, events = self.communication.route(capsule, candidates=deliverable, roles=roles)
+            # capsule_created was emitted at node end; avoid duplicating it here.
+            self._runtime_events.extend(events[1:])
+            state[COMMUNICATION_STATE_KEY] = self.communication.snapshot()
         for h in self.extra_hooks:
             overridden = h.resolve_successors(node, result, state)
             if overridden is not None:
                 result = overridden
         return result
+
+    def drain_events(self) -> List[Dict[str, Any]]:
+        events = list(self._runtime_events)
+        self._runtime_events.clear()
+        return events
+
+    def checkpoint_metadata(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        if self.communication is not None:
+            data["communication"] = self.communication.snapshot()
+        data["reasoning"] = {
+            "verified_runs": sorted(self._reasoned_runs),
+            "recovery_episode_count": self._recovery_episode_counter,
+        }
+        return data
+
+    def _ensure_verified_plan(self, state: Dict[str, Any]) -> None:
+        if self.reasoner is None:
+            return
+        run_id = self._run_id_from_state(state)
+        if run_id in self._reasoned_runs or isinstance(state.get(PLAN_IR_KEY), dict):
+            return
+        goal = str(state.get("original_goal") or state.get("goal") or state.get("task") or state.get("input") or "")
+        raw_plan = state.get("current_plan") or state.get("plan") or []
+        context = {"subtasks": raw_plan} if isinstance(raw_plan, list) and raw_plan else {}
+        outcome = self.reasoner.reason(goal, context)
+        state[PLAN_IR_KEY] = outcome.plan.to_dict()
+        state[PLAN_VALIDATION_KEY] = outcome.validation.to_dict()
+        state[PLAN_REVISIONS_KEY] = [item.to_dict() for item in outcome.revisions]
+        for capsule in outcome.feedback_capsules:
+            self._runtime_events.append({"type": "symbolic_counterexample", "capsule": capsule.to_dict()})
+        self._runtime_events.append({
+            "type": "plan_verified" if outcome.verified else "plan_rejected",
+            "outcome": outcome.to_dict(),
+        })
+        if not outcome.verified:
+            state[RUN_STATUS_KEY] = "plan_validation_paused"
+            state[PAUSE_REASON_KEY] = "symbolic plan validation failed"
+        self._reasoned_runs.add(run_id)
+
+    def _inject_reasoning_context(self, ctx: NodeContext) -> None:
+        raw = ctx.state.get(PLAN_IR_KEY)
+        if not isinstance(raw, dict):
+            return
+        plan = PlanIR.from_dict(raw)
+        task = next(
+            (item for item in plan.subtasks if item.id == ctx.node or item.description.startswith(ctx.node)),
+            None,
+        )
+        ctx.state[REASONING_CONTEXT_KEY] = {
+            "verified": bool((ctx.state.get(PLAN_VALIDATION_KEY) or {}).get("passed")),
+            "plan_revision": plan.revision,
+            "subtask": task.to_dict() if task else None,
+            "hard_constraints": [item.to_dict() for item in plan.hard_constraints],
+        }
 
     # ------------------------------------------------------------------ #
     # 供引擎构造一条失败记录的状态增量（写回 __failures__）。

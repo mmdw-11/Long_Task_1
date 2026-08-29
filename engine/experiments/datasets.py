@@ -187,7 +187,17 @@ def _memory_texts(row: Dict[str, Any]) -> List[str]:
         items = _string_list(value)
         if items:
             return items
-    sessions = row.get("haystack_sessions") or row.get("sessions") or row.get("conversation")
+    # LongMemEval-V2 stores multimodal agent histories as trajectories rather
+    # than chat sessions. The generic flattener preserves action/observation
+    # text while metadata retains the original record for official harnesses.
+    sessions = (
+        row.get("haystack_sessions")
+        or row.get("haystack_trajectories")
+        or row.get("trajectories")
+        or row.get("history_trajectories")
+        or row.get("sessions")
+        or row.get("conversation")
+    )
     items = _flatten_conversation(sessions)
     return items
 
@@ -205,7 +215,7 @@ def _flatten_conversation(value: Any) -> List[str]:
         for item in value:
             if isinstance(item, dict):
                 role = item.get("role") or item.get("speaker") or item.get("name") or ""
-                content = _first_text(item, ["content", "text", "message", "utterance", "value"])
+                content = _first_text(item, ["content", "text", "message", "utterance", "value", "observation", "action", "summary"])
                 if content:
                     parts.append(f"{role}: {content}" if role else content)
                 else:

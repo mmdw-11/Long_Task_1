@@ -1,0 +1,13 @@
+min_contribution: 0.28
+max_capsule_tokens: 512
+redundancy_threshold: 0.82
+task_relevance_weight: 0.24
+information_gain_weight: 0.22
+evidence_quality_weight: 0.18
+role_fit_weight: 0.12
+freshness_weight: 0.10
+redundancy_weight: 0.20
+budget_pressure_weight: 0.10
+broadcast_when_unresolved: true
+preserve_constraints: true
+preserve_conflicts: true

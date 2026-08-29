@@ -1,0 +1,31 @@
+{
+  "seed": 42,
+  "planning": {
+    "natural_language_plan": {
+      "parse_rate": 0.0,
+      "constraint_satisfaction": null
+    },
+    "structured_ir_only": {
+      "parse_rate": 1.0,
+      "constraint_satisfaction": 0.0
+    },
+    "ir_rule_validation": {
+      "violations_detected": 1,
+      "accepted": false
+    },
+    "ir_counterexample_repair": {
+      "accepted": true,
+      "revision_count": 1
+    },
+    "ir_z3_counterexample_repair": {
+      "skipped": true
+    }
+  },
+  "recovery": {
+    "abort_completion_rate": 0.0,
+    "policy_recovery_rate": 0.8,
+    "fault_count": 5,
+    "human_pause_count": 1
+  },
+  "elapsed_ms": 3.105499781668186
+}

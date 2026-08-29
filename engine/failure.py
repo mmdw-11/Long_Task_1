@@ -10,11 +10,41 @@
 from __future__ import annotations
 
 import time
+import enum
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 # 状态中承载失败轨迹的约定字段名。
 FAILURES_KEY = "__failures__"
+RECOVERY_TRACE_KEY = "__recovery_trace__"
+SIDE_EFFECT_JOURNAL_KEY = "__side_effect_journal__"
+
+
+class FailureKind(str, enum.Enum):
+    AGENT="agent"; TOOL="tool"; TIMEOUT="timeout"; MESSAGE_MISSING="message_missing"
+    EVIDENCE_MISSING="evidence_missing"; PLAN_CONFLICT="plan_conflict"
+    STEP_FAILED="step_failed"; RESOURCE_UNAVAILABLE="resource_unavailable"
+    ROLE_UNAVAILABLE="role_unavailable"; VALIDATION_FAILED="validation_failed"
+
+
+class FailureSeverity(str, enum.Enum):
+    TRANSIENT="transient"; DEGRADED="degraded"; CRITICAL="critical"; FATAL="fatal"
+
+
+@dataclass
+class FailureContext:
+    kind: FailureKind; node: str; message: str; step: int=0
+    severity: FailureSeverity=FailureSeverity.TRANSIENT
+    attempt: int=1; retryable: bool=True; side_effect_class: str="idempotent"
+    metadata: Dict[str,Any]=field(default_factory=dict); timestamp: float=field(default_factory=time.time)
+    def to_dict(self)->Dict[str,Any]:
+        return {"kind":self.kind.value,"node":self.node,"message":self.message,"step":self.step,"severity":self.severity.value,"attempt":self.attempt,"retryable":self.retryable,"side_effect_class":self.side_effect_class,"metadata":self.metadata,"timestamp":self.timestamp}
+    @classmethod
+    def from_error(cls,error:BaseException,*,node:str,step:int=0,metadata:Optional[Dict[str,Any]]=None,attempt:int=1)->"FailureContext":
+        md=dict(metadata or {}); text=str(error).lower()
+        declared=getattr(error,"failure_kind",None)
+        kind=FailureKind(declared) if declared else FailureKind.TIMEOUT if isinstance(error,TimeoutError) or "timeout" in text else FailureKind.RESOURCE_UNAVAILABLE if any(x in text for x in ("resource","rate limit","429")) else FailureKind.TOOL if md.get("tool") or "tool" in text else FailureKind.AGENT
+        return cls(kind,node,str(error),step,FailureSeverity.TRANSIENT if kind in {FailureKind.TIMEOUT,FailureKind.RESOURCE_UNAVAILABLE} else FailureSeverity.CRITICAL,attempt,True,str(md.get("idempotency") or "idempotent"),md)
 
 
 @dataclass
@@ -27,6 +57,9 @@ class FailureRecord:
     step: int = 0
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    kind: str = FailureKind.AGENT.value
+    severity: str = FailureSeverity.CRITICAL.value
+    attempt: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -36,6 +69,9 @@ class FailureRecord:
             "step": self.step,
             "timestamp": self.timestamp,
             "metadata": self.metadata,
+            "kind": self.kind,
+            "severity": self.severity,
+            "attempt": self.attempt,
         }
 
 
@@ -92,6 +128,9 @@ class FailureTrace:
                         step=item.get("step", 0),
                         timestamp=item.get("timestamp", time.time()),
                         metadata=item.get("metadata", {}),
+                        kind=item.get("kind", FailureKind.AGENT.value),
+                        severity=item.get("severity", FailureSeverity.CRITICAL.value),
+                        attempt=int(item.get("attempt", 1)),
                     )
                 )
         return cls(records)

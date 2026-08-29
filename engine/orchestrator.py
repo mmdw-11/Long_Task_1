@@ -43,7 +43,11 @@ from .modules.context import (
 )
 from .modules.flow import FlowController
 from .modules.memory import MemoryStore
-from .modules.recovery import RecoveryStrategy
+from .modules.memory import TemporalEvidenceMemoryStore
+from .modules.communication import CommunicationManager
+from .modules.recovery import PolicyRecoveryStrategy, RecoveryPolicy, RecoveryStrategy
+from .modules.reasoning import NeuroSymbolicReasoner
+from .modules.fault_injection import FaultInjector
 from .modules.routing import Router, RoutingPolicy
 from .modules.scheduling import ResourceScheduler
 from .node import Node, NodeType
@@ -202,6 +206,10 @@ class Orchestrator:
         self._project_rules: Dict[str, Any] = {}
         self._memory_top_k: int = 5
         self._wakeup_level: int | str = 1
+        self._communication: Optional[CommunicationManager] = None
+        self._temporal_memory: Optional[TemporalEvidenceMemoryStore] = None
+        self._reasoner: Optional[NeuroSymbolicReasoner] = None
+        self._fault_injector: Optional[FaultInjector] = None
 
     # ------------------------------------------------------------------ #
     # 注册可插拔模块（接入或替换默认策略）
@@ -209,6 +217,14 @@ class Orchestrator:
     def set_memory(self, store: MemoryStore) -> None:
         """注入记忆模块。"""
         self._memory = store
+
+    def set_temporal_memory(self, store: TemporalEvidenceMemoryStore) -> None:
+        """Register temporal evidence persistence without replacing tiered memory."""
+        self._temporal_memory = store
+
+    def set_communication_manager(self, manager: CommunicationManager) -> None:
+        """Enable structured low-entropy communication for this graph."""
+        self._communication = manager
 
     def set_memory_options(self, *, top_k: int = 5, wakeup_level: int | str = 1) -> None:
         """Configure how many memory items are injected before each node."""
@@ -232,6 +248,18 @@ class Orchestrator:
     def set_recovery_strategy(self, strategy: RecoveryStrategy) -> None:
         """注入恢复策略模块。"""
         self._recovery_strategy = strategy
+
+    def set_recovery_policy(self, policy: RecoveryPolicy) -> None:
+        """Enable bounded, side-effect-aware policy recovery."""
+        self._recovery_strategy = PolicyRecoveryStrategy(policy)
+
+    def set_neurosymbolic_reasoner(self, reasoner: NeuroSymbolicReasoner) -> None:
+        """Require a symbolically verified PlanIR before graph execution."""
+        self._reasoner = reasoner
+
+    def set_fault_injector(self, injector: FaultInjector) -> None:
+        """Install deterministic research fault injection at the node boundary."""
+        self._fault_injector = injector
 
     def set_scheduler(self, scheduler: ResourceScheduler) -> None:
         """注入端边云资源调度模块。"""
@@ -622,6 +650,14 @@ class Orchestrator:
             kwargs["skill_retriever"] = self._skill_retriever
         if self._skill_trace_store is not None:
             kwargs["skill_trace_store"] = self._skill_trace_store
+        if self._communication is not None:
+            kwargs["communication"] = self._communication
+        if self._temporal_memory is not None:
+            kwargs["temporal_memory"] = self._temporal_memory
+        if self._reasoner is not None:
+            kwargs["reasoner"] = self._reasoner
+        if self._fault_injector is not None:
+            kwargs["fault_injector"] = self._fault_injector
         return HookManager(**kwargs)
 
     @staticmethod

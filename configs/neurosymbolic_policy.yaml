@@ -1,0 +1,8 @@
+schema_version: "1.0"
+solver_backend: auto
+max_revisions: 2
+available_roles: [planner, researcher, executor, reviewer]
+hard_constraints: []
+require_verified_plan: true
+counterexample_transport: message_capsule
+

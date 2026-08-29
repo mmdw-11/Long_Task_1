@@ -39,6 +39,7 @@ from .judge import MemoryLLMJudge, OpenAIMemoryJudge, build_default_memory_judge
 
 # Store implementation
 from .store import HybridTieredMemoryStore
+from .temporal import Fact, FactSearchResult, FactStatus, TemporalEvidence, TemporalEvidenceMemoryStore, TemporalRetrievalWeights
 from .banks import MemoryBankRuntime, list_bank_memories
 
 __all__ = [
@@ -68,6 +69,8 @@ __all__ = [
     "build_default_memory_judge",
     # Store
     "HybridTieredMemoryStore",
+    "Fact", "FactSearchResult", "FactStatus", "TemporalEvidence",
+    "TemporalEvidenceMemoryStore", "TemporalRetrievalWeights",
     "MemoryBankRuntime",
     "list_bank_memories",
 ]

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 CONTEXT_LEDGER_KEY = "__context_ledger__"
@@ -26,6 +26,11 @@ class ContextFact:
     verified: bool = False
     node: str = ""
     step: int = 0
+    fact_id: str = ""
+    evidence_ids: List[str] = field(default_factory=list)
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
+    status: str = "active"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -35,6 +40,11 @@ class ContextFact:
             "verified": self.verified,
             "node": self.node,
             "step": self.step,
+            "fact_id": self.fact_id,
+            "evidence_ids": list(self.evidence_ids),
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
+            "status": self.status,
         }
 
     @classmethod
@@ -46,6 +56,11 @@ class ContextFact:
             verified=bool(data.get("verified", False)),
             node=str(data.get("node", "")),
             step=int(data.get("step", 0)),
+            fact_id=str(data.get("fact_id", "")),
+            evidence_ids=[str(item) for item in data.get("evidence_ids", [])],
+            valid_from=float(data["valid_from"]) if data.get("valid_from") is not None else None,
+            valid_to=float(data["valid_to"]) if data.get("valid_to") is not None else None,
+            status=str(data.get("status", "active")),
         )
 
 

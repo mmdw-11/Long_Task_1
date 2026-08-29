@@ -1,0 +1,5 @@
+{"fault": "timeout", "side_effect": "idempotent", "repair": {"action": "retry", "targets": ["faulty-node"], "reason": "bounded retry for transient failure", "metadata": {"attempt": 2, "backoff_seconds": 0.0}}, "recovered": true}
+{"fault": "tool", "side_effect": "idempotent", "repair": {"action": "fallback_tool", "targets": [], "reason": "primary tool failed", "metadata": {"fallback_tool": "cached_search"}}, "recovered": true}
+{"fault": "resource_unavailable", "side_effect": "idempotent", "repair": {"action": "migrate_resource", "targets": ["faulty-node"], "reason": "resource tier unavailable", "metadata": {"degradation_order": ["cloud", "edge", "device"]}}, "recovered": true}
+{"fault": "role_unavailable", "side_effect": "idempotent", "repair": {"action": "sibling_takeover", "targets": ["standby-reviewer"], "reason": "critical role unavailable", "metadata": {}}, "recovered": true}
+{"fault": "agent", "side_effect": "non_idempotent", "repair": {"action": "human_review", "targets": [], "reason": "non-idempotent side effect cannot be replayed safely", "metadata": {"pause": true, "side_effect_class": "non_idempotent"}}, "recovered": false}

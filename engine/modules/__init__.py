@@ -64,10 +64,22 @@ from .execution import (
 )
 from .recovery import (
     RecoveryAction,
+    RecoveryAttempt,
+    RecoveryEpisode,
+    RecoveryPolicy,
     RepairPlan,
     RecoveryStrategy,
     NoOpRecoveryStrategy,
+    PolicyRecoveryStrategy,
 )
+from .reasoning import (
+    ConstraintIR, ConstraintKind, ConstraintViolation, Counterexample,
+    DeterministicPlanGenerator, DeterministicPlanRepairer, LLMPlanGenerator,
+    NeuroSymbolicReasoner, PlanGenerator, PlanIR, PlanRepairer, PlanRevision,
+    ReasoningOutcome, SubtaskIR, SymbolicPlanValidator, ValidationResult,
+    ValidationStatus,
+)
+from .fault_injection import FaultInjector, FaultSpec, InjectedFault
 from .security import AuditPack, AuditPackBuilder, RedactionResult, SensitiveDataRedactor
 from .scheduling import (
     AdaptiveResourceScheduler,
@@ -162,6 +174,12 @@ __all__ = [
     "RepairPlan",
     "RecoveryStrategy",
     "NoOpRecoveryStrategy",
+    "PolicyRecoveryStrategy", "RecoveryAttempt", "RecoveryEpisode", "RecoveryPolicy",
+    "ConstraintIR", "ConstraintKind", "ConstraintViolation", "Counterexample",
+    "DeterministicPlanGenerator", "DeterministicPlanRepairer", "LLMPlanGenerator",
+    "NeuroSymbolicReasoner", "PlanGenerator", "PlanIR", "PlanRepairer",
+    "PlanRevision", "ReasoningOutcome", "SubtaskIR", "SymbolicPlanValidator",
+    "ValidationResult", "ValidationStatus", "FaultInjector", "FaultSpec", "InjectedFault",
     # security
     "AuditPack",
     "AuditPackBuilder",
