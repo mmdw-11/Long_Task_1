@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output-dir", default="runs/experiments/memory")
+    parser.add_argument("--run-name", default="", help="结果子目录；不同方法必须使用不同名称")
     parser.add_argument("--mem0-raw", action="store_true", help="mem0 直接写原文，不让 LLM 抽取记忆")
     parser.add_argument("--no-llm-judge", action="store_true", help="engine 后端关闭 DeepSeek 记忆更新判断")
     parser.add_argument(
@@ -40,11 +41,16 @@ def main() -> None:
     )
     parser.add_argument("--project-only", action="store_true", help="仅检索 PROJECT 层，不做层级级联")
     parser.add_argument("--append-only", action="store_true", help="关闭 UPDATE/DELETE 合并策略")
+    parser.add_argument("--qa-solver", choices=["llm", "extractive"], default="llm")
+    parser.add_argument("--qa-model", default="", help="默认使用 .env 中的 OPENAI_MODEL")
     parser.add_argument("--fresh", action="store_true", help="忽略已有 rows.jsonl，完整重跑")
     args = parser.parse_args()
 
     examples = load_memory_dataset(args.dataset, source=args.source, limit=args.limit)
-    final_dir = Path(args.output_dir) / args.source / args.backend
+    default_name = args.backend
+    if args.backend == "engine" and args.no_llm_judge:
+        default_name = "ours_no_judge"
+    final_dir = Path(args.output_dir) / args.source / (args.run_name or default_name)
     existing = load_existing_rows(final_dir, fresh=args.fresh)
     remaining = filter_remaining(examples, existing)
     if not remaining:
@@ -55,13 +61,15 @@ def main() -> None:
         MemoryExperimentConfig(
             backend=args.backend,
             top_k=args.top_k,
-            output_root=args.output_dir,
+            output_root=str(final_dir),
             clean=args.fresh or not existing,
             use_llm_judge=not args.no_llm_judge,
             mem0_infer=not args.mem0_raw,
             retrieval_mode=args.retrieval_mode,
             cascade_read=not args.project_only,
             enable_memory_update=not args.append_only,
+            qa_solver=args.qa_solver,
+            qa_model=args.qa_model,
         ),
     )
     report = merge_reports(report.name, existing, report)

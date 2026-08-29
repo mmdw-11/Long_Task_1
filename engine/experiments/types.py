@@ -18,6 +18,11 @@ class MemoryExample:
     question: str
     answer: str
     memories: List[str]
+    # Gold evidence is optional because some public releases only provide an
+    # answer. Retrieval metrics are reported as answer-text fallback metrics
+    # when this list is empty; QA metrics remain the primary outcome.
+    evidence: List[str] = field(default_factory=list)
+    trajectory_id: str = ""
     source: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
