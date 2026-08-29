@@ -1,0 +1,2 @@
+{"id":"status-update","events":[{"subject":"project","predicate":"status","object":"planned","valid_from":1},{"subject":"project","predicate":"status","object":"running","valid_from":10,"replace":true}],"queries":[{"as_of":5,"answer":"planned"},{"as_of":20,"answer":"running"}]}
+{"id":"owner-conflict","events":[{"subject":"project","predicate":"owner","object":"Alice","valid_from":1},{"subject":"project","predicate":"owner","object":"Bob","valid_from":1}],"conflict_count":1}

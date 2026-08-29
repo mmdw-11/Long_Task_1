@@ -22,6 +22,7 @@ from .reports import ExperimentReport, save_report
 from .routing import RoutingExperimentConfig, run_routing_experiment
 from .skills import SkillExperimentConfig, run_skill_experiment
 from .workflow import WorkflowExperimentConfig, run_workflow_experiment
+from .communication_memory import run_communication_ablation, run_temporal_memory_ablation
 
 __all__ = [
     "ExperimentReport",
@@ -43,4 +44,7 @@ __all__ = [
     "run_routing_experiment",
     "save_jsonl",
     "save_report",
+    "run_communication_ablation",
+    "run_temporal_memory_ablation",
 ]
+from .neurosymbolic_recovery import run_neurosymbolic_recovery_experiment

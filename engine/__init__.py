@@ -21,7 +21,22 @@ from .node import Node, NodeType
 from .graph import StateGraph, CompiledGraph, GraphExecutionError
 from .checkpoint import GraphCheckpoint, GraphCheckpointStore
 from .orchestrator import Orchestrator, AgentSpec
-from .failure import FailureRecord, FailureTrace, FAILURES_KEY
+from .failure import (
+    FailureContext, FailureKind, FailureRecord, FailureSeverity, FailureTrace,
+    FAILURES_KEY, RECOVERY_TRACE_KEY, SIDE_EFFECT_JOURNAL_KEY,
+)
+from .modules.recovery import (
+    NoOpRecoveryStrategy, PolicyRecoveryStrategy, RecoveryAction,
+    RecoveryAttempt, RecoveryEpisode, RecoveryPolicy, RecoveryStrategy, RepairPlan,
+)
+from .modules.reasoning import (
+    ConstraintIR, ConstraintKind, ConstraintViolation, Counterexample,
+    DeterministicPlanGenerator, DeterministicPlanRepairer, LLMPlanGenerator,
+    NeuroSymbolicReasoner, PlanGenerator, PlanIR, PlanRepairer, PlanRevision,
+    ReasoningOutcome, SubtaskIR, SymbolicPlanValidator, ValidationResult,
+    ValidationStatus,
+)
+from .modules.fault_injection import FaultInjector, FaultSpec, InjectedFault
 from .hooks import ExecutionHook, HookManager, NodeContext
 from .modules.memory import (
     BGEM3EmbeddingModel,
@@ -39,6 +54,29 @@ from .modules.memory import (
     WakeupProfile,
     WakeupResult,
     wakeup_profile,
+    Fact,
+    FactSearchResult,
+    FactStatus,
+    TemporalEvidence,
+    TemporalEvidenceMemoryStore,
+    TemporalRetrievalWeights,
+)
+from .modules.communication import (
+    CAPSULE_CONTEXT_KEY,
+    CAPSULE_EVENTS_KEY,
+    CAPSULE_OUTBOX_KEY,
+    COMMUNICATION_STATE_KEY,
+    CapsuleDecision,
+    CapsuleEnvelope,
+    CommunicationBudget,
+    CommunicationManager,
+    CommunicationPolicy,
+    DeterministicCapsuleCompressor,
+    LLMLinguaCapsuleCompressor,
+    EvidenceRef,
+    MessageCapsule,
+    Provenance,
+    StateDelta,
 )
 from .modules.context import (
     CONTEXT_LEDGER_KEY,
@@ -197,10 +235,27 @@ __all__ = [
     "FailureRecord",
     "FailureTrace",
     "FAILURES_KEY",
+    "RECOVERY_TRACE_KEY", "SIDE_EFFECT_JOURNAL_KEY", "FailureContext",
+    "FailureKind", "FailureSeverity", "RecoveryAction", "RecoveryAttempt",
+    "RecoveryEpisode", "RecoveryPolicy", "RecoveryStrategy", "RepairPlan",
+    "NoOpRecoveryStrategy", "PolicyRecoveryStrategy",
+    "ConstraintIR", "ConstraintKind", "ConstraintViolation", "Counterexample",
+    "DeterministicPlanGenerator", "DeterministicPlanRepairer", "LLMPlanGenerator",
+    "NeuroSymbolicReasoner", "PlanGenerator", "PlanIR", "PlanRepairer",
+    "PlanRevision", "ReasoningOutcome", "SubtaskIR", "SymbolicPlanValidator",
+    "ValidationResult", "ValidationStatus", "FaultInjector", "FaultSpec", "InjectedFault",
     # 钩子
     "ExecutionHook",
     "HookManager",
     "NodeContext",
+    "CAPSULE_CONTEXT_KEY", "CAPSULE_EVENTS_KEY", "CAPSULE_OUTBOX_KEY",
+    "COMMUNICATION_STATE_KEY", "CapsuleDecision", "CapsuleEnvelope",
+    "CommunicationBudget", "CommunicationManager", "CommunicationPolicy",
+    "DeterministicCapsuleCompressor", "EvidenceRef", "MessageCapsule",
+    "LLMLinguaCapsuleCompressor",
+    "Provenance", "StateDelta",
+    "Fact", "FactSearchResult", "FactStatus", "TemporalEvidence",
+    "TemporalEvidenceMemoryStore", "TemporalRetrievalWeights",
     # Memory
     "CONTEXT_LEDGER_KEY",
     "CONTEXT_INJECTION_KEY",

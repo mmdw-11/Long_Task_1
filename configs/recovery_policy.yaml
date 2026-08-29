@@ -1,0 +1,13 @@
+schema_version: "1.0"
+max_attempts: 3
+max_episode_actions: 5
+base_backoff_seconds: 0.25
+jitter_seconds: 0.05
+resource_degradation_order: [cloud, edge, device]
+human_review_for_non_idempotent: true
+side_effect_rules:
+  read_only: replay
+  idempotent: replay
+  compensatable: compensate_then_resume
+  non_idempotent: human_review
+
