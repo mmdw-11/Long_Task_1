@@ -23,12 +23,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--source", choices=["longmemeval", "locomo", "custom"], default="longmemeval")
-    parser.add_argument("--backend", choices=["engine", "mem0"], default="engine")
+    parser.add_argument(
+        "--backend",
+        choices=["no_memory", "full_context", "engine", "mem0"],
+        default="engine",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output-dir", default="runs/experiments/memory")
     parser.add_argument("--mem0-raw", action="store_true", help="mem0 直接写原文，不让 LLM 抽取记忆")
     parser.add_argument("--no-llm-judge", action="store_true", help="engine 后端关闭 DeepSeek 记忆更新判断")
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["dense", "sparse", "hybrid", "hybrid_temporal"],
+        default="hybrid",
+    )
+    parser.add_argument("--project-only", action="store_true", help="仅检索 PROJECT 层，不做层级级联")
+    parser.add_argument("--append-only", action="store_true", help="关闭 UPDATE/DELETE 合并策略")
     parser.add_argument("--fresh", action="store_true", help="忽略已有 rows.jsonl，完整重跑")
     args = parser.parse_args()
 
@@ -48,6 +59,9 @@ def main() -> None:
             clean=args.fresh or not existing,
             use_llm_judge=not args.no_llm_judge,
             mem0_infer=not args.mem0_raw,
+            retrieval_mode=args.retrieval_mode,
+            cascade_read=not args.project_only,
+            enable_memory_update=not args.append_only,
         ),
     )
     report = merge_reports(report.name, existing, report)
