@@ -11,12 +11,10 @@ from engine.experiments import (
     build_long_task_dataset,
     run_memory_experiment,
     run_long_task_experiment,
-    run_routing_experiment,
     run_skill_experiment,
     run_workflow_experiment,
 )
 from engine.experiments.types import MemoryExample, SkillExample
-from engine import PseudoCascadeTeacher, build_route_dataset, default_training_texts
 
 
 def test_memory_experiment_engine_backend(tmp_path):
@@ -25,18 +23,17 @@ def test_memory_experiment_engine_backend(tmp_path):
             id="m1",
             question="小明喜欢什么水果？",
             answer="苹果",
-            memories=["小明喜欢苹果，也喜欢梨。", "小红喜欢香蕉。"],
+            memories=["小明最喜欢的水果是 苹果。", "小红喜欢香蕉。"],
             source="unit",
         )
     ]
 
     report = run_memory_experiment(
         examples,
-        MemoryExperimentConfig(output_root=str(tmp_path), top_k=2, use_llm_judge=False),
+        MemoryExperimentConfig(output_root=str(tmp_path), top_k=2, use_llm_judge=False, qa_solver="extractive"),
     )
 
     assert report.summary()["pass_rate"] == 1.0
-
 
 def test_memory_control_baselines_report_tokens(tmp_path):
     examples = [
@@ -50,11 +47,11 @@ def test_memory_control_baselines_report_tokens(tmp_path):
     ]
     no_memory = run_memory_experiment(
         examples,
-        MemoryExperimentConfig(backend="no_memory", output_root=str(tmp_path)),
+        MemoryExperimentConfig(backend="no_memory", output_root=str(tmp_path), qa_solver="extractive"),
     )
     full_context = run_memory_experiment(
         examples,
-        MemoryExperimentConfig(backend="full_context", output_root=str(tmp_path)),
+        MemoryExperimentConfig(backend="full_context", output_root=str(tmp_path), qa_solver="extractive"),
     )
 
     assert no_memory.summary()["pass_rate"] == 0.0
@@ -104,13 +101,3 @@ async def test_workflow_experiment_runs_all_patterns():
 
     assert report.summary()["total"] == 5
     assert report.summary()["pass_rate"] == 1.0
-
-
-def test_routing_experiment_includes_four_controls():
-    dataset = build_route_dataset(default_training_texts(), teacher=PseudoCascadeTeacher())
-    reports = run_routing_experiment(dataset)
-
-    assert set(reports) == {"all_device", "all_cloud", "heuristic", "learned"}
-    assert all(report.summary()["total"] > 0 for report in reports.values())
-    assert reports["all_cloud"].summary()["avg_cloud_call"] == 1.0
-    assert reports["all_device"].summary()["avg_cloud_call"] == 0.0

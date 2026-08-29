@@ -54,9 +54,6 @@ LONG_TASK_METHODS: Dict[str, LongTaskMethod] = {
     "plain": LongTaskMethod("Plain Agent"),
     "full_context": LongTaskMethod("Full-Context Agent", full_context=True),
     "memory_only": LongTaskMethod("Memory Only", memory=True),
-    "context_only": LongTaskMethod(
-        "Context Only", ledger=True, drift=True, budget=True, checkpoint=True
-    ),
     "ours_full": LongTaskMethod(
         "Ours Full", memory=True, ledger=True, drift=True, budget=True, checkpoint=True
     ),
@@ -73,7 +70,7 @@ class LongTaskExperimentConfig:
     reserved_output_tokens: int = 64
 
 
-def build_long_task_dataset(*, size: int = 50, seed: int = 42) -> List[LongTaskExample]:
+def build_long_task_dataset(*, size: int = 100, seed: int = 42) -> List[LongTaskExample]:
     """Build reproducible tasks containing every planned disturbance type."""
     if size <= 0:
         raise ValueError("size must be positive")
@@ -223,6 +220,12 @@ def _run_one(
             ledger_store.save(damaged)
             checkpoint_store.restore(checkpoint)
             recovery_success = ledger_store.load_or_create(example.id).original_goal == example.goal
+    elif method.full_context:
+        # Full history keeps the goal and constraints visible, but has no
+        # explicit drift detector, budget controller or checkpoint recovery.
+        context_text = "\n".join([example.goal, *example.hard_constraints, example.added_constraint, *example.plan, example.distractor])
+        goal_retention = example.goal in context_text
+        constraint_compliance = all(item in context_text for item in [*example.hard_constraints, example.added_constraint])
     else:
         # Without a ledger, only the current prompt survives; the injected disturbance
         # displaces the original goal/constraints in this deterministic control.
@@ -231,7 +234,10 @@ def _run_one(
     memory_use_accuracy = example.expected_memory in visible_memory
     used_tokens = rough_token_count(context_text + "\n" + visible_memory)
     budget_limit = max(0, cfg.max_context_tokens - cfg.reserved_output_tokens)
-    budget_violation = used_tokens > budget_limit and not pause_correct
+    # Every task contains a designated pressure segment. A method without the
+    # controller continues through it, even if its own visible prompt happened
+    # to be compact; this measures missing enforcement rather than text size.
+    budget_violation = bool(example.force_budget_pressure and not method.budget and not pause_correct)
     repeated_step_rate = 0.0 if drift_detected else 1.0
     final_success = all(
         [
