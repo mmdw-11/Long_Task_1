@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .io import read_json_or_jsonl, write_jsonl
-from .long_task import LongTaskExample
+from .long_task import LongTaskExample, memory_contains_expected
 from .types import MemoryExample, SkillExample, WorkflowExample
 
 
@@ -157,7 +157,7 @@ def build_long_task_dataset_from_memory(
     tasks: List[LongTaskExample] = []
     for index, item in enumerate(selected):
         domain = str(item.metadata.get("domain") or item.source or "对话任务")
-        fact = next((text for text in item.memories if _norm(item.answer) in _norm(text)), "")
+        fact = next((text for text in item.memories if memory_contains_expected(item.answer, text)), "")
         if not fact:
             fact = f"历史对话中的已确认答案：{item.answer}。"
         tasks.append(
@@ -390,7 +390,12 @@ def _expand_memory_rows(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             for pair_index, pair in enumerate(pairs):
                 merged = dict(row)
                 merged.update(pair)
-                merged["parent_id"] = str(row.get("id") or row.get("conversation_id") or f"trajectory-{pair_index}")
+                merged["parent_id"] = str(
+                    row.get("id")
+                    or row.get("conversation_id")
+                    or row.get("sample_id")
+                    or f"trajectory-{pair_index}"
+                )
                 merged["id"] = str(pair.get("id") or pair.get("question_id") or f"{merged['parent_id']}-q{pair_index}")
                 expanded.append(merged)
             return expanded

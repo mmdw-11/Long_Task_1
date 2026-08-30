@@ -26,6 +26,34 @@ def test_model_connection_store_never_returns_api_key_value(tmp_path, monkeypatc
     assert payload["test_status"] == "untested"
 
 
+def test_auto_requires_one_runnable_default_for_every_tier(tmp_path):
+    store = ModelConnectionStore(tmp_path / "models")
+    for tier in ("device", "edge", "cloud"):
+        store.create({
+            "name": f"{tier} default",
+            "provider": "openai-compatible",
+            "model_id": f"{tier}-model",
+            "base_url": f"https://{tier}.example.com/v1",
+            "tier": tier,
+            "auto_default": True,
+            "test_status": "succeeded",
+        })
+
+    status = store.auto_status()
+
+    assert status["ready"] is True
+    assert all(status["tiers"][tier]["connection"]["auto_default"] for tier in ("device", "edge", "cloud"))
+
+
+def test_each_tier_has_only_one_auto_default(tmp_path):
+    store = ModelConnectionStore(tmp_path / "models")
+    first = store.create({"name":"first", "model_id":"one", "base_url":"https://one.example/v1", "tier":"cloud", "auto_default":True})
+    second = store.create({"name":"second", "model_id":"two", "base_url":"https://two.example/v1", "tier":"cloud", "auto_default":True})
+
+    assert store.get(first.id).auto_default is False
+    assert store.get(second.id).auto_default is True
+
+
 def test_openapi_operations_are_split_into_tools():
     document = {
         "openapi": "3.0.0",

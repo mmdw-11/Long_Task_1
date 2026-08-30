@@ -43,6 +43,20 @@ class WorkflowNodeRuntimeFactory:
                     raise RuntimeError(result.get("error") or "工具调用失败")
                 output_key = str(config.get("output_field") or "tool_output")
                 return {output_key: result.get("result"), "input": result.get("result"), "__runtime_tool_calls__": [result]}
+            if kind == "knowledge":
+                # 知识库资源目前只完成工作流挂载与持久化。检索适配器接入前，
+                # 节点安全透传上游输入并返回空文档列表，避免占位能力阻断发布
+                # 或让已发布工作流在运行时因“不支持节点类型”而失败。
+                value = state.get("input", state)
+                output_key = str(config.get("output_field") or "documents")
+                return {
+                    output_key: [],
+                    "input": value,
+                    "__knowledge_binding__": {
+                        "knowledge_base_id": str(config.get("knowledge_base_id") or ""),
+                        "retrieval_enabled": False,
+                    },
+                }
             if kind == "condition":
                 left = _get(state, str(config.get("field") or "input"))
                 right = config.get("value")

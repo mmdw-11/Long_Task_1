@@ -10,6 +10,59 @@ from engine.modules.workflows import WorkflowStore
 from engine.server.app import create_app
 
 
+def test_application_workflow_versions_are_created_only_on_publish(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    created = store.create(
+        name="application workflow",
+        tags=["workflow", "application"],
+        graph={"entry": None, "agents": [], "connections": []},
+    )
+
+    draft = type(created).from_dict({
+        **created.to_dict(),
+        "description": "draft edit",
+    })
+    saved = store.save_draft(draft)
+    assert saved.version == 1
+    assert store.list_versions(created.id) == []
+
+    first = store.publish(created.id)
+    assert first.version == 1
+    assert [item.version for item in store.list_versions(created.id)] == [1]
+
+    next_draft = type(created).from_dict({
+        **first.to_dict(),
+        "description": "second release",
+    })
+    store.save_draft(next_draft)
+    second = store.publish(created.id)
+    assert second.version == 2
+    assert [item.version for item in store.list_versions(created.id)] == [2, 1]
+
+    activated = store.activate_version(created.id, 1)
+    assert activated.version == 1
+    assert activated.description == "draft edit"
+    assert [item.version for item in store.list_versions(created.id)] == [2, 1]
+
+
+def test_first_publish_replaces_legacy_unpublished_version_file(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    created = store.create(
+        name="legacy application workflow",
+        tags=["workflow", "application"],
+        graph={"entry": None, "agents": [], "connections": []},
+    )
+    legacy = type(created).from_dict({**created.to_dict(), "description": "legacy draft history"})
+    store._archive_version(legacy)  # noqa: SLF001 - migration compatibility fixture
+
+    published = store.publish(created.id)
+
+    assert published.version == 1
+    versions = store.list_versions(created.id)
+    assert [item.version for item in versions] == [1]
+    assert versions[0].metadata["published_snapshot"] is True
+
+
 def test_workflow_save_list_load_and_run(tmp_path):
     app = create_app(workflow_store=WorkflowStore(tmp_path / "workflows"))
     client = TestClient(app)

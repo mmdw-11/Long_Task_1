@@ -686,6 +686,42 @@ def create_app(
             record.owner_user_id=_request_user_id(request);applications.save(record)
         return record
 
+    def _model_selection_errors(app_record: ApplicationRecord, graph: Optional[Dict[str, Any]] = None) -> List[str]:
+        """Validate fixed/AUTO selections against the shared model connection catalog."""
+        errors: List[str] = []
+        auto_status = model_connections.auto_status()
+
+        def check(selection: str, label: str) -> None:
+            # Empty is the legacy pre-model-management value. It keeps the old
+            # development fallback until the application is explicitly saved as AUTO.
+            if selection == "":
+                return
+            normalized = "auto" if selection in {"", "auto", "device", "edge", "cloud"} else selection
+            if normalized == "auto":
+                if not auto_status["ready"]:
+                    missing = "、".join(name for tier, name in (("device", "端"), ("edge", "边"), ("cloud", "云")) if not auto_status["tiers"][tier]["ready"])
+                    errors.append(f"{label}使用 AUTO，但{missing}模型尚未设置可用的默认连接")
+                return
+            try:
+                connection = model_connections.get(normalized)
+                if not connection.runnable:
+                    errors.append(f"{label}选择的模型连接未启用、未配置或尚未测试成功")
+            except KeyError:
+                errors.append(f"{label}选择的模型连接不存在")
+
+        if app_record.app_type == "agent":
+            check(app_record.model, "智能体应用")
+        elif graph is not None:
+            check(app_record.model, "工作流默认模型")
+            for item in graph.get("agents", []):
+                kind = str((item.get("config") or {}).get("node_kind") or "agent")
+                if kind not in {"agent", "llm"}:
+                    continue
+                selection = str(item.get("model") or "")
+                if selection:
+                    check(selection, f"节点“{item.get('name')}”")
+        return list(dict.fromkeys(errors))
+
     def _visible_skill(skill_id: str, request: Request, *, mutable: bool = False):
         record = skills.get(skill_id)
         if record.visibility == "builtin":
@@ -763,6 +799,12 @@ def create_app(
         application_id = str((record.metadata if record else {}).get("application_id") or "")
         if application_id:
             app_record = applications.get(application_id)
+            if app_record.app_type == "workflow":
+                inherited_model = "auto" if app_record.model in {"", "auto", "device", "edge", "cloud"} else app_record.model
+                for spec in target.list_agents():
+                    kind = str(spec.config.get("node_kind") or "agent")
+                    if kind in {"agent", "llm"} and not spec.model:
+                        target.update_agent(spec.id, model=inherited_model)
             bound = [bank_id for bank_id in app_record.memory_bank_ids if memory_banks.exists(bank_id)]
             primary = app_record.primary_memory_bank_id or (bound[0] if bound else None)
             if primary and primary in bound and normalize_memory_config(app_record.memory_config)["long_term_enabled"]:
@@ -820,8 +862,6 @@ def create_app(
                 errors.append("所有节点必须能够从开始节点到达")
             if ends and str(ends[0].get("id")) not in reached:
                 errors.append("结束节点必须能够从开始节点到达")
-        if runnable and "knowledge" in kinds:
-            errors.append("知识库节点已完成配置保存，但检索运行能力尚未接入")
         for item, kind in zip(agents, kinds):
             config = item.get("config") or {}
             if kind == "tool" and not config.get("tool_id"):
@@ -1639,6 +1679,10 @@ def create_app(
     def list_model_connections() -> List[Dict[str, Any]]:
         return [item.to_dict() for item in model_connections.list()]
 
+    @app.get("/api/model-connections/auto-status")
+    def get_model_auto_status() -> Dict[str, Any]:
+        return model_connections.auto_status()
+
     @app.post("/api/model-connections")
     def create_model_connection(req: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -1669,7 +1713,9 @@ def create_app(
             request = urllib.request.Request(f"{item.base_url}/models", headers=headers)
             with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310 - URL is administrator configured
                 if response.status >= 400: raise ValueError(f"模型服务返回 HTTP {response.status}")
-            chat_body=json.dumps({"model":item.model_id,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"temperature":0,"max_tokens":8}).encode("utf-8")
+            # Connection tests should verify credentials and basic inference,
+            # not spend the entire tiny output budget on a reasoning trace.
+            chat_body=json.dumps({"model":item.model_id,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":32}).encode("utf-8")
             chat_headers={**headers,"Content-Type":"application/json"}
             chat_request=urllib.request.Request(f"{item.base_url}/chat/completions",data=chat_body,headers=chat_headers,method="POST")
             with urllib.request.urlopen(chat_request,timeout=30) as response:  # noqa: S310 - administrator configured
@@ -1840,16 +1886,15 @@ def create_app(
                             "prompt_variables": updated.prompt_variables,
                         },
                     )
-                workflows.save(
-                    WorkflowRecord.from_dict(
-                        {
-                            **workflow.to_dict(),
-                            "name": updated.name,
-                            "description": updated.description,
-                            "graph": graph.to_dict(),
-                        }
-                    )
+                workflow_update = WorkflowRecord.from_dict(
+                    {
+                        **workflow.to_dict(),
+                        "name": updated.name,
+                        "description": updated.description,
+                        "graph": graph.to_dict(),
+                    }
                 )
+                workflows.save_draft(workflow_update)
             return applications.save(updated).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -1860,11 +1905,17 @@ def create_app(
     def publish_application(app_id: str, request: Request) -> Dict[str, Any]:
         try:
             app_record = _owned_application(app_id, request)
-            if app_record.app_type == "workflow":
-                workflow = workflows.get(app_record.workflow_id)
+            workflow = workflows.get(app_record.workflow_id) if app_record.workflow_id else None
+            model_errors = _model_selection_errors(app_record, workflow.graph if workflow else None)
+            if model_errors:
+                raise ValueError("；".join(model_errors))
+            if app_record.app_type == "workflow" and workflow is not None:
                 errors = _validate_application_workflow(workflow.graph, runnable=True)
                 if errors:
                     raise ValueError("；".join(errors))
+            if workflow is not None:
+                published = workflows.publish(app_record.workflow_id)
+                app_record.metadata = {**app_record.metadata, "workflow_version": published.version}
             app_record.status = "published"
             return applications.save(app_record).to_dict()
         except KeyError as e:
@@ -1885,6 +1936,9 @@ def create_app(
             if not app_record.workflow_id:
                 raise HTTPException(status_code=400, detail="应用尚未绑定工作流")
             workflows.get(app_record.workflow_id)
+            model_errors = _model_selection_errors(app_record, workflows.get(app_record.workflow_id).graph)
+            if model_errors:
+                raise HTTPException(status_code=400, detail="；".join(model_errors))
             if app_record.app_type == "workflow":
                 errors = _validate_application_workflow(workflows.get(app_record.workflow_id).graph, runnable=True)
                 if errors:
@@ -2072,7 +2126,7 @@ def create_app(
                     "graph": next_graph,
                 }
             )
-            return workflows.save(updated).to_dict()
+            return (workflows.save_draft(updated) if "application" in current.tags else workflows.save(updated)).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -2096,6 +2150,26 @@ def create_app(
     def rollback_workflow(workflow_id: str, version: int, request: Request) -> Dict[str, Any]:
         try:
             _owned_app_for_workflow(workflow_id, request)
+            current = workflows.get(workflow_id)
+            if "application" in current.tags:
+                activated = workflows.activate_version(workflow_id, version)
+                application = _owned_app_for_workflow(workflow_id, request)
+                if application is not None:
+                    application.metadata = {**application.metadata, "workflow_version": version}
+                    if application.app_type == "agent":
+                        entry = next((item for item in activated.graph.get("agents", []) if item.get("id") == application.entry_agent_id), None)
+                        if entry:
+                            config = dict(entry.get("config") or {})
+                            application.name = str(entry.get("name") or application.name)
+                            application.description = str(entry.get("description") or "")
+                            application.model = str(entry.get("model") or "")
+                            application.system_prompt = str(entry.get("sys_prompt") or "")
+                            for key in ("tool_ids", "skill_ids", "knowledge_base_ids", "memory_bank_ids", "prompt_variables"):
+                                setattr(application, key, [str(item) if key != "prompt_variables" else item for item in config.get(key) or []])
+                            application.primary_memory_bank_id = config.get("primary_memory_bank_id")
+                            application.memory_config = normalize_memory_config(config.get("memory_config"))
+                    applications.save(application)
+                return activated.to_dict()
             return workflows.rollback(workflow_id, version).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -2561,6 +2635,29 @@ def create_app(
             items = list_bank_memories(memory_data_root, bank_id, query=query, scope=effective_scope, limit=500)
             bounded_limit = max(1, min(limit, 200))
             return {"items":[item.to_dict() for item in items[max(0,offset):max(0,offset)+bounded_limit]],"total":len(items)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/model-connections/{connection_id}")
+    def delete_model_connection(connection_id: str) -> Dict[str, Any]:
+        try:
+            model_connections.get(connection_id)
+            references: List[str] = []
+            for application in applications.list():
+                if application.model == connection_id:
+                    references.append(f"应用“{application.name}”")
+                if not application.workflow_id or not workflows.exists(application.workflow_id):
+                    continue
+                workflow = workflows.get(application.workflow_id)
+                for node in workflow.graph.get("agents", []):
+                    if str(node.get("model") or "") == connection_id:
+                        references.append(f"工作流“{application.name}”的节点“{node.get('name')}”")
+            if references:
+                raise ValueError(f"该模型正在被{'、'.join(dict.fromkeys(references))}使用，请先解除绑定")
+            model_connections.delete(connection_id)
+            return {"ok": True, "id": connection_id}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         except ValueError as exc:
