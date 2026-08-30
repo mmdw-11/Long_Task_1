@@ -20,6 +20,9 @@ dist/
 runs/
 .memory/
 
+# 运行与调试日志
+*.log
+
 # huggingface 认证
 .hf_cache/token
 .hf_cache/stored_tokens

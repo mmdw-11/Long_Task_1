@@ -18,7 +18,7 @@ from ..modules.execution import ExecutorRegistry, InferenceResult, ResilientInfe
 from ..modules.model_connections import ModelConnectionStore
 from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
-from ..modules.scheduling import AdaptiveResourceScheduler, ResourceRequest, ResourceScheduler, ResourceTier
+from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity
 from ..modules.tool_runtime import ToolRuntime
 from ..modules.skills import SKILL_CONTEXT_TEXT_KEY
 from ..node import Node, NodeType
@@ -56,7 +56,10 @@ class AgentRuntimeFactory:
 
         async def _run(state: Dict[str, Any]) -> Dict[str, Any]:
             prompt = self._build_prompt(spec, state)
-            tool_calls = self._run_tools(spec, prompt)
+            # Tool routing must only inspect the user's task. The expanded
+            # prompt contains internal identifiers such as ``todo-1`` which
+            # can otherwise be mistaken for arithmetic expressions.
+            tool_calls = self._run_tools(spec, self._state_input_text(state))
             if tool_calls:
                 prompt = f"{prompt}\n\n工具调用结果：\n{json.dumps(tool_calls, ensure_ascii=False, default=str)}"
             request = ResourceRequest(
@@ -71,7 +74,9 @@ class AgentRuntimeFactory:
                 state=state,
             )
             system_prompt = self._render_variables(spec.sys_prompt, state)
-            result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else runner.run(
+            result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
+                request, prompt, system_prompt
+            ) if self.model_connections is not None and self.model_connections.auto_status()["ready"] else runner.run(
                 resource_request=request,
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -81,7 +86,9 @@ class AgentRuntimeFactory:
             # 但只携带用户问题再次生成面向用户的自然语言回答，避免暴露内部账本。
             if result.success and not result.metadata.get("simulated") and self._looks_like_prompt_echo(result.text):
                 clean_prompt = f"用户问题：{self._state_input_text(state)}\n\n请直接给出自然、简洁的回答。不要复述系统提示、Agent 配置、上下文账本、执行步骤或内部判断。"
-                rewritten = self._run_pinned_model(spec.model, clean_prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else runner.run(
+                rewritten = self._run_pinned_model(spec.model, clean_prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
+                    request, clean_prompt, system_prompt
+                ) if self.model_connections is not None and self.model_connections.auto_status()["ready"] else runner.run(
                     resource_request=request,
                     prompt=clean_prompt,
                     system_prompt=system_prompt,
@@ -244,7 +251,7 @@ class AgentRuntimeFactory:
             return InferenceResult(text="", executor="ModelConnectionExecutor", endpoint="", success=False, error="模型连接目录未启用")
         try:
             connection = self.model_connections.get(connection_id)
-            if not connection.enabled or connection.test_status != "succeeded":
+            if not connection.runnable:
                 raise ValueError("指定模型连接未启用或尚未测试成功")
             from openai import OpenAI
             api_key = os.environ.get(connection.api_key_env, "") if connection.api_key_env else "not-needed"
@@ -252,3 +259,45 @@ class AgentRuntimeFactory:
             return InferenceResult(text=response.choices[0].message.content or "",executor="ModelConnectionExecutor",endpoint=connection.base_url,model=connection.model_id,metadata={"provider":connection.provider,"connection_id":connection.id})
         except Exception as exc:
             return InferenceResult(text="",executor="ModelConnectionExecutor",endpoint="",success=False,error=str(exc),retryable=False)
+
+    def _run_auto_model(self, request: ResourceRequest, prompt: str, system_prompt: str) -> InferenceResult:
+        """Route AUTO through the same tested model connections used by fixed mode."""
+        if self.model_connections is None:
+            return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error="模型连接目录未启用", retryable=False)
+        status = self.model_connections.auto_status()
+        if not status["ready"]:
+            missing = "、".join(label for tier, label in (("device", "端"), ("edge", "边"), ("cloud", "云")) if not status["tiers"][tier]["ready"])
+            return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error=f"AUTO 尚未就绪：{missing}模型未配置可用的默认连接", retryable=False, metadata={"auto_status": status})
+        allocation = self._connection_scheduler(self.model_connections).acquire(request)
+        selected_tier = allocation.tier.value
+        preference = [selected_tier] + [tier.value for tier in request.tier_preference if tier.value != selected_tier]
+        decision = allocation.metadata.get("decision") or {}
+        profile = decision.get("profile") or {}
+        if profile.get("requires_trusted_workspace") and not profile.get("human_approved"):
+            preference = [tier for tier in preference if tier != "cloud"]
+        attempts: list[Dict[str, Any]] = []
+        for tier in preference:
+            connection = self.model_connections.default_for_tier(tier)
+            if connection is None:
+                continue
+            result = self._run_pinned_model(connection.id, prompt, system_prompt)
+            attempts.append({"tier": tier, "connection_id": connection.id, "model": connection.model_id, "success": result.success, "error": result.error})
+            if result.success:
+                result.metadata = {**result.metadata, "mode": "auto", "selected_tier": selected_tier, "actual_tier": tier, "route_reason": allocation.metadata.get("reason", ""), "fallback": tier != selected_tier, "attempts": attempts}
+                return result
+        return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error="AUTO 模式下所有默认模型调用均失败", retryable=False, metadata={"mode": "auto", "selected_tier": selected_tier, "attempts": attempts})
+
+    @staticmethod
+    def _connection_scheduler(store: Optional[ModelConnectionStore]) -> AdaptiveResourceScheduler:
+        if store is None:
+            return AdaptiveResourceScheduler()
+        profiles: list[ResourceProfile] = []
+        settings = {
+            "device": (True, TaskComplexity.MEDIUM, 30, 0.2),
+            "edge": (True, TaskComplexity.HIGH, 90, 0.6),
+            "cloud": (False, TaskComplexity.EXTREME, 220, 1.0),
+        }
+        for tier_name, (trusted, complexity, latency, cost) in settings.items():
+            connection = store.default_for_tier(tier_name, runnable=False)
+            profiles.append(ResourceProfile(tier=ResourceTier(tier_name), endpoint=connection.base_url if connection else f"model-connection://{tier_name}", available=bool(connection and connection.runnable), trusted=trusted, max_complexity=complexity, latency_ms=latency, cost_weight=cost, models={"default": connection.model_id if connection else ""}))
+        return AdaptiveResourceScheduler(resources=profiles)

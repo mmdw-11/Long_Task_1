@@ -7,6 +7,7 @@ from engine.experiments import (
     LongTaskExperimentConfig,
     SkillExperimentConfig,
     WorkflowExperimentConfig,
+    build_long_task_dataset_from_memory,
     build_workflow_dataset,
     build_long_task_dataset,
     run_memory_experiment,
@@ -15,6 +16,60 @@ from engine.experiments import (
     run_workflow_experiment,
 )
 from engine.experiments.types import MemoryExample, SkillExample
+from engine.experiments.datasets import load_memory_dataset
+from engine.experiments.long_task import memory_contains_expected
+
+
+@pytest.mark.parametrize(
+    ("expected", "memory"),
+    [
+        ("Photography", "Calvin recently got into photography."),
+        ("two", "Calvin owns 2 Ferraris."),
+        ("ABC-123", "历史确认码是 abc 123。"),
+        ("苹果", "小明最喜欢的水果是苹果。"),
+    ],
+)
+def test_memory_match_normalizes_harmless_surface_differences(expected, memory):
+    assert memory_contains_expected(expected, memory)
+
+
+def test_memory_match_does_not_match_inside_unrelated_word():
+    assert not memory_contains_expected("two", "The network is working.")
+
+
+def test_long_task_dataset_selects_fact_on_token_boundaries():
+    examples = [
+        MemoryExample(
+            id="q1",
+            question="What is the adopted pup's name?",
+            answer="Ned",
+            memories=[
+                "John signed up for a programming class.",
+                "James adopted a pup named Ned.",
+            ],
+            source="locomo",
+        )
+    ]
+
+    tasks = build_long_task_dataset_from_memory(examples, count=1, seed=42)
+
+    assert tasks[0].memory_fact == "James adopted a pup named Ned."
+
+
+def test_locomo_nested_qa_ids_use_sample_id(tmp_path):
+    dataset = tmp_path / "locomo.json"
+    dataset.write_text(
+        '[{"sample_id":"conv-a","conversation":"A1 context",'
+        '"qa":[{"question":"Q1","answer":"A1"}]},'
+        '{"sample_id":"conv-b","conversation":"A2 context",'
+        '"qa":[{"question":"Q2","answer":"A2"}]}]',
+        encoding="utf-8",
+    )
+
+    examples = load_memory_dataset(dataset, source="locomo")
+
+    assert [item.id for item in examples] == ["conv-a-q0", "conv-b-q0"]
+    assert len({item.id for item in examples}) == 2
 
 
 def test_memory_experiment_engine_backend(tmp_path):
@@ -56,7 +111,7 @@ def test_memory_control_baselines_report_tokens(tmp_path):
 
     assert no_memory.summary()["pass_rate"] == 0.0
     assert full_context.summary()["pass_rate"] == 1.0
-    assert full_context.summary()["avg_tokens"] > no_memory.summary()["avg_tokens"]
+    assert full_context.summary()["avg_context_tokens"] > no_memory.summary()["avg_context_tokens"]
 
 
 def test_long_task_joint_experiment_exercises_all_controls(tmp_path):

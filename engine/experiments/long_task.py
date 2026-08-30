@@ -9,8 +9,10 @@ real solver can later consume the same normalized dataset and metric schema.
 from __future__ import annotations
 
 import random
+import re
 import shutil
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
@@ -21,6 +23,43 @@ from engine.modules.memory import HybridTieredMemoryStore, MemoryContext, Memory
 
 from .reports import ExperimentReport
 from .types import ExperimentRow
+
+
+_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+
+
+def memory_contains_expected(expected: str, visible_memory: str) -> bool:
+    """Match an expected fact after harmless surface-form normalization.
+
+    Matching is case-insensitive, ignores punctuation/spacing differences, and
+    treats common single-digit English number words as their Arabic digits.
+    Token-sequence matching prevents short answers from matching inside an
+    unrelated longer word.
+    """
+    expected_tokens = _normalized_fact_tokens(expected)
+    memory_tokens = _normalized_fact_tokens(visible_memory)
+    if not expected_tokens or len(expected_tokens) > len(memory_tokens):
+        return False
+    width = len(expected_tokens)
+    return any(memory_tokens[index:index + width] == expected_tokens for index in range(len(memory_tokens) - width + 1))
+
+
+def _normalized_fact_tokens(text: str) -> List[str]:
+    normalized = unicodedata.normalize("NFKC", str(text)).casefold()
+    tokens = re.findall(r"[a-z0-9]+|[\u3400-\u9fff]", normalized)
+    return [_NUMBER_WORDS.get(token, token) for token in tokens]
 
 
 @dataclass
@@ -231,7 +270,7 @@ def _run_one(
         # displaces the original goal/constraints in this deterministic control.
         context_text = example.distractor
 
-    memory_use_accuracy = example.expected_memory in visible_memory
+    memory_use_accuracy = memory_contains_expected(example.expected_memory, visible_memory)
     used_tokens = rough_token_count(context_text + "\n" + visible_memory)
     budget_limit = max(0, cfg.max_context_tokens - cfg.reserved_output_tokens)
     # Every task contains a designated pressure segment. A method without the

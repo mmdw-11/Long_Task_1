@@ -123,6 +123,27 @@ def test_calculator_accepts_full_width_operators_and_returns_natural_answer(tmp_
     assert record["state"]["messages"][0]["content"] == "计算结果是 8。"
 
 
+def test_internal_todo_id_does_not_trigger_calculator(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.delenv("DEVICE_BASE_URL", raising=False)
+    monkeypatch.delenv("DEVICE_MODEL", raising=False)
+    tool_store = ToolCatalogStore(tmp_path / "tools")
+    calculator = tool_store.create(
+        name="calculator", display_name="计算器", description="执行安全四则运算",
+        metadata={"adapter":"calculator", "risk":"low"},
+    )
+    app = create_app(workflow_store=WorkflowStore(tmp_path / "workflows"), run_store=RunStore(tmp_path / "runs"), tool_catalog_store=tool_store)
+    client = TestClient(app)
+    agent_id = client.post("/api/agents", json={"name":"minutes_agent", "config":{"tool_ids":[calculator.id]}}).json()["id"]
+    client.post("/api/graph/entry", json={"agent_id":agent_id})
+
+    created = client.post("/api/runs", json={"input":{"input":"给我生成一份会议纪要的模板。"}}).json()
+    record = client.get(f"/api/runs/{created['id']}").json()
+
+    assert not any(event["type"] == "tool_result" for event in record["events"])
+    assert record["state"]["messages"][0]["content"] != "计算结果是 -1。"
+
+
 def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
     monkeypatch.delenv("DEVICE_BASE_URL", raising=False)

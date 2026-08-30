@@ -162,6 +162,73 @@ class WorkflowStore:
         )
         return record
 
+    def save_draft(self, record: WorkflowRecord) -> WorkflowRecord:
+        """保存应用工作流草稿，不创建或递增发布版本。"""
+        existing = self.get(record.id) if self.exists(record.id) else None
+        if existing is not None:
+            record.created_at = existing.created_at
+            record.version = existing.version
+        record.updated_at = _utc_now()
+        self._write_current(record)
+        return record
+
+    def publish(self, workflow_id: str) -> WorkflowRecord:
+        """将当前应用工作流草稿保存为一个新的不可变发布快照。"""
+        current = self.get(workflow_id)
+        published = [item.version for item in self._published_versions(workflow_id)]
+        next_version = max(published, default=0) + 1
+        now = _utc_now()
+        snapshot = WorkflowRecord.from_dict(
+            {
+                **current.to_dict(),
+                "version": next_version,
+                "updated_at": now,
+                "metadata": {
+                    **current.metadata,
+                    "published_snapshot": True,
+                    "published_at": now,
+                },
+            }
+        )
+        # 旧版本逻辑可能已经留下同编号的“草稿历史”文件。这类文件没有
+        # published_snapshot 标记，应由新的正式发布快照替换，否则发布成功
+        # 后版本列表会因为过滤旧草稿而显示为空。
+        self._archive_version(snapshot, overwrite_unpublished=True)
+        current.version = next_version
+        current.updated_at = now
+        current.metadata = {
+            **current.metadata,
+            "published_version": next_version,
+            "published_at": now,
+        }
+        self._write_current(current)
+        return current
+
+    def activate_version(self, workflow_id: str, version: int) -> WorkflowRecord:
+        """激活既有发布快照，不创建新版本。"""
+        path = self._version_path(workflow_id, version)
+        if not path.exists():
+            raise KeyError(f"workflow {workflow_id!r} version {version!r} not found")
+        target = WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        if not target.metadata.get("published_snapshot"):
+            raise ValueError("只能激活已发布的工作流版本")
+        current = self.get(workflow_id)
+        activated = WorkflowRecord.from_dict(
+            {
+                **target.to_dict(),
+                "created_at": current.created_at,
+                "updated_at": _utc_now(),
+                "metadata": {
+                    **target.metadata,
+                    "application_id": current.metadata.get("application_id", target.metadata.get("application_id")),
+                    "published_version": version,
+                    "active_version": version,
+                },
+            }
+        )
+        self._write_current(activated)
+        return activated
+
     def create(
         self,
         *,
@@ -207,6 +274,9 @@ class WorkflowStore:
         if not self.exists(workflow_id):
             raise KeyError(f"workflow {workflow_id!r} not found")
         version_root = self._version_root(workflow_id)
+        current = self.get(workflow_id)
+        if "application" in current.tags:
+            return sorted(self._published_versions(workflow_id), key=lambda item: item.version, reverse=True)
         records = []
         for path in sorted(version_root.glob("v*.json")):
             records.append(WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8"))))
@@ -214,13 +284,13 @@ class WorkflowStore:
         return sorted(records, key=lambda item: item.version, reverse=True)
 
     def get_version(self, workflow_id: str, version: int) -> WorkflowRecord:
+        path = self._version_path(workflow_id, version)
+        if path.exists():
+            return WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
         current = self.get(workflow_id)
         if current.version == version:
             return current
-        path = self._version_path(workflow_id, version)
-        if not path.exists():
-            raise KeyError(f"workflow {workflow_id!r} version {version!r} not found")
-        return WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        raise KeyError(f"workflow {workflow_id!r} version {version!r} not found")
 
     def rollback(self, workflow_id: str, version: int) -> WorkflowRecord:
         target = self.get_version(workflow_id, version)
@@ -238,12 +308,30 @@ class WorkflowStore:
         )
         return self.save(restored)
 
-    def _archive_version(self, record: WorkflowRecord) -> None:
+    def _archive_version(self, record: WorkflowRecord, *, overwrite_unpublished: bool = False) -> None:
         path = self._version_path(record.id, record.version)
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            return
+            if not overwrite_unpublished:
+                return
+            existing = WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if existing.metadata.get("published_snapshot"):
+                return
         path.write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _published_versions(self, workflow_id: str) -> List[WorkflowRecord]:
+        version_root = self._version_root(workflow_id)
+        records = [
+            WorkflowRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            for path in sorted(version_root.glob("v*.json"))
+        ]
+        return [item for item in records if item.metadata.get("published_snapshot")]
+
+    def _write_current(self, record: WorkflowRecord) -> None:
+        self._path(record.id).write_text(
             json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
