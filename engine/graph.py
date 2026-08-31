@@ -377,7 +377,8 @@ class CompiledGraph:
             deferred = [n for n in frontier if decisions[n] == FlowDecision.DEFER]
 
             for name in executable:
-                yield {"type": "node_start", "node": name}
+                metadata = self.nodes[name].metadata
+                yield {"type": "node_start", "node": name, "parent_node_id": metadata.get("parent_id"), "iteration": snapshot.get("loop_index"), "batch_index": snapshot.get("batch_index"), "input": snapshot.get("input")}
 
             results = await asyncio.gather(
                 *[self._run_node(name, step, node_snapshots.get(name, snapshot)) for name in executable],
@@ -493,7 +494,8 @@ class CompiledGraph:
                         break
                 state.update(update)
                 executed_ok.append(name)
-                yield {"type": "node_end", "node": name, "update": update or {}}
+                event_state = state.snapshot()
+                yield {"type": "node_end", "node": name, "update": update or {}, "parent_node_id": self.nodes[name].metadata.get("parent_id"), "iteration": event_state.get("loop_index"), "batch_index": event_state.get("batch_index"), "output": update or {}}
                 for hook_event in hook_events:
                     yield hook_event
 
