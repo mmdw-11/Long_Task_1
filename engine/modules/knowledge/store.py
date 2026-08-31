@@ -96,7 +96,11 @@ class KnowledgeStore:
     def _extract(self,path:Path,name:str)->tuple[str,list[int|None]]:
         ext=path.suffix.lower();raw=path.read_bytes()
         if ext in {".txt",".md",".markdown"}:return raw.decode("utf-8",errors="replace"),[]
-        if ext in {".html",".htm"}:return re.sub(r"\s+"," ",re.sub(r"<[^>]+>"," ",html.unescape(raw.decode("utf-8",errors="replace")))),[]
+        if ext in {".html",".htm"}:
+            from bs4 import BeautifulSoup
+            soup=BeautifulSoup(raw.decode("utf-8",errors="replace"),"html.parser")
+            for tag in soup(["script","style","noscript"]):tag.decompose()
+            return "\n".join(soup.stripped_strings),[]
         if ext==".csv":return "\n".join(" | ".join(row) for row in csv.reader(io.StringIO(raw.decode("utf-8-sig",errors="replace")))),[]
         if ext==".json":return json.dumps(json.loads(raw.decode("utf-8")),ensure_ascii=False,indent=2),[]
         if ext==".pdf":
