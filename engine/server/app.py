@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile, File, Form
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel, Field
@@ -90,6 +90,7 @@ from ..modules.skills import (
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
 from ..modules.tool_runtime import ToolRuntime, ensure_builtin_tools
 from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
+from ..modules.knowledge import KnowledgeStore
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -265,6 +266,7 @@ class CreateApplicationReq(BaseModel):
     tool_ids: List[str] = Field(default_factory=list)
     skill_ids: List[str] = Field(default_factory=list)
     knowledge_base_ids: List[str] = Field(default_factory=list)
+    knowledge_base_bindings: List[Dict[str, Any]] = Field(default_factory=list)
     memory_bank_ids: List[str] = Field(default_factory=list)
     primary_memory_bank_id: Optional[str] = None
     memory_config: Dict[str, Any] = Field(default_factory=dict)
@@ -282,6 +284,7 @@ class UpdateApplicationReq(BaseModel):
     tool_ids: Optional[List[str]] = None
     skill_ids: Optional[List[str]] = None
     knowledge_base_ids: Optional[List[str]] = None
+    knowledge_base_bindings: Optional[List[Dict[str, Any]]] = None
     memory_bank_ids: Optional[List[str]] = None
     primary_memory_bank_id: Optional[str] = None
     memory_config: Optional[Dict[str, Any]] = None
@@ -355,6 +358,32 @@ class CreateConsoleResourceReq(BaseModel):
     name: str
     description: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class KnowledgeBaseReq(BaseModel):
+    name: str = Field(max_length=80)
+    description: str = ""
+    workspace_id: str = "local"
+    type: str = "document"
+    edition: str = "standard"
+    embedding_model: str = "hashing"
+    retrieval_mode: str = "hybrid"
+    chunk_strategy: str = "smart"
+    chunk_size: int = 600
+    chunk_overlap: int = 80
+    similarity_threshold: float = .15
+    top_k: int = 5
+    rerank_enabled: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class KnowledgeRetrieveReq(BaseModel):
+    knowledge_base_ids: List[str] = Field(default_factory=list)
+    query: str
+    mode: str = "hybrid"
+    top_k: int = 5
+    threshold: float = .15
+    labels: List[str] = Field(default_factory=list)
+    document_ids: List[str] = Field(default_factory=list)
+    bindings: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class RegisterReq(BaseModel):
@@ -486,6 +515,7 @@ def create_app(
     console_resources = console_resource_store or ConsoleResourceStore(
         os.environ.get("CONSOLE_RESOURCE_STORE_ROOT") or "runs/console_resources"
     )
+    knowledge = KnowledgeStore(os.environ.get("KNOWLEDGE_STORE_ROOT") or str(applications.root_dir.parent / "knowledge"))
     api_keys = api_key_store or ApiKeyStore(os.environ.get("API_KEY_STORE_ROOT") or "runs/api_keys")
     api_audit = api_audit_store or ApiAuditStore(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
@@ -524,8 +554,9 @@ def create_app(
         tool_catalog_store=tools,
         model_connection_store=model_connections,
         mcp_config_store=mcp_configs,
+        knowledge_store=knowledge,
     )
-    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -1060,6 +1091,10 @@ def create_app(
             run_input = {
                 **record.input,
                 "run_id": record.id,
+                "__run_id__": record.id,
+                "__workflow_id__": record.workflow_id,
+                "__application_id__": str(record.metadata.get("application_id") or ""),
+                "__owner_user_id__": str(record.metadata.get("owner_user_id") or "local-user"),
                 "task_id": record.id,
                 "project_id": str(record.metadata.get("application_id") or record.workflow_id or "default-project"),
                 "global_id": str(record.metadata.get("owner_user_id") or "default"),
@@ -1769,6 +1804,7 @@ def create_app(
                 tool_ids=req.tool_ids,
                 skill_ids=req.skill_ids,
                 knowledge_base_ids=req.knowledge_base_ids,
+                knowledge_base_bindings=req.knowledge_base_bindings,
                 memory_bank_ids=memory_ids,
                 primary_memory_bank_id=primary_memory_id,
                 memory_config=normalize_memory_config(req.memory_config),
@@ -1795,6 +1831,7 @@ def create_app(
                         "tool_ids": req.tool_ids,
                         "skill_ids": req.skill_ids,
                         "knowledge_base_ids": req.knowledge_base_ids,
+                        "knowledge_base_bindings": req.knowledge_base_bindings,
                         "memory_bank_ids": memory_ids,
                         "primary_memory_bank_id": primary_memory_id,
                         "memory_config": normalize_memory_config(req.memory_config),
@@ -1867,6 +1904,7 @@ def create_app(
                     "tool_ids": req.tool_ids if req.tool_ids is not None else current.tool_ids,
                     "skill_ids": req.skill_ids if req.skill_ids is not None else current.skill_ids,
                     "knowledge_base_ids": req.knowledge_base_ids if req.knowledge_base_ids is not None else current.knowledge_base_ids,
+                    "knowledge_base_bindings": req.knowledge_base_bindings if req.knowledge_base_bindings is not None else current.knowledge_base_bindings,
                     "memory_bank_ids": memory_ids,
                     "primary_memory_bank_id": primary_memory_id,
                     "memory_config": normalize_memory_config(req.memory_config if req.memory_config is not None else current.memory_config),
@@ -1888,6 +1926,7 @@ def create_app(
                             "tool_ids": updated.tool_ids,
                             "skill_ids": updated.skill_ids,
                             "knowledge_base_ids": updated.knowledge_base_ids,
+                            "knowledge_base_bindings": updated.knowledge_base_bindings,
                             "memory_bank_ids": updated.memory_bank_ids,
                             "primary_memory_bank_id": updated.primary_memory_bank_id,
                             "memory_config": updated.memory_config,
@@ -2769,9 +2808,13 @@ def create_app(
         return {"installed": True, "component": record.to_dict(), "message": "组件已安装，可在组件管理中查看"}
 
     @app.get("/api/resources/{kind}")
-    def list_console_resources(kind: str) -> List[Dict[str, Any]]:
+    def list_console_resources(kind: str, request: Request) -> List[Dict[str, Any]]:
         if kind not in resource_kinds:
             raise HTTPException(status_code=404, detail="不支持的资源类型")
+        # Compatibility bridge for older agent/workflow editors. New code uses
+        # /api/knowledge-bases; never recreate the old generic-resource shell.
+        if kind == "knowledge-bases":
+            return [item.to_dict() for item in knowledge.list_bases(_request_user_id(request))]
         return [item.to_dict() for item in console_resources.list(kind)]
 
     @app.post("/api/resources/{kind}")
@@ -2991,6 +3034,94 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         return {"ok": True}
+
+    # ------------------------- 企业知识库 ------------------------- #
+    def _owned_kb(kb_id: str, request: Request):
+        try:
+            return knowledge.get_base(kb_id, _request_user_id(request))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/api/knowledge-bases")
+    def list_knowledge_bases(request: Request) -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in knowledge.list_bases(_request_user_id(request))]
+
+    @app.post("/api/knowledge-bases")
+    def create_knowledge_base(req: KnowledgeBaseReq, request: Request) -> Dict[str, Any]:
+        try:return knowledge.create_base(req.model_dump(), _request_user_id(request)).to_dict()
+        except ValueError as exc:raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.get("/api/knowledge-bases/{kb_id}")
+    def get_knowledge_base(kb_id: str, request: Request) -> Dict[str, Any]: return _owned_kb(kb_id,request).to_dict()
+
+    @app.put("/api/knowledge-bases/{kb_id}")
+    def update_knowledge_base(kb_id: str, req: KnowledgeBaseReq, request: Request) -> Dict[str, Any]:
+        try:return knowledge.update_base(kb_id,req.model_dump(exclude_unset=True),_request_user_id(request)).to_dict()
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc))
+
+    @app.delete("/api/knowledge-bases/{kb_id}")
+    def delete_knowledge_base(kb_id: str, request: Request) -> Dict[str, Any]:
+        _owned_kb(kb_id,request)
+        references=[app.id for app in applications.list() if kb_id in app.knowledge_base_ids]
+        if references:raise HTTPException(status_code=409,detail="知识库仍被应用引用，请先在应用中明确解除挂载："+"、".join(references))
+        knowledge.delete_base(kb_id,_request_user_id(request));return {"ok":True}
+
+    @app.post("/api/knowledge-bases/{kb_id}/documents")
+    async def upload_knowledge_document(kb_id: str, request: Request, file: UploadFile = File(...), labels: str = Form("")) -> Dict[str, Any]:
+        _owned_kb(kb_id,request)
+        try:
+            parsed_labels=json.loads(labels) if labels else []
+            return knowledge.add_document(kb_id,_request_user_id(request),file.filename or "",await file.read(),parsed_labels).to_dict()
+        except FileExistsError as exc:raise HTTPException(status_code=409,detail=str(exc))
+        except (ValueError,json.JSONDecodeError) as exc:raise HTTPException(status_code=422,detail=str(exc))
+
+    @app.get("/api/knowledge-bases/{kb_id}/documents")
+    def list_knowledge_documents(kb_id:str,request:Request)->List[Dict[str,Any]]:
+        _owned_kb(kb_id,request);return [d.to_dict() for d in knowledge.list_documents(kb_id)]
+    @app.get("/api/knowledge-bases/{kb_id}/documents/{document_id}")
+    def get_knowledge_document(kb_id:str,document_id:str,request:Request)->Dict[str,Any]:
+        _owned_kb(kb_id,request)
+        try:return knowledge.get_document(kb_id,document_id).to_dict()
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+    @app.delete("/api/knowledge-bases/{kb_id}/documents/{document_id}")
+    def delete_knowledge_document(kb_id:str,document_id:str,request:Request)->Dict[str,Any]:
+        try:knowledge.delete_document(kb_id,document_id,_request_user_id(request));return {"ok":True}
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+    @app.post("/api/knowledge-bases/{kb_id}/documents/{document_id}/reparse")
+    def reparse_knowledge_document(kb_id:str,document_id:str,request:Request)->Dict[str,Any]:
+        try:return knowledge.reparse(kb_id,document_id,_request_user_id(request)).to_dict()
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+    @app.post("/api/knowledge-bases/{kb_id}/documents/{document_id}/reindex")
+    def reindex_knowledge_document(kb_id:str,document_id:str,request:Request)->Dict[str,Any]:
+        try:return knowledge.reindex(kb_id,document_id,_request_user_id(request)).to_dict()
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+    @app.get("/api/knowledge-bases/{kb_id}/chunks")
+    def list_knowledge_chunks(kb_id:str,request:Request,document_id:Optional[str]=None)->List[Dict[str,Any]]:
+        _owned_kb(kb_id,request);return [c.to_dict() for c in knowledge.list_chunks(kb_id,document_id)]
+    @app.post("/api/knowledge-bases/{kb_id}/chunks")
+    async def create_knowledge_chunk(kb_id:str,request:Request)->Dict[str,Any]:
+        try:return knowledge.save_chunk(kb_id,await request.json(),_request_user_id(request)).to_dict()
+        except (KeyError,ValueError) as exc:raise HTTPException(status_code=422,detail=str(exc))
+    @app.put("/api/knowledge-bases/{kb_id}/chunks/{chunk_id}")
+    async def update_knowledge_chunk(kb_id:str,chunk_id:str,request:Request)->Dict[str,Any]:
+        try:return knowledge.save_chunk(kb_id,await request.json(),_request_user_id(request),chunk_id).to_dict()
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc))
+    @app.delete("/api/knowledge-bases/{kb_id}/chunks/{chunk_id}")
+    def delete_knowledge_chunk(kb_id:str,chunk_id:str,request:Request)->Dict[str,Any]:knowledge.delete_chunk(kb_id,chunk_id,_request_user_id(request));return {"ok":True}
+    def _retrieve(req:KnowledgeRetrieveReq,request:Request):
+        try:return knowledge.retrieve(req.knowledge_base_ids,req.query,owner=_request_user_id(request),mode=req.mode,top_k=req.top_k,threshold=req.threshold,labels=req.labels,document_ids=req.document_ids,bindings=req.bindings)
+        except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc))
+    @app.post("/api/knowledge-retrieval")
+    def knowledge_retrieval(req:KnowledgeRetrieveReq,request:Request)->Dict[str,Any]:return _retrieve(req,request)
+    @app.post("/api/knowledge-bases/{kb_id}/retrieval-test")
+    def knowledge_retrieval_test(kb_id:str,req:KnowledgeRetrieveReq,request:Request)->Dict[str,Any]:req.knowledge_base_ids=[kb_id];return _retrieve(req,request)
+    @app.get("/api/knowledge-bases/{kb_id}/logs")
+    def knowledge_logs(kb_id:str,request:Request)->List[Dict[str,Any]]:_owned_kb(kb_id,request);return knowledge.logs(kb_id)
+    @app.get("/api/knowledge-bases/{kb_id}/statistics")
+    def knowledge_statistics(kb_id:str,request:Request)->Dict[str,Any]:_owned_kb(kb_id,request);return knowledge.statistics(kb_id)
 
     return app
 
