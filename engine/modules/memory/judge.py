@@ -94,6 +94,9 @@ class OpenAIMemoryJudge:
             )
         self._model = model
         self._temperature = temperature
+        self.call_count = 0
+        self.parse_error_count = 0
+        self.thinking_disabled = True
         self._client = openai.OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
             base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
@@ -121,7 +124,10 @@ class OpenAIMemoryJudge:
             ],
             temperature=self._temperature,
             response_format={"type": "json_object"},
+            max_tokens=500,
+            extra_body={"thinking": {"type": "disabled"}},
         )
+        self.call_count += 1
 
         content = response.choices[0].message.content or ""
         try:
@@ -136,6 +142,7 @@ class OpenAIMemoryJudge:
                     return result.get("actions", [])
                 except json.JSONDecodeError:
                     pass
+            self.parse_error_count += 1
             return []
 
 

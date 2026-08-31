@@ -16,8 +16,17 @@ from engine.experiments import (
     run_workflow_experiment,
 )
 from engine.experiments.types import MemoryExample, SkillExample
-from engine.experiments.datasets import load_memory_dataset
+from engine.experiments.datasets import load_memory_dataset, memory_examples_to_rows
 from engine.experiments.long_task import memory_contains_expected
+from engine.experiments.memory import (
+    _disable_mem0_thinking,
+    _engine_memory_context,
+    _engine_retrieved_text,
+    _mem0_source_text,
+    _qa_judge_prompt,
+    _yes_verdict,
+)
+from engine.modules.memory.judge import OpenAIMemoryJudge
 
 
 @pytest.mark.parametrize(
@@ -112,6 +121,173 @@ def test_memory_control_baselines_report_tokens(tmp_path):
     assert no_memory.summary()["pass_rate"] == 0.0
     assert full_context.summary()["pass_rate"] == 1.0
     assert full_context.summary()["avg_context_tokens"] > no_memory.summary()["avg_context_tokens"]
+
+
+def test_longmemeval_judge_accepts_only_explicit_yes_verdict():
+    assert _yes_verdict("yes")
+    assert _yes_verdict("Yes.")
+    assert not _yes_verdict("no")
+    assert not _yes_verdict("The answer says yes, but it is incorrect.")
+
+
+def test_longmemeval_judge_prompt_uses_task_specific_criterion():
+    example = MemoryExample(
+        id="temporal-question",
+        question="How many days passed?",
+        answer="six days",
+        memories=["The event dates were recorded."],
+        source="longmemeval",
+        metadata={"question_type": "temporal-reasoning"},
+    )
+
+    prompt = _qa_judge_prompt(example, "It was 7 days.")
+
+    assert "off-by-one" in prompt
+    assert "six days" in prompt
+
+
+def test_processed_memory_dataset_preserves_question_type_metadata(tmp_path):
+    original = MemoryExample(
+        id="q1",
+        question="When did it happen?",
+        answer="Tuesday",
+        memories=["It happened on Tuesday."],
+        source="longmemeval",
+        metadata={"question_type": "temporal-reasoning"},
+    )
+    dataset = tmp_path / "processed.jsonl"
+    import json
+    dataset.write_text(
+        json.dumps(memory_examples_to_rows([original])[0], ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_memory_dataset(dataset, source="longmemeval")
+
+    assert loaded[0].metadata["question_type"] == "temporal-reasoning"
+
+
+def test_mem0_requests_disable_deepseek_thinking():
+    calls = []
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            calls.append(kwargs)
+            return "response"
+
+    class Object:
+        pass
+
+    memory = Object()
+    memory.llm = Object()
+    memory.llm.client = Object()
+    memory.llm.client.chat = Object()
+    memory.llm.client.chat.completions = Completions()
+
+    _disable_mem0_thinking(memory)
+    result = memory.llm.client.chat.completions.create(
+        model="deepseek-v4-flash",
+        extra_body={"unrelated": "preserved", "thinking": {"type": "enabled"}},
+    )
+
+    assert result == "response"
+    assert calls[0]["extra_body"] == {
+        "unrelated": "preserved",
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_mem0_retrieval_metrics_use_source_session_provenance():
+    example = MemoryExample(
+        id="q1",
+        question="What was the fare?",
+        answer="$6",
+        memories=["irrelevant session", "The taxi cost $14 and the train cost $8."],
+        evidence=["The taxi cost $14 and the train cost $8."],
+        source="longmemeval",
+    )
+    extracted = {
+        "memory": "User paid more for a taxi.",
+        "metadata": {"index": 1},
+    }
+
+    assert _mem0_source_text(extracted, example) == example.evidence[0]
+
+
+def test_engine_memory_examples_use_isolated_project_scopes():
+    first = MemoryExample(
+        id="q1",
+        question="Q1",
+        answer="A1",
+        memories=["history one"],
+        source="longmemeval",
+    )
+    second = MemoryExample(
+        id="q2",
+        question="Q2",
+        answer="A2",
+        memories=["history two"],
+        source="longmemeval",
+    )
+
+    first_context = _engine_memory_context(first)
+    second_context = _engine_memory_context(second)
+
+    assert first_context.project_id != second_context.project_id
+    assert first_context.project_id == "longmemeval-q1"
+    assert second_context.project_id == "longmemeval-q2"
+
+
+def test_engine_retrieval_hydrates_archived_raw_text():
+    class Item:
+        raw_ref = "project_archive/example.md"
+        content = "truncated summary"
+
+    class Store:
+        def expand(self, item):
+            assert item.raw_ref
+            return "full archived session with the answer"
+
+    assert _engine_retrieved_text(Store(), Item()) == "full archived session with the answer"
+
+
+def test_memory_update_judge_disables_thinking_and_tracks_calls():
+    calls = []
+
+    class Message:
+        content = '{"actions":[{"id":"old","action":"update"}]}'
+
+    class Choice:
+        message = Message()
+
+    class Response:
+        choices = [Choice()]
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return Response()
+
+    class Object:
+        pass
+
+    judge = OpenAIMemoryJudge.__new__(OpenAIMemoryJudge)
+    judge._model = "deepseek-v4-flash"
+    judge._temperature = 0.0
+    judge.call_count = 0
+    judge.parse_error_count = 0
+    judge.thinking_disabled = True
+    judge._client = Object()
+    judge._client.chat = Object()
+    judge._client.chat.completions = Completions()
+
+    actions = judge.judge("new", [{"id": "old", "content": "old"}])
+
+    assert actions == [{"id": "old", "action": "update"}]
+    assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert calls[0]["max_tokens"] == 500
+    assert judge.call_count == 1
+    assert judge.parse_error_count == 0
 
 
 def test_long_task_joint_experiment_exercises_all_controls(tmp_path):

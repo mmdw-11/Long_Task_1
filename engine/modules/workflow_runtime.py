@@ -30,6 +30,8 @@ class WorkflowNodeRuntimeFactory:
             config = spec.config
             if kind == "start":
                 return {"input": state.get("input", state)}
+            if kind in {"loop_start", "loop_end"}:
+                return {}
             if kind == "end":
                 value = _get(state, str(config.get("output_field") or "input"))
                 return {"input": value, "workflow_output": value, spec.name: value}
@@ -79,10 +81,35 @@ class WorkflowNodeRuntimeFactory:
                 return {key: rendered, "input": rendered, str(config.get("route_key") or f"route_{spec.id}"): str(config.get("route") or "next")}
             if kind == "loop":
                 counter_key = f"__loop_{spec.id}"
-                count = int(state.get(counter_key) or 0) + 1
+                count = int(state.get(counter_key) or 0)
                 limit = max(1, min(100, int(config.get("max_iterations") or 3)))
-                route = str(config.get("continue_route") if count < limit else config.get("done_route"))
-                return {counter_key: count, str(config.get("route_key") or f"route_{spec.id}"): route}
+                route_key = str(config.get("route_key") or f"route_{spec.id}")
+                continue_route = str(config.get("continue_route") or "continue")
+                done_route = str(config.get("done_route") or "done")
+                termination_field = str(config.get("termination_field") or "").strip()
+                terminated = bool(termination_field) and _compare(
+                    _get(state, termination_field),
+                    config.get("termination_value"),
+                    str(config.get("termination_operator") or "equals"),
+                )
+                updates: Dict[str, Any] = {}
+                if str(config.get("loop_type") or "count") == "array":
+                    items = _get(state, str(config.get("items_path") or "input.items"))
+                    values = items if isinstance(items, list) else []
+                    should_continue = not terminated and count < min(limit, len(values))
+                    if should_continue:
+                        updates[str(config.get("item_field") or "loop_item")] = values[count]
+                        updates[str(config.get("index_field") or "loop_index")] = count
+                else:
+                    should_continue = not terminated and count < limit
+                if should_continue:
+                    updates[counter_key] = count + 1
+                    updates[route_key] = continue_route
+                else:
+                    updates[counter_key] = count
+                    updates[route_key] = done_route
+                    updates[str(config.get("output_field") or "loop_output")] = state.get("input")
+                return updates
             if kind == "batch":
                 items = _get(state, str(config.get("items_path") or "input.items"))
                 values = items if isinstance(items, list) else []
