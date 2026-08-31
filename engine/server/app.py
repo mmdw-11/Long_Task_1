@@ -866,8 +866,20 @@ def create_app(
             config = item.get("config") or {}
             if kind == "tool" and not config.get("tool_id"):
                 errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
-            if kind in {"condition", "intent", "loop"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
+            if kind in {"condition", "intent", "loop", "batch"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
                 errors.append(f"逻辑节点“{item.get('name')}”尚未配置分支连线")
+            if kind == "intent" and not (config.get("model") or item.get("model")):
+                errors.append(f"意图分类节点“{item.get('name')}”尚未选择模型")
+            if kind == "script" and config.get("code") and not config.get("output_field"):
+                errors.append(f"脚本节点“{item.get('name')}”尚未配置输出字段")
+            if kind in {"loop", "batch"}:
+                arrays = config.get("input_arrays") or []
+                if config.get("loop_type") == "array" or kind == "batch":
+                    if not arrays or any(not value.get("path") or not value.get("item_field") for value in arrays):
+                        errors.append(f"{item.get('name')}的输入数组配置不完整")
+                child_ids = set(item.get("children") or [])
+                if any(str((child.get("config") or {}).get("node_kind")) in {"loop", "batch"} for child in agents if child.get("id") in child_ids):
+                    errors.append(f"{item.get('name')}内不能嵌套循环或批处理")
         return list(dict.fromkeys(errors))
 
     def _append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1050,8 +1062,9 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict()) if is_visual_workflow else None
             compiled = target.build_graph(
-                node_factory=workflow_runtime_factory if is_visual_workflow else runtime_factory,
+                node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
             )
             run_input = {
@@ -1066,11 +1079,14 @@ def create_app(
                 record.recursion_limit,
                 run_id=record.id,
             ):
+                child_events: List[Dict[str, Any]] = []
                 if event.get("type") == "node_start":
                     record.metadata["active_agent"] = event.get("node")
                     event["message"] = f"进入 {event.get('node')}，开始处理当前步骤"
                 elif event.get("type") == "node_end":
                     update = dict(event.get("update") or {})
+                    child_events = list(update.pop("__runtime_child_events__", []) or [])
+                    event["update"] = update
                     messages = list(update.get("messages") or [])
                     latest_message = messages[-1] if messages else {}
                     result = dict(latest_message.get("result") or {}) if isinstance(latest_message, dict) else {}
@@ -1092,6 +1108,13 @@ def create_app(
                     return
                 _append_event(record, event)
                 if event.get("type") == "node_end":
+                    for child_event in child_events:
+                        child_event["message"] = child_event.get("message") or (
+                            f"{child_event.get('node')} 已完成批处理项"
+                            if child_event.get("type") == "node_end"
+                            else f"进入 {child_event.get('node')}，开始处理批处理项"
+                        )
+                        _append_event(record, child_event)
                     for tool_call in event.get("tool_calls") or []:
                         _append_event(
                             record,
