@@ -293,6 +293,14 @@ def _memory_example_from_row(row: Dict[str, Any], *, source: str, index: int) ->
     memories = _memory_texts(row)
     if not question or not answer or not memories:
         return None
+    embedded_metadata = dict(row.get("metadata") or {})
+    top_level_metadata = {
+        k: v
+        for k, v in row.items()
+        if k not in {
+            "question", "answer", "haystack_sessions", "memories", "evidence", "metadata"
+        }
+    }
     return MemoryExample(
         id=str(row.get("question_id") or row.get("id") or f"{source}-{index:05d}"),
         question=question,
@@ -301,7 +309,7 @@ def _memory_example_from_row(row: Dict[str, Any], *, source: str, index: int) ->
         evidence=_evidence_texts(row),
         trajectory_id=str(row.get("trajectory_id") or row.get("conversation_id") or row.get("session_id") or row.get("parent_id") or row.get("id") or ""),
         source=source,
-        metadata={k: v for k, v in row.items() if k not in {"question", "answer", "haystack_sessions", "memories", "evidence"}},
+        metadata={**embedded_metadata, **top_level_metadata},
     )
 
 
