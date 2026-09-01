@@ -206,6 +206,22 @@ def test_tested_model_connection_can_be_bound_to_application(tmp_path, monkeypat
     assert response.json()["model"] == model.id
 
 
+def test_model_connection_api_accepts_direct_key_without_returning_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    models = ModelConnectionStore(tmp_path / "models")
+    client = TestClient(create_app(application_store=ApplicationStore(tmp_path / "apps"), model_connection_store=models))
+
+    response = client.post("/api/model-connections", json={
+        "name": "浏览器直接配置", "provider": "openai-compatible", "model_id": "browser-model",
+        "base_url": "https://models.example.com/v1", "api_key": "browser-entered-secret", "tier": "cloud",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["has_api_key"] is True
+    assert "browser-entered-secret" not in response.text
+    assert models.get(response.json()["id"]).api_key == "browser-entered-secret"
+
+
 def test_explicit_auto_cannot_publish_until_all_tier_defaults_are_ready(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
     client = TestClient(create_app(application_store=ApplicationStore(tmp_path / "apps")))

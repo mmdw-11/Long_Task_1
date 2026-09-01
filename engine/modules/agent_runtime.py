@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 from ..hooks import MEMORY_CONTEXT_TEXT_KEY
 from ..modules.context import CONTEXT_INJECTION_TEXT_KEY
 from ..modules.execution import ExecutorRegistry, InferenceResult, ResilientInferenceRunner
-from ..modules.model_connections import ModelConnectionStore
+from ..modules.model_connections import ModelConnectionStore, connection_api_key
 from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
 from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity
@@ -62,12 +62,13 @@ class AgentRuntimeFactory:
 
         async def _run(state: Dict[str, Any]) -> Dict[str, Any]:
             citations=[]
+            retrieval_metadata={}
             kb_ids=list(spec.config.get("knowledge_base_ids") or [])
             if self.knowledge_store is not None and kb_ids:
                 owner=str(state.get("__owner_user_id__") or "local-user")
                 bindings={str(x.get("knowledge_base_id") or x.get("id")):x for x in spec.config.get("knowledge_base_bindings",[]) if isinstance(x,dict)}
                 retrieved=self.knowledge_store.retrieve(kb_ids,self._state_input_text(state),owner=owner,bindings=bindings,application_id=str(state.get("__application_id__") or ""),workflow_id=str(state.get("__workflow_id__") or ""),run_id=str(state.get("__run_id__") or ""))
-                state["__knowledge_context__"]=retrieved["context"];citations=retrieved["citations"]
+                state["__knowledge_context__"]=retrieved["context"];citations=retrieved["citations"];retrieval_metadata=retrieved["retrieval_metadata"]
             prompt = self._build_prompt(spec, state)
             # Tool routing must only inspect the user's task. The expanded
             # prompt contains internal identifiers such as ``todo-1`` which
@@ -89,7 +90,7 @@ class AgentRuntimeFactory:
             system_prompt = self._render_variables(spec.sys_prompt, state)
             result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
                 request, prompt, system_prompt
-            ) if self.model_connections is not None and self.model_connections.auto_status()["ready"] else runner.run(
+            ) if self.model_connections is not None else runner.run(
                 resource_request=request,
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -101,7 +102,7 @@ class AgentRuntimeFactory:
                 clean_prompt = f"用户问题：{self._state_input_text(state)}\n\n请直接给出自然、简洁的回答。不要复述系统提示、Agent 配置、上下文账本、执行步骤或内部判断。"
                 rewritten = self._run_pinned_model(spec.model, clean_prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
                     request, clean_prompt, system_prompt
-                ) if self.model_connections is not None and self.model_connections.auto_status()["ready"] else runner.run(
+                ) if self.model_connections is not None else runner.run(
                     resource_request=request,
                     prompt=clean_prompt,
                     system_prompt=system_prompt,
@@ -131,6 +132,7 @@ class AgentRuntimeFactory:
                 spec.name: result.text,
                 "__runtime_tool_calls__": tool_calls,
                 "citations": citations,
+                "retrieval_metadata": retrieval_metadata,
                 "messages": [
                     {
                         "agent": spec.name,
@@ -417,7 +419,7 @@ class AgentRuntimeFactory:
             if not connection.runnable:
                 raise ValueError("指定模型连接未启用或尚未测试成功")
             from openai import OpenAI
-            api_key = os.environ.get(connection.api_key_env, "") if connection.api_key_env else "not-needed"
+            api_key = connection_api_key(connection) or "not-needed"
             response = OpenAI(api_key=api_key or "not-needed", base_url=connection.base_url, timeout=60).chat.completions.create(model=connection.model_id,messages=[{"role":"system","content":system_prompt or "Answer concisely and accurately."},{"role":"user","content":prompt}],temperature=0)
             return InferenceResult(text=response.choices[0].message.content or "",executor="ModelConnectionExecutor",endpoint=connection.base_url,model=connection.model_id,metadata={"provider":connection.provider,"connection_id":connection.id})
         except Exception as exc:
