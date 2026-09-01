@@ -1,9 +1,10 @@
-"""File-backed model connection catalog with write-only credential references."""
+"""File-backed model connection catalog with write-only credentials."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +16,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalise_base_url(value: Any) -> str:
+    """Recover historical "model / https://host/v1" values into a real URL."""
+    raw = str(value or "").strip()
+    match = re.search(r"https?://[^\s]+", raw)
+    return (match.group(0) if match else raw).rstrip("/")
+
+
+def connection_api_key(item: "ModelConnection") -> str:
+    """Prefer the user-entered key and retain compatibility with old DeepSeek rows."""
+    if item.api_key:
+        return item.api_key
+    if item.api_key_env and os.environ.get(item.api_key_env):
+        return os.environ[item.api_key_env]
+    if item.provider == "deepseek":
+        return os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+    return ""
+
+
 @dataclass
 class ModelConnection:
     id: str
@@ -22,6 +41,9 @@ class ModelConnection:
     provider: str
     model_id: str
     base_url: str
+    # This value is persisted for the local service but deliberately excluded
+    # from every API response. It is accepted only on create/update requests.
+    api_key: str = ""
     api_key_env: str = ""
     tier: str = "cloud"
     auto_default: bool = False
@@ -32,11 +54,15 @@ class ModelConnection:
     updated_at: str = field(default_factory=_now)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"id":self.id,"name":self.name,"provider":self.provider,"model_id":self.model_id,"base_url":self.base_url,"api_key_env":self.api_key_env,"tier":self.tier,"auto_default":self.auto_default,"enabled":self.enabled,"test_status":self.test_status,"configured":self.configured,"capabilities":list(self.capabilities),"created_at":self.created_at,"updated_at":self.updated_at}
+        """Public representation; API keys must never be returned to the browser."""
+        return {"id":self.id,"name":self.name,"provider":self.provider,"model_id":self.model_id,"base_url":self.base_url,"api_key_env":self.api_key_env,"has_api_key":bool(self.api_key),"tier":self.tier,"auto_default":self.auto_default,"enabled":self.enabled,"test_status":self.test_status,"configured":self.configured,"capabilities":list(self.capabilities),"created_at":self.created_at,"updated_at":self.updated_at}
+
+    def to_storage_dict(self) -> Dict[str, Any]:
+        return {**self.to_dict(), "api_key": self.api_key}
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.model_id and (not self.api_key_env or os.environ.get(self.api_key_env)))
+        return bool(self.base_url and self.model_id and (connection_api_key(self) or not self.api_key_env))
 
     @property
     def runnable(self) -> bool:
@@ -50,7 +76,7 @@ class ModelConnection:
         tier = str(data.get("tier") or "cloud")
         if tier not in {"device","edge","cloud"}:
             raise ValueError("model connection tier must be device, edge or cloud")
-        return cls(id=str(data.get("id") or f"model-{uuid.uuid4().hex[:12]}"),name=name,provider=str(data.get("provider") or "openai-compatible"),model_id=model_id,base_url=str(data.get("base_url") or "").rstrip("/"),api_key_env=str(data.get("api_key_env") or ""),tier=tier,auto_default=bool(data.get("auto_default",False)),enabled=bool(data.get("enabled",True)),test_status=str(data.get("test_status") or "untested"),capabilities=[str(x) for x in data.get("capabilities") or ["chat"]],created_at=str(data.get("created_at") or _now()),updated_at=str(data.get("updated_at") or _now()))
+        return cls(id=str(data.get("id") or f"model-{uuid.uuid4().hex[:12]}"),name=name,provider=str(data.get("provider") or "openai-compatible"),model_id=model_id,base_url=_normalise_base_url(data.get("base_url")),api_key=str(data.get("api_key") or ""),api_key_env=str(data.get("api_key_env") or ""),tier=tier,auto_default=bool(data.get("auto_default",False)),enabled=bool(data.get("enabled",True)),test_status=str(data.get("test_status") or "untested"),capabilities=[str(x) for x in data.get("capabilities") or ["chat"]],created_at=str(data.get("created_at") or _now()),updated_at=str(data.get("updated_at") or _now()))
 
 
 class ModelConnectionStore:
@@ -66,7 +92,7 @@ class ModelConnectionStore:
         # Changing a tested connection invalidates its previous health result.
         if self.exists(item.id):
             previous = self.get(item.id)
-            if (previous.base_url, previous.model_id, previous.api_key_env) != (item.base_url, item.model_id, item.api_key_env):
+            if (previous.base_url, previous.model_id, previous.api_key, previous.api_key_env) != (item.base_url, item.model_id, item.api_key, item.api_key_env):
                 item.test_status = "untested"
         return self._write(item)
     def create(self, data: Dict[str, Any]) -> ModelConnection: return self.save(ModelConnection.from_dict(data))
@@ -98,7 +124,7 @@ class ModelConnectionStore:
             }
         return {"ready": all(item["ready"] for item in tiers.values()), "tiers": tiers}
     def _write(self, item: ModelConnection) -> ModelConnection:
-        item.updated_at=_now(); self._path(item.id).write_text(json.dumps(item.to_dict(),ensure_ascii=False,indent=2),encoding="utf-8"); return item
+        item.updated_at=_now(); self._path(item.id).write_text(json.dumps(item.to_storage_dict(),ensure_ascii=False,indent=2),encoding="utf-8"); return item
     def _path(self,item_id:str)->Path:return self.root/f"{''.join(c for c in item_id if c.isalnum() or c in '-_')}.json"
 
 

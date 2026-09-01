@@ -76,7 +76,7 @@ from ..modules.product_ops import (
     ToolConnectionStore,
     ToolRecord,
 )
-from ..modules.model_connections import MODEL_PRESETS, ModelConnection, ModelConnectionStore
+from ..modules.model_connections import MODEL_PRESETS, ModelConnection, ModelConnectionStore, connection_api_key
 from ..modules.external_imports import discover_mcp_tools, openapi_operations, parse_openapi, read_remote_document, read_skill_file, read_skill_git, read_skill_zip, validate_remote_url
 from ..modules.memory import HybridTieredMemoryStore, MemoryBankRuntime, MemoryContext, MemoryScope, list_bank_memories
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
@@ -1791,7 +1791,8 @@ def create_app(
     def update_model_connection(connection_id: str, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
             current = model_connections.get(connection_id)
-            return model_connections.save(ModelConnection.from_dict({**current.to_dict(), **req, "id": connection_id})).to_dict()
+            # Merge from storage so an omitted write-only api_key is retained.
+            return model_connections.save(ModelConnection.from_dict({**current.to_storage_dict(), **req, "id": connection_id})).to_dict()
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         except ValueError as exc:
@@ -1805,8 +1806,9 @@ def create_app(
             if not item.base_url:
                 raise ValueError("模型连接缺少 base_url")
             headers = {"Accept": "application/json"}
-            if item.api_key_env and os.environ.get(item.api_key_env):
-                headers["Authorization"] = f"Bearer {os.environ[item.api_key_env]}"
+            api_key = connection_api_key(item)
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
             request = urllib.request.Request(f"{item.base_url}/models", headers=headers)
             with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310 - URL is administrator configured
                 if response.status >= 400: raise ValueError(f"模型服务返回 HTTP {response.status}")
