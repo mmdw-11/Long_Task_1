@@ -1,7 +1,7 @@
 """Local, dependency-light enterprise knowledge-base domain and retrieval service."""
 from __future__ import annotations
 
-import csv, hashlib, html, io, json, math, re, sqlite3, time, uuid
+import csv, hashlib, io, json, math, re, sqlite3, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -104,8 +104,20 @@ class KnowledgeStore:
         if ext==".csv":return "\n".join(" | ".join(row) for row in csv.reader(io.StringIO(raw.decode("utf-8-sig",errors="replace")))),[]
         if ext==".json":return json.dumps(json.loads(raw.decode("utf-8")),ensure_ascii=False,indent=2),[]
         if ext==".pdf":
-            from pypdf import PdfReader
-            pages=[p.extract_text() or "" for p in PdfReader(io.BytesIO(raw)).pages];return "\n\f\n".join(pages),list(range(1,len(pages)+1))
+            # PyMuPDF preserves CJK character maps for many TeX/embedded-font
+            # PDFs where pypdf returns mojibake.  pypdf remains a lightweight
+            # fallback for installations that do not include PyMuPDF.
+            try:
+                import pymupdf
+                pdf=pymupdf.open(stream=raw,filetype="pdf")
+                pages=[page.get_text("text").strip() for page in pdf]
+            except ImportError:
+                from pypdf import PdfReader
+                pages=[page.extract_text() or "" for page in PdfReader(io.BytesIO(raw)).pages]
+            text=self._clean_pdf_text("\n\f\n".join(pages))
+            if not self._usable_pdf_text(text):
+                raise ValueError("PDF 未提取到可用文本（可能是扫描件或缺少字体映射），请先进行 OCR 后再上传")
+            return text,list(range(1,len(pages)+1))
         if ext==".docx":
             from docx import Document
             return "\n".join(p.text for p in Document(io.BytesIO(raw)).paragraphs),[]
@@ -164,6 +176,30 @@ class KnowledgeStore:
         kb=self.get_base(kb_id);kb.document_count=len(self.list_documents(kb_id));kb.chunk_count=len(self.list_chunks(kb_id));kb.status="ready";self._save_base(kb)
     @staticmethod
     def _mode(v):return str(v) if str(v) in {"dense","sparse","hybrid"} else "hybrid"
+    @staticmethod
+    def _usable_pdf_text(text:str)->bool:
+        """Reject empty/obviously-corrupted extraction instead of indexing it."""
+        visible=re.findall(r"[A-Za-z0-9\u4e00-\u9fff]",text)
+        if len(visible)<12:return False
+        replacement=text.count("\ufffd")
+        return replacement/max(1,len(text))<0.08
+    @staticmethod
+    def _clean_pdf_text(text:str)->str:
+        """Drop PDF layout artefacts such as table-of-contents dot leaders."""
+        pages=[]
+        for page in text.split("\f"):
+            cleaned=[]
+            for line in page.splitlines():
+                compact=line.strip()
+                # A text extractor may emit ``. . . .`` as one line or one
+                # dot per line.  Neither form is meaningful knowledge.
+                compact=re.sub(r"(?:[.·…]\s*){3,}"," ",compact)
+                compact=re.sub(r"\s{2,}"," ",compact).strip()
+                if not compact or re.fullmatch(r"[.。·•…\-_\s]+",compact):
+                    continue
+                cleaned.append(compact)
+            pages.append("\n".join(cleaned))
+        return "\f".join(pages)
     @staticmethod
     def _num(v,d,low,high):
         try:return max(low,min(high,int(v)))

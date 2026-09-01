@@ -26,6 +26,23 @@ def test_model_connection_store_never_returns_api_key_value(tmp_path, monkeypatc
     assert payload["test_status"] == "untested"
 
 
+def test_model_connection_accepts_direct_api_key_without_environment_variable(tmp_path):
+    store = ModelConnectionStore(tmp_path / "models")
+    item = store.create({
+        "name": "Direct credential model",
+        "provider": "openai-compatible",
+        "model_id": "direct-model",
+        "base_url": "https://models.example.com/v1",
+        "api_key": "direct-secret",
+        "tier": "cloud",
+    })
+
+    assert store.get(item.id).api_key == "direct-secret"
+    assert item.configured is True
+    assert item.to_dict()["has_api_key"] is True
+    assert "direct-secret" not in str(item.to_dict())
+
+
 def test_auto_requires_one_runnable_default_for_every_tier(tmp_path):
     store = ModelConnectionStore(tmp_path / "models")
     for tier in ("device", "edge", "cloud"):
