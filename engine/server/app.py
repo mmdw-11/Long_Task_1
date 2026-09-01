@@ -375,6 +375,24 @@ class KnowledgeBaseReq(BaseModel):
     rerank_enabled: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
+
+class KnowledgeBaseUpdateReq(BaseModel):
+    """Partial update payload; creation fields must not be required on PUT."""
+    name: Optional[str] = Field(default=None, max_length=80)
+    description: Optional[str] = None
+    workspace_id: Optional[str] = None
+    type: Optional[str] = None
+    edition: Optional[str] = None
+    embedding_model: Optional[str] = None
+    retrieval_mode: Optional[str] = None
+    chunk_strategy: Optional[str] = None
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    similarity_threshold: Optional[float] = None
+    top_k: Optional[int] = None
+    rerank_enabled: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
+
 class KnowledgeRetrieveReq(BaseModel):
     knowledge_base_ids: List[str] = Field(default_factory=list)
     query: str
@@ -1096,7 +1114,7 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
-            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict()) if is_visual_workflow else None
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge) if is_visual_workflow else None
             compiled = target.build_graph(
                 node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
@@ -1145,7 +1163,20 @@ def create_app(
                     runs.save(record)
                     return
                 _append_event(record, event)
+                if event.get("type") == "node_start":
+                    node_config=next((dict(item.get("config") or {}) for item in target.to_dict().get("agents",[]) if item.get("name")==event.get("node")),{})
+                    kb_ids=list(node_config.get("knowledge_base_ids") or [])
+                    if node_config.get("knowledge_base_id"): kb_ids.append(str(node_config["knowledge_base_id"]))
+                    if kb_ids:
+                        names=[]
+                        for kb_id in dict.fromkeys(kb_ids):
+                            try:names.append(knowledge.get_base(kb_id,str(record.metadata.get("owner_user_id") or "local-user")).name)
+                            except KeyError:names.append(kb_id)
+                        _append_event(record,{"type":"knowledge_retrieval_start","node":event.get("node"),"knowledge_base_ids":list(dict.fromkeys(kb_ids)),"knowledge_base_names":names,"message":f"{event.get('node')} 正在查询知识库：{'、'.join(names)}"})
                 if event.get("type") == "node_end":
+                    retrieval_metadata=dict((event.get("update") or {}).get("retrieval_metadata") or {})
+                    if retrieval_metadata:
+                        _append_event(record,{"type":"knowledge_retrieval_end","node":event.get("node"),"retrieval_metadata":retrieval_metadata,"citations":list((event.get("update") or {}).get("citations") or []),"message":f"{event.get('node')} 已完成知识库检索，命中 {retrieval_metadata.get('result_count',0)} 条，耗时 {retrieval_metadata.get('latency_ms','—')} ms"})
                     for child_event in child_events:
                         child_event["message"] = child_event.get("message") or (
                             f"{child_event.get('node')} 已完成批处理项"
@@ -3078,8 +3109,8 @@ def create_app(
     def get_knowledge_base(kb_id: str, request: Request) -> Dict[str, Any]: return _owned_kb(kb_id,request).to_dict()
 
     @app.put("/api/knowledge-bases/{kb_id}")
-    def update_knowledge_base(kb_id: str, req: KnowledgeBaseReq, request: Request) -> Dict[str, Any]:
-        try:return knowledge.update_base(kb_id,req.model_dump(exclude_unset=True),_request_user_id(request)).to_dict()
+    def update_knowledge_base(kb_id: str, req: KnowledgeBaseUpdateReq, request: Request) -> Dict[str, Any]:
+        try:return knowledge.update_base(kb_id,req.model_dump(exclude_unset=True,exclude_none=True),_request_user_id(request)).to_dict()
         except KeyError as exc:raise HTTPException(status_code=404,detail=str(exc))
         except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc))
 
