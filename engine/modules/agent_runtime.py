@@ -90,7 +90,7 @@ class AgentRuntimeFactory:
             system_prompt = self._render_variables(spec.sys_prompt, state)
             result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
                 request, prompt, system_prompt
-            ) if self.model_connections is not None and self.model_connections.auto_status()["ready"] else runner.run(
+            ) if self.model_connections is not None else runner.run(
                 resource_request=request,
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -102,7 +102,7 @@ class AgentRuntimeFactory:
                 clean_prompt = f"用户问题：{self._state_input_text(state)}\n\n请直接给出自然、简洁的回答。不要复述系统提示、Agent 配置、上下文账本、执行步骤或内部判断。"
                 rewritten = self._run_pinned_model(spec.model, clean_prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
                     request, clean_prompt, system_prompt
-                ) if self.model_connections is not None and self.model_connections.auto_status()["ready"] else runner.run(
+                ) if self.model_connections is not None else runner.run(
                     resource_request=request,
                     prompt=clean_prompt,
                     system_prompt=system_prompt,
