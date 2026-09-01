@@ -12,16 +12,24 @@ from .agent_runtime import AgentRuntimeFactory
 from .product_ops import ToolCatalogStore
 from .model_connections import ModelConnectionStore
 from .tool_runtime import ToolRuntime
+from .knowledge import KnowledgeStore
 from .workflow_scripts import run_workflow_script
 
 
 class WorkflowNodeRuntimeFactory:
     """Dispatch persisted ``config.node_kind`` values to executable nodes."""
 
-    def __init__(self, tools: ToolCatalogStore, models: ModelConnectionStore | None = None, graph: Dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        tools: ToolCatalogStore,
+        models: ModelConnectionStore | None = None,
+        graph: Dict[str, Any] | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+    ) -> None:
         self.tools = tools
         self.tool_runtime = ToolRuntime(tools)
-        self.agent_runtime = AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=models)
+        self.agent_runtime = AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=models, knowledge_store=knowledge_store)
+        self.knowledge_store = knowledge_store
         self.models = models
         self.graph = graph or {}
 
@@ -55,18 +63,17 @@ class WorkflowNodeRuntimeFactory:
                 output_key = str(config.get("output_field") or "tool_output")
                 return {output_key: result.get("result"), "input": result.get("result"), "__runtime_tool_calls__": [result]}
             if kind == "knowledge":
-                # 知识库资源目前只完成工作流挂载与持久化。检索适配器接入前，
-                # 节点安全透传上游输入并返回空文档列表，避免占位能力阻断发布
-                # 或让已发布工作流在运行时因“不支持节点类型”而失败。
-                value = state.get("input", state)
+                kb_ids = list(config.get("knowledge_base_ids") or [])
+                if config.get("knowledge_base_id"):
+                    kb_ids.append(str(config["knowledge_base_id"]))
+                if not self.knowledge_store or not kb_ids:
+                    raise RuntimeError("知识库节点未配置可用知识库")
+                query = _get(state, str(config.get("input_field") or "input"))
+                owner = str(state.get("__owner_user_id__") or "local-user")
+                result=self.knowledge_store.retrieve(kb_ids, str(query or ""), owner=owner, mode=str(config.get("mode") or "hybrid"), top_k=int(config.get("top_k") or 5), threshold=float(config.get("threshold") or .15), labels=list(config.get("labels") or []), workflow_id=str(state.get("__workflow_id__") or ""), run_id=str(state.get("__run_id__") or ""))
                 output_key = str(config.get("output_field") or "documents")
                 return {
-                    output_key: [],
-                    "input": value,
-                    "__knowledge_binding__": {
-                        "knowledge_base_id": str(config.get("knowledge_base_id") or ""),
-                        "retrieval_enabled": False,
-                    },
+                    output_key: result["documents"], "documents":result["documents"], "context":result["context"], "citations":result["citations"], "retrieval_metadata":result["retrieval_metadata"], "input": result["context"],
                 }
             if kind == "condition":
                 branches = config.get("branches") or _legacy_condition_branches(config)
@@ -194,7 +201,7 @@ class WorkflowNodeRuntimeFactory:
         if not start: raise RuntimeError("批处理子流程缺少批处理开始节点")
         child_graph = {"entry": start["id"], "agents": agents, "connections": connections}
         orchestrator = Orchestrator.from_dict(child_graph)
-        factory = WorkflowNodeRuntimeFactory(self.tools, self.models)
+        factory = WorkflowNodeRuntimeFactory(self.tools, self.models, graph=child_graph, knowledge_store=self.knowledge_store)
         compiled = orchestrator.build_graph(node_factory=factory, recursion_limit=50)
         events, output = [], state
         async for event in compiled.astream(state, 50):

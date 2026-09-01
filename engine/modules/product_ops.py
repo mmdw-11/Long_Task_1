@@ -368,6 +368,8 @@ class ApplicationRecord:
     tool_ids: List[str] = field(default_factory=list)
     skill_ids: List[str] = field(default_factory=list)
     knowledge_base_ids: List[str] = field(default_factory=list)
+    # Rich bindings are additive; legacy knowledge_base_ids remains readable.
+    knowledge_base_bindings: List[Dict[str, Any]] = field(default_factory=list)
     memory_bank_ids: List[str] = field(default_factory=list)
     primary_memory_bank_id: Optional[str] = None
     memory_config: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_MEMORY_CONFIG))
@@ -392,6 +394,7 @@ class ApplicationRecord:
             "tool_ids": list(self.tool_ids),
             "skill_ids": list(self.skill_ids),
             "knowledge_base_ids": list(self.knowledge_base_ids),
+            "knowledge_base_bindings": [dict(item) for item in self.knowledge_base_bindings],
             "memory_bank_ids": list(self.memory_bank_ids),
             "primary_memory_bank_id": self.primary_memory_bank_id,
             "memory_config": normalize_memory_config(self.memory_config),
@@ -423,6 +426,7 @@ class ApplicationRecord:
             tool_ids=[str(item) for item in data.get("tool_ids") or []],
             skill_ids=[str(item) for item in data.get("skill_ids") or []],
             knowledge_base_ids=[str(item) for item in data.get("knowledge_base_ids") or []],
+            knowledge_base_bindings=[dict(item) for item in data.get("knowledge_base_bindings") or [] if isinstance(item, dict)],
             memory_bank_ids=[str(item) for item in data.get("memory_bank_ids") or []],
             primary_memory_bank_id=(str(data.get("primary_memory_bank_id")) if data.get("primary_memory_bank_id") else None),
             memory_config=normalize_memory_config(data.get("memory_config")),
@@ -453,6 +457,7 @@ class ApplicationStore:
         tool_ids: Optional[List[str]] = None,
         skill_ids: Optional[List[str]] = None,
         knowledge_base_ids: Optional[List[str]] = None,
+        knowledge_base_bindings: Optional[List[Dict[str, Any]]] = None,
         memory_bank_ids: Optional[List[str]] = None,
         primary_memory_bank_id: Optional[str] = None,
         memory_config: Optional[Dict[str, Any]] = None,
@@ -471,6 +476,7 @@ class ApplicationStore:
                 "tool_ids": tool_ids or [],
                 "skill_ids": skill_ids or [],
                 "knowledge_base_ids": knowledge_base_ids or [],
+                "knowledge_base_bindings": knowledge_base_bindings or [],
                 "memory_bank_ids": memory_bank_ids or [],
                 "primary_memory_bank_id": primary_memory_bank_id or ((memory_bank_ids or [None])[0]),
                 "memory_config": normalize_memory_config(memory_config),
