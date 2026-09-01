@@ -5,6 +5,8 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
+
 from engine.modules.agent_runtime import AgentRuntimeFactory
 from engine.modules.model_connections import ModelConnectionStore
 from engine.orchestrator import AgentSpec
@@ -54,3 +56,14 @@ def test_agent_uses_directly_configured_model_connection(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_auto_does_not_fall_back_to_environment_models_when_connections_are_unready(tmp_path):
+    """An explicit AUTO choice must use the UI connection catalog exclusively."""
+    store = ModelConnectionStore(tmp_path / "models")
+    node = AgentRuntimeFactory(model_connection_store=store)(AgentSpec(
+        id="agent-auto", name="AUTO agent", model="auto", sys_prompt="请简洁回答。"
+    ))
+
+    with pytest.raises(RuntimeError, match="AUTO 尚未就绪：端、边、云模型未配置可用的默认连接"):
+        asyncio.run(node.invoke({"input": "请回答这条问题"}))
