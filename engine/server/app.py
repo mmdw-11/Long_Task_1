@@ -89,7 +89,7 @@ from ..modules.skills import (
     SkillTraceStore,
 )
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
-from ..modules.tools import MCPAuthorizationRequired, MCPAuthorizationStore, ToolRuntime, complete_authorization, ensure_builtin_tools, start_authorization
+from ..modules.tools import GMAIL_STATIC_OAUTH_SCHEMA, MCPAuthorizationRequired, MCPAuthorizationStore, ToolRuntime, complete_authorization, ensure_builtin_tools, inspect_connection, missing_required, start_authorization
 from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
 from ..modules.knowledge import KnowledgeStore
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
@@ -2698,6 +2698,7 @@ def create_app(
         {"slug":"local-demo","name":"本地演示 MCP","provider":"AgentForge","category":"开发测试","description":"零权限 JSON-RPC 演示服务，用于验证 MCP 发现、选择与调用链。","cover":"violet","mcp_url":"http://127.0.0.1:8000/mcp/demo","verified":True,"tools":[{"name":"preview_email","title":"邮件预览","description":"仅生成邮件预览，不发送真实邮件"},{"name":"lookup_demo","title":"演示检索","description":"返回本地演示检索结果"}]},
         {"slug":"context7","name":"Context7 文档 MCP","provider":"Context7","category":"开发工具","description":"查询公开的软件库与框架最新文档；无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"mint","mcp_url":"https://mcp.context7.com/mcp","verified":True,"tools":[{"name":"resolve-library-id","title":"解析文档库","description":"把库名解析为 Context7 文档库 ID","inputSchema":{"type":"object","properties":{"libraryName":{"type":"string"}},"required":["libraryName"]}},{"name":"query-docs","title":"查询文档","description":"基于已解析的库 ID 查询文档","inputSchema":{"type":"object","properties":{"libraryId":{"type":"string"},"query":{"type":"string"}},"required":["libraryId","query"]}}]},
         {"slug":"web-search","name":"联网检索 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入组织已采购的检索 MCP；安装后需要填写实际服务地址和凭据。","cover":"mint","verified":False},
+        {"slug":"gmail","name":"Gmail MCP","provider":"Google","category":"邮件办公","description":"使用 Google OAuth 创建草稿、读取或发送 Gmail；普通用户连接账号即可。当前 Google 官方 MCP 需要管理员预先配置 OAuth 应用。","cover":"cyan","mcp_url":"https://gmailmcp.googleapis.com/mcp/v1","verified":False,"connection_schema":GMAIL_STATIC_OAUTH_SCHEMA},
         {"slug":"github","name":"GitHub MCP","provider":"GitHub","category":"代码协作","description":"用于仓库、Issue 与 PR 协作；服务真实可用，但需在自定义连接中配置 GitHub 认证后再安装。","cover":"violet","verified":False},
         {"slug":"enterprise-knowledge","name":"企业知识检索 MCP 模板","provider":"项目精选目录","category":"知识库","description":"接入企业文档检索服务；安装后需要填写实际 MCP 地址。","cover":"cyan","verified":False},
     ]
@@ -2711,7 +2712,7 @@ def create_app(
         payload = {**connection.to_dict(), "tools": child_tools, "tool_count": len(child_tools)}
         if connection.type == "mcp":
             payload["authorization_required"] = connection.status == "authorization_required"
-            payload["authorized"] = mcp_oauth.connected(connection.id)
+            payload["authorized"] = bool(_connection_mcp_token(connection))
         return payload
 
     def _oauth_redirect_uri(request: Request) -> str:
@@ -2721,7 +2722,17 @@ def create_app(
     def _connection_mcp_token(connection: ToolConnectionRecord) -> str:
         if connection.credential_env:
             return os.environ.get(connection.credential_env, "")
-        return mcp_oauth.token_for(connection.id)
+        return mcp_oauth.bearer_token_for(connection.id) or mcp_oauth.token_for(connection.id)
+
+    def _mcp_schema_for_endpoint(url: str, timeout: float, schema_hint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if url.rstrip("/") == "https://gmailmcp.googleapis.com/mcp/v1":
+            return {**GMAIL_STATIC_OAUTH_SCHEMA, "protocol_source":"market_override", "tool_count":0}
+        discovered = inspect_connection(url, timeout=timeout)
+        # Marketplace schemas may describe non-secret URL variables and labels,
+        # but protocol-discovered authentication always wins.
+        if schema_hint and discovered.get("auth_type") == "none":
+            return {**schema_hint, "protocol_source":"market_schema", "tool_count":discovered.get("tool_count", 0)}
+        return discovered
 
     def _install_discovered_mcp_tools(connection: ToolConnectionRecord, remote_tools: List[Dict[str, Any]], timeout: float) -> List[Dict[str, Any]]:
         connected = [item for item in tools.list() if item.metadata.get("connection_id") == connection.id]
@@ -2731,7 +2742,7 @@ def create_app(
             remote_name = str(remote["name"])
             annotations = dict(remote.get("annotations") or {})
             risk = "read" if annotations.get("readOnlyHint") is True else "high"
-            metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection.id,"connection_name":connection.name,"mcp_url":connection.endpoint,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or remote.get("input_schema") or {},"credential_env":connection.credential_env,"risk":risk,"mcp_annotations":annotations,"sync_status":"synced","timeout_seconds":timeout,"auth_mode":"bearer" if connection.credential_env else "oauth" if mcp_oauth.connected(connection.id) else "none"}
+            metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection.id,"connection_name":connection.name,"mcp_url":connection.endpoint,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or remote.get("input_schema") or {},"credential_env":connection.credential_env,"risk":risk,"mcp_annotations":annotations,"sync_status":"synced","timeout_seconds":timeout,"auth_mode":str(connection.metadata.get("auth_mode") or ("bearer" if connection.credential_env else "oauth" if mcp_oauth.connected(connection.id) else "none"))}
             existing = by_name.get(remote_name)
             if existing:
                 existing.display_name=str(remote.get("title") or remote_name); existing.description=str(remote.get("description") or existing.description); existing.metadata=metadata
@@ -2788,7 +2799,7 @@ def create_app(
     @app.get("/api/marketplace/mcp")
     def list_mcp_marketplace() -> List[Dict[str, Any]]:
         installed = {item.market_slug:item for item in tool_connections.list() if item.market_slug}
-        return [{**{k:v for k,v in item.items() if k != "tools"},"tool_count":len(item.get("tools") or []),"requires_configuration":not bool(item.get("mcp_url")),"availability":"ready" if item.get("verified") and item.get("mcp_url") else "configuration_required","installed":item["slug"] in installed,"connection_id":installed[item["slug"]].id if item["slug"] in installed else ""} for item in mcp_market]
+        return [{**{k:v for k,v in item.items() if k != "tools"},"tool_count":len(item.get("tools") or []),"requires_configuration":not bool(item.get("mcp_url")) or bool((item.get("connection_schema") or {}).get("fields")),"availability":"ready" if item.get("verified") and item.get("mcp_url") else "configuration_required","installed":item["slug"] in installed,"connection_id":installed[item["slug"]].id if item["slug"] in installed else ""} for item in mcp_market]
 
     @app.post("/api/marketplace/mcp/{slug}/install")
     def install_mcp_template(slug: str) -> Dict[str, Any]:
@@ -3156,6 +3167,19 @@ def create_app(
         return {"ok": True}
 
     # ------------------------- 工具目录 ------------------------- #
+    @app.post("/api/tool-connections/mcp/probe")
+    def probe_mcp_connection(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
+        """Inspect a URL using MCP/OAuth metadata; never ask an LLM."""
+        try:
+            url = validate_remote_url(str(req.get("url") or ""))
+            market_slug = str(req.get("market_slug") or "")
+            market_item = next((item for item in mcp_market if item.get("slug") == market_slug), None)
+            schema_hint = dict(market_item.get("connection_schema") or {}) if market_item else None
+            schema = _mcp_schema_for_endpoint(url, min(30, max(1, int(req.get("timeout_seconds") or 12))), schema_hint)
+            return {"url":url, "name":str(market_item.get("name") if market_item else ""), "schema":schema, "oauth_callback_url":_oauth_redirect_uri(request) if str(schema.get("auth_type")).startswith("oauth") else ""}
+        except (ValueError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.post("/api/tool-connections/mcp")
     def import_mcp_connection(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
         try:
@@ -3163,16 +3187,28 @@ def create_app(
             name = str(req.get("name") or "Remote MCP").strip()
             credential_env = str(req.get("credential_env") or "")
             timeout = min(30, max(1, int(req.get("timeout_seconds") or 8)))
+            market_slug = str(req.get("market_slug") or "")
+            market_item = next((item for item in mcp_market if item.get("slug") == market_slug), None)
+            schema_hint = dict(market_item.get("connection_schema") or {}) if market_item else None
+            schema = _mcp_schema_for_endpoint(url, timeout, schema_hint)
+            configuration = {str(key): value for key, value in dict(req.get("configuration") or {}).items()}
+            required = missing_required(schema, configuration)
+            if required:
+                raise ValueError(f"请填写：{'、'.join(required)}")
             connection_id = f"mcp-{time.time_ns()}"
-            connection = tool_connections.create(id=connection_id,type="mcp",name=name,source="custom",endpoint=url,status="syncing",credential_env=credential_env,metadata={"auth_mode":"bearer" if credential_env else "auto"})
-            try:
+            auth_type = str(schema.get("auth_type") or "none")
+            connection = tool_connections.create(id=connection_id,type="mcp",name=name,source="market" if market_item else "custom",market_slug=market_slug if market_item else "",endpoint=url,status="syncing",credential_env=credential_env,metadata={"auth_mode":auth_type,"connection_schema":schema})
+            if configuration:
+                mcp_oauth.save_configuration(connection.id, configuration)
+            if auth_type == "manual_bearer":
+                imported = _install_discovered_mcp_tools(connection, discover_mcp_tools(url, "", timeout, access_token=_connection_mcp_token(connection)), timeout)
+            elif auth_type in {"oauth_dcr", "oauth_static"}:
+                config = mcp_oauth.configuration(connection.id)
+                authorization = start_authorization(endpoint=url, redirect_uri=_oauth_redirect_uri(request), connection_id=connection.id, store=mcp_oauth, timeout=timeout, client_id=config.get("client_id", ""), client_secret=config.get("client_secret", ""))
+                connection.status="authorization_required"; connection.metadata={**connection.metadata,"auth_mode":auth_type,"authorization_started_at":_utc_now()}; tool_connections.save(connection)
+                return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":[],"schema":schema,"authorization":authorization,"message":"该 MCP 需要浏览器登录。请完成授权后回到这里同步工具。"}
+            else:
                 imported = _install_discovered_mcp_tools(connection, discover_mcp_tools(url, credential_env, timeout), timeout)
-            except MCPAuthorizationRequired:
-                if credential_env:
-                    raise ValueError(f"MCP 返回 401：后端环境变量 {credential_env} 未配置或凭据无效")
-                authorization = start_authorization(endpoint=url, redirect_uri=_oauth_redirect_uri(request), connection_id=connection.id, store=mcp_oauth, timeout=timeout)
-                connection.status="authorization_required"; connection.metadata={**connection.metadata,"auth_mode":"oauth","authorization_started_at":_utc_now()}; tool_connections.save(connection)
-                return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":[],"authorization":authorization,"message":"该 MCP 需要浏览器登录。请完成授权后回到这里同步工具。"}
             return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":imported}
         except (ValueError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             if 'connection' in locals() and tool_connections.exists(connection.id): tool_connections.delete(connection.id)
@@ -3199,7 +3235,8 @@ def create_app(
                 raise ValueError("只有 MCP 连接支持此授权流程")
             if connection.credential_env:
                 raise ValueError("当前连接使用 Bearer 环境变量，无需浏览器 OAuth 登录")
-            authorization = start_authorization(endpoint=connection.endpoint, redirect_uri=_oauth_redirect_uri(request), connection_id=connection.id, store=mcp_oauth)
+            config = mcp_oauth.configuration(connection.id)
+            authorization = start_authorization(endpoint=connection.endpoint, redirect_uri=_oauth_redirect_uri(request), connection_id=connection.id, store=mcp_oauth, client_id=config.get("client_id", ""), client_secret=config.get("client_secret", ""))
             connection.status="authorization_required"; connection.metadata={**connection.metadata,"auth_mode":"oauth","authorization_started_at":_utc_now()}; tool_connections.save(connection)
             return {"connection":_tool_connection_payload(connection),"authorization":authorization}
         except KeyError as exc:

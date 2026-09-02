@@ -21,6 +21,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .connection_schema import MANUAL_BEARER_SCHEMA, connection_schema
+
 try:  # ``httpx`` has more reliable TLS/proxy behaviour than urllib on Windows.
     import httpx
 except Exception:  # pragma: no cover - dependency guard for partial installs
@@ -64,8 +66,27 @@ def call_tool(endpoint: str, tool_name: str, arguments: Dict[str, Any], *, token
     return result
 
 
+def inspect_connection(endpoint: str, *, timeout: float = 12) -> Dict[str, Any]:
+    """Return a public, deterministic connection schema for a remote MCP."""
+    try:
+        tools = discover_tools(endpoint, timeout=timeout)
+        return {**connection_schema(auth_type="none", help_text="该 MCP 未要求认证，可直接连接。"), "tool_count": len(tools), "protocol_source": "mcp"}
+    except MCPAuthorizationRequired as exc:
+        protected_resource = str(exc.details.get("resource_metadata") or "")
+        if not protected_resource:
+            return {**MANUAL_BEARER_SCHEMA, "tool_count": 0, "protocol_source": "http_401"}
+        _, metadata = _oauth_metadata(endpoint, protected_resource, timeout)
+        if metadata.get("registration_endpoint"):
+            return {**connection_schema(auth_type="oauth_dcr", help_text="该 MCP 支持标准 OAuth 自动注册。点击连接后只需在服务商页面登录授权。"), "tool_count": 0, "protocol_source": "oauth_metadata"}
+        return {**connection_schema(auth_type="oauth_static", help_text="该 MCP 使用 OAuth，但未开放动态客户端注册。请填写服务商要求的 OAuth Client ID 和 Client Secret。", fields=[
+            {"name":"client_id", "label":"OAuth Client ID", "type":"text", "required":True, "scope":"workspace"},
+            {"name":"client_secret", "label":"OAuth Client Secret", "type":"secret", "required":True, "scope":"workspace"},
+        ]), "tool_count": 0, "protocol_source": "oauth_metadata"}
+
+
 def start_authorization(
-    *, endpoint: str, redirect_uri: str, connection_id: str, store: "MCPAuthorizationStore", timeout: float = 12
+    *, endpoint: str, redirect_uri: str, connection_id: str, store: "MCPAuthorizationStore", timeout: float = 12,
+    client_id: str = "", client_secret: str = "",
 ) -> Dict[str, Any]:
     """Discover OAuth metadata, dynamically register, and create a PKCE grant."""
     cached = store.pending_authorization_url(connection_id)
@@ -77,25 +98,15 @@ def start_authorization(
         protected_resource = str(exc.details.get("resource_metadata") or "")
     else:
         raise ValueError("该 MCP 不需要 OAuth 授权")
-    if not protected_resource:
-        protected_resource = urllib.parse.urljoin(endpoint.rstrip("/") + "/", ".well-known/oauth-protected-resource")
-    resource = _get_json(protected_resource, timeout)
-    servers = resource.get("authorization_servers") or []
-    if not servers:
-        raise ValueError("MCP 服务要求登录，但没有提供 OAuth 授权服务器地址")
-    authorization_server = str(servers[0]).rstrip("/")
-    metadata_url = authorization_server + "/.well-known/oauth-authorization-server"
-    metadata = _get_json(metadata_url, timeout)
+    authorization_server, metadata = _oauth_metadata(endpoint, protected_resource, timeout)
     authorization_endpoint = str(metadata.get("authorization_endpoint") or "")
     token_endpoint = str(metadata.get("token_endpoint") or "")
     if not authorization_endpoint or not token_endpoint:
         raise ValueError("OAuth 授权服务器缺少 authorization_endpoint 或 token_endpoint")
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    client_id = ""
-    client_secret = ""
     registration_endpoint = str(metadata.get("registration_endpoint") or "")
-    if registration_endpoint:
+    if not client_id and registration_endpoint:
         registered = _post_json(
             registration_endpoint,
             {
@@ -110,7 +121,7 @@ def start_authorization(
         client_id = str(registered.get("client_id") or "")
         client_secret = str(registered.get("client_secret") or "")
     if not client_id:
-        raise ValueError("此 MCP 的 OAuth 服务未开放动态客户端注册，当前产品暂不能安全自动接入")
+        raise ValueError("此 MCP 未开放动态客户端注册，需要填写 OAuth Client ID 和 Client Secret")
     state = secrets.token_urlsafe(32)
     scope = " ".join(str(item) for item in metadata.get("scopes_supported") or [])
     params = {
@@ -128,6 +139,18 @@ def start_authorization(
         "authorization_url": authorization_url,
     })
     return {"connection_id": connection_id, "authorization_url": authorization_url}
+
+
+def _oauth_metadata(endpoint: str, protected_resource: str, timeout: float) -> tuple[str, Dict[str, Any]]:
+    if not protected_resource:
+        protected_resource = urllib.parse.urljoin(endpoint.rstrip("/") + "/", ".well-known/oauth-protected-resource")
+    resource = _get_json(protected_resource, timeout)
+    servers = resource.get("authorization_servers") or []
+    if not servers:
+        raise ValueError("MCP 服务要求登录，但没有提供 OAuth 授权服务器地址")
+    authorization_server = str(servers[0]).rstrip("/")
+    metadata_url = authorization_server + "/.well-known/oauth-authorization-server"
+    return authorization_server, _get_json(metadata_url, timeout)
 
 
 def complete_authorization(*, state: str, code: str, store: "MCPAuthorizationStore", timeout: float = 15) -> str:
@@ -162,7 +185,19 @@ class MCPAuthorizationStore:
         self._cipher = _cipher()
 
     def save_pending(self, connection_id: str, payload: Dict[str, Any]) -> None:
-        self._write(connection_id, {"pending": payload, "tokens": self._read(connection_id).get("tokens") or {}})
+        existing = self._read(connection_id)
+        self._write(connection_id, {"pending": payload, "tokens": existing.get("tokens") or {}, "configuration": existing.get("configuration") or {}})
+
+    def save_configuration(self, connection_id: str, values: Dict[str, Any]) -> None:
+        data = self._read(connection_id)
+        data["configuration"] = {str(key): str(value) for key, value in values.items() if str(value).strip()}
+        self._write(connection_id, data)
+
+    def configuration(self, connection_id: str) -> Dict[str, str]:
+        return {str(key): str(value) for key, value in dict(self._read(connection_id).get("configuration") or {}).items()}
+
+    def bearer_token_for(self, connection_id: str) -> str:
+        return str(self.configuration(connection_id).get("bearer_token") or "")
 
     def find_pending(self, state: str) -> tuple[str, Dict[str, Any]]:
         for path in self.root_dir.glob("*.json"):

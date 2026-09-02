@@ -284,7 +284,8 @@ def _call_mcp_http(
     credential_env = str(metadata.get("credential_env") or "")
     token = os.environ.get(credential_env, "") if credential_env else ""
     if not token and oauth_store is not None:
-        token = oauth_store.token_for(str(metadata.get("connection_id") or ""))
+        connection_id = str(metadata.get("connection_id") or "")
+        token = oauth_store.bearer_token_for(connection_id) or oauth_store.token_for(connection_id)
     try:
         response = call_remote_mcp_tool(url, remote_name, resolved_arguments, token=token, timeout=float(metadata.get("timeout_seconds") or 8))
         return {"url": url, "method": "tools/call", "response": response}
@@ -302,7 +303,8 @@ def _bird_email_preflight_error(metadata: Dict[str, Any], arguments: Dict[str, A
     credential_env = str(metadata.get("credential_env") or "")
     token = os.environ.get(credential_env, "") if credential_env else ""
     if not token and oauth_store is not None:
-        token = oauth_store.token_for(str(metadata.get("connection_id") or ""))
+        connection_id = str(metadata.get("connection_id") or "")
+        token = oauth_store.bearer_token_for(connection_id) or oauth_store.token_for(connection_id)
     if not token:
         return "Bird 尚未授权，请先完成 MCP 登录授权。"
     try:
