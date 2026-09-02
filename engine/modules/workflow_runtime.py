@@ -61,8 +61,8 @@ class WorkflowNodeRuntimeFactory:
                 task = _get(state, str(config.get("input_field") or "input"))
                 task_text = task if isinstance(task, str) else json.dumps(task, ensure_ascii=False, default=str)
                 result = self.tool_runtime.execute(tool, task_text).to_dict()
-                if result["status"] == "failed":
-                    raise RuntimeError(result.get("error") or "工具调用失败")
+                if result["status"] != "succeeded":
+                    raise RuntimeError(result.get("error") or "工具调用未完成")
                 output_key = str(config.get("output_field") or "tool_output")
                 return {output_key: result.get("result"), "input": result.get("result"), "__runtime_tool_calls__": [result]}
             if kind == "knowledge":

@@ -910,10 +910,16 @@ def create_app(
             app_record = applications.get(application_id)
             if app_record.app_type == "workflow":
                 inherited_model = "auto" if app_record.model in {"", "auto", "device", "edge", "cloud"} else app_record.model
+                workflow_tool_ids = [tool_id for tool_id in app_record.tool_ids if tools.exists(tool_id)]
+                workflow_tool_set = set(workflow_tool_ids)
                 for spec in target.list_agents():
                     kind = str(spec.config.get("node_kind") or "agent")
-                    if kind in {"agent", "llm"} and not spec.model:
-                        target.update_agent(spec.id, model=inherited_model)
+                    if kind in {"agent", "llm"}:
+                        config = dict(spec.config)
+                        node_tool_ids = [str(tool_id) for tool_id in (config.get("tool_ids") or [])]
+                        inherited_tools = node_tool_ids or workflow_tool_ids
+                        config["tool_ids"] = [tool_id for tool_id in inherited_tools if tool_id in workflow_tool_set]
+                        target.update_agent(spec.id, model=spec.model or inherited_model, config=config)
             bound = [bank_id for bank_id in app_record.memory_bank_ids if memory_banks.exists(bank_id)]
             primary = app_record.primary_memory_bank_id or (bound[0] if bound else None)
             if primary and primary in bound and normalize_memory_config(app_record.memory_config)["long_term_enabled"]:
@@ -923,7 +929,7 @@ def create_app(
                 target.set_memory_options(top_k=memory_config["memory_top_k"] if memory_config["retrieval_override_enabled"] else bank_config["top_k"], wakeup_level=memory_config["wakeup_level"])
         return target
 
-    def _validate_application_workflow(graph: Dict[str, Any], *, runnable: bool = False) -> List[str]:
+    def _validate_application_workflow(graph: Dict[str, Any], *, runnable: bool = False, app_tool_ids: Optional[List[str]] = None) -> List[str]:
         """Validate the product workflow contract without breaking legacy graphs."""
         agents = [item for item in graph.get("agents", []) if isinstance(item, dict)]
         connections = [item for item in graph.get("connections", []) if isinstance(item, dict)]
@@ -954,6 +960,18 @@ def create_app(
             errors.append("开始节点不能有入边")
         if ends and any(edge.get("source") == ends[0].get("id") for edge in connections):
             errors.append("结束节点不能有出边")
+        allowed_tools = set(app_tool_ids or [])
+        if app_tool_ids is not None:
+            for item, kind in zip(agents, kinds):
+                config = item.get("config") or {}
+                if kind == "tool":
+                    tool_id = str(config.get("tool_id") or "")
+                    if tool_id and tool_id not in allowed_tools:
+                        errors.append(f"工具节点 {item.get('name') or item.get('id')} 使用了未挂载到当前工作流的工具")
+                if kind in {"agent", "llm"}:
+                    invalid = [str(tool_id) for tool_id in (config.get("tool_ids") or []) if str(tool_id) not in allowed_tools]
+                    if invalid:
+                        errors.append(f"节点 {item.get('name') or item.get('id')} 包含未挂载到当前工作流的工具")
         if starts:
             adjacency: Dict[str, set[str]] = {node_id: set() for node_id in ids}
             for edge in connections:
@@ -2153,6 +2171,10 @@ def create_app(
             )
             if updated.workflow_id:
                 workflow = workflows.get(updated.workflow_id)
+                if updated.app_type == "workflow":
+                    errors = _validate_application_workflow(workflow.graph, app_tool_ids=updated.tool_ids)
+                    if errors:
+                        raise ValueError("；".join(errors))
                 graph = Orchestrator.from_dict(workflow.graph)
                 if updated.entry_agent_id and updated.app_type == "agent":
                     graph.update_agent(
@@ -2196,7 +2218,7 @@ def create_app(
             if model_errors:
                 raise ValueError("；".join(model_errors))
             if app_record.app_type == "workflow" and workflow is not None:
-                errors = _validate_application_workflow(workflow.graph, runnable=True)
+                errors = _validate_application_workflow(workflow.graph, runnable=True, app_tool_ids=app_record.tool_ids)
                 if errors:
                     raise ValueError("；".join(errors))
             if workflow is not None:
@@ -2226,7 +2248,7 @@ def create_app(
             if model_errors:
                 raise HTTPException(status_code=400, detail="；".join(model_errors))
             if app_record.app_type == "workflow":
-                errors = _validate_application_workflow(workflows.get(app_record.workflow_id).graph, runnable=True)
+                errors = _validate_application_workflow(workflows.get(app_record.workflow_id).graph, runnable=True, app_tool_ids=app_record.tool_ids)
                 if errors:
                     raise HTTPException(status_code=400, detail="；".join(errors))
             input_payload = dict(req.input or {})
@@ -2389,11 +2411,11 @@ def create_app(
     @app.put("/api/workflows/{workflow_id}")
     def update_workflow(workflow_id: str, req: UpdateWorkflowReq, request: Request) -> Dict[str, Any]:
         try:
-            _owned_app_for_workflow(workflow_id, request)
+            app_record = _owned_app_for_workflow(workflow_id, request)
             current = workflows.get(workflow_id)
             next_graph = req.graph if req.graph is not None else current.graph
             if "workflow" in current.tags:
-                errors = _validate_application_workflow(next_graph)
+                errors = _validate_application_workflow(next_graph, app_tool_ids=app_record.tool_ids if app_record else None)
                 if errors:
                     raise ValueError("；".join(errors))
             updated = WorkflowRecord.from_dict(
