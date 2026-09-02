@@ -1,5 +1,7 @@
 """验证应用中心接口会把百炼式应用流程落到现有工作流后端。"""
 
+import time
+
 from fastapi.testclient import TestClient
 
 from engine.modules.product_ops import ApplicationStore, ToolCatalogStore
@@ -145,6 +147,98 @@ def test_create_workflow_application_seeds_start_and_end(tmp_path, monkeypatch):
     assert workflow["graph"]["entry"] == payload["entry_agent_id"]
     assert workflow["graph"]["connections"][0]["target"] == workflow["graph"]["agents"][1]["id"]
     assert len(workflow["metadata"]["editor"]["positions"]) == 2
+
+
+def test_workflow_application_mounts_and_runs_tool_node(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    tool_store = ToolCatalogStore(tmp_path / "tools")
+    calculator = tool_store.create(
+        name="calculator",
+        display_name="计算器",
+        description="执行安全四则运算",
+        metadata={"adapter": "calculator", "risk": "low", "source": "builtin"},
+    )
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=tool_store,
+        application_store=ApplicationStore(tmp_path / "apps"),
+    )
+    client = TestClient(app)
+
+    created = client.post("/api/apps", json={"name": "工具工作流", "app_type": "workflow", "model": ""}).json()
+    workflow = client.get(f"/api/workflows/{created['workflow_id']}").json()
+    start, end = workflow["graph"]["agents"]
+    tool_node = {
+        "id": "node-calculator",
+        "name": "计算器节点",
+        "description": "计算表达式",
+        "model": "",
+        "sys_prompt": "",
+        "children": [],
+        "config": {
+            "node_kind": "tool",
+            "tool_id": calculator.id,
+            "input_field": "input",
+            "output_field": "tool_output",
+        },
+    }
+
+    updated = client.put(f"/api/apps/{created['id']}", json={"model": "", "tool_ids": [calculator.id]})
+    assert updated.status_code == 200
+    graph = {
+        "entry": start["id"],
+        "agents": [start, tool_node, end],
+        "connections": [
+            {"source": start["id"], "target": tool_node["id"], "conditional": False},
+            {"source": tool_node["id"], "target": end["id"], "conditional": False},
+        ],
+    }
+    saved = client.put(f"/api/workflows/{created['workflow_id']}", json={"graph": graph})
+    assert saved.status_code == 200
+
+    run = client.post(f"/api/apps/{created['id']}/runs", json={"input": {"input": "3+5"}}).json()
+    for _ in range(30):
+        if run["status"] != "queued":
+            break
+        time.sleep(0.1)
+        run = client.get(f"/api/runs/{run['id']}").json()
+
+    assert run["status"] == "succeeded"
+    assert run["state"]["workflow_output"] == 8.0
+
+
+def test_workflow_application_rejects_unmounted_tool_node(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    tool_store = ToolCatalogStore(tmp_path / "tools")
+    calculator = tool_store.create(name="calculator", display_name="计算器", metadata={"adapter": "calculator"})
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=tool_store,
+        application_store=ApplicationStore(tmp_path / "apps"),
+    )
+    client = TestClient(app)
+    created = client.post("/api/apps", json={"name": "未挂载工具工作流", "app_type": "workflow", "model": ""}).json()
+    workflow = client.get(f"/api/workflows/{created['workflow_id']}").json()
+    start, end = workflow["graph"]["agents"]
+    graph = {
+        "entry": start["id"],
+        "agents": [
+            start,
+            {"id": "node-calculator", "name": "计算器节点", "description": "", "model": "", "sys_prompt": "", "children": [], "config": {"node_kind": "tool", "tool_id": calculator.id}},
+            end,
+        ],
+        "connections": [
+            {"source": start["id"], "target": "node-calculator", "conditional": False},
+            {"source": "node-calculator", "target": end["id"], "conditional": False},
+        ],
+    }
+
+    response = client.put(f"/api/workflows/{created['workflow_id']}", json={"graph": graph})
+
+    assert response.status_code == 400
+    assert "未挂载" in response.text
 
 
 def test_application_rejects_unknown_type(tmp_path, monkeypatch):

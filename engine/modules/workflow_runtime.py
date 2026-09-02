@@ -12,6 +12,7 @@ from .agent_runtime import AgentRuntimeFactory
 from .product_ops import ToolCatalogStore
 from .model_connections import ModelConnectionStore
 from .tool_runtime import ToolRuntime
+from .tools.mcp_remote import MCPAuthorizationStore
 from .knowledge import KnowledgeStore
 from .workflow_scripts import run_workflow_script
 
@@ -25,10 +26,12 @@ class WorkflowNodeRuntimeFactory:
         models: ModelConnectionStore | None = None,
         graph: Dict[str, Any] | None = None,
         knowledge_store: KnowledgeStore | None = None,
+        mcp_oauth_store: MCPAuthorizationStore | None = None,
     ) -> None:
         self.tools = tools
-        self.tool_runtime = ToolRuntime(tools)
-        self.agent_runtime = AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=models, knowledge_store=knowledge_store)
+        self.mcp_oauth_store = mcp_oauth_store
+        self.tool_runtime = ToolRuntime(tools, mcp_oauth_store)
+        self.agent_runtime = AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=models, knowledge_store=knowledge_store, mcp_oauth_store=mcp_oauth_store)
         self.knowledge_store = knowledge_store
         self.models = models
         self.graph = graph or {}
@@ -58,8 +61,8 @@ class WorkflowNodeRuntimeFactory:
                 task = _get(state, str(config.get("input_field") or "input"))
                 task_text = task if isinstance(task, str) else json.dumps(task, ensure_ascii=False, default=str)
                 result = self.tool_runtime.execute(tool, task_text).to_dict()
-                if result["status"] == "failed":
-                    raise RuntimeError(result.get("error") or "工具调用失败")
+                if result["status"] != "succeeded":
+                    raise RuntimeError(result.get("error") or "工具调用未完成")
                 output_key = str(config.get("output_field") or "tool_output")
                 return {output_key: result.get("result"), "input": result.get("result"), "__runtime_tool_calls__": [result]}
             if kind == "knowledge":
@@ -201,7 +204,7 @@ class WorkflowNodeRuntimeFactory:
         if not start: raise RuntimeError("批处理子流程缺少批处理开始节点")
         child_graph = {"entry": start["id"], "agents": agents, "connections": connections}
         orchestrator = Orchestrator.from_dict(child_graph)
-        factory = WorkflowNodeRuntimeFactory(self.tools, self.models, graph=child_graph, knowledge_store=self.knowledge_store)
+        factory = WorkflowNodeRuntimeFactory(self.tools, self.models, graph=child_graph, knowledge_store=self.knowledge_store, mcp_oauth_store=self.mcp_oauth_store)
         compiled = orchestrator.build_graph(node_factory=factory, recursion_limit=50)
         events, output = [], state
         async for event in compiled.astream(state, 50):

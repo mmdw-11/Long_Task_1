@@ -9,6 +9,7 @@ import inspect
 import ipaddress
 import json
 import os
+import re
 import socket
 import urllib.error
 import urllib.parse
@@ -433,14 +434,16 @@ async def list_mcp_tools(
         return await _jsonrpc_list_tools(endpoint=endpoint, headers=headers, timeout=timeout)
 
 
-async def call_mcp_tool(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+async def call_mcp_tool(
+    metadata: Dict[str, Any], task_text: str, *, arguments: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     endpoint = str(metadata.get("mcp_url") or "").strip()
     tool_name = str(metadata.get("tool_name") or metadata.get("name") or "").strip()
     if not endpoint or not tool_name:
         raise ValueError("mcp_url and tool_name are required")
     validate_remote_mcp_url(endpoint)
     if _is_builtin_demo_endpoint(endpoint):
-        args = _arguments_from_schema(dict(metadata.get("input_schema") or {}), task_text)
+        args = dict(arguments or _arguments_from_schema(dict(metadata.get("input_schema") or {}), task_text))
         return {
             "tool_name": tool_name,
             "arguments": args,
@@ -449,7 +452,7 @@ async def call_mcp_tool(metadata: Dict[str, Any], task_text: str) -> Dict[str, A
     auth_type = str(metadata.get("auth_type") or "none")
     token = str(metadata.get("auth_secret") or metadata.get("token") or "")
     headers = auth_headers(auth_type, token)
-    args = _arguments_from_schema(dict(metadata.get("input_schema") or {}), task_text)
+    args = dict(arguments or _arguments_from_schema(dict(metadata.get("input_schema") or {}), task_text))
     return await _jsonrpc_call_tool(
         endpoint=endpoint,
         headers=headers,
@@ -459,19 +462,21 @@ async def call_mcp_tool(metadata: Dict[str, Any], task_text: str) -> Dict[str, A
     )
 
 
-def call_mcp_tool_sync(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+def call_mcp_tool_sync(
+    metadata: Dict[str, Any], task_text: str, *, arguments: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Run an MCP tool from sync runtime code, including inside an active loop."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(call_mcp_tool(metadata, task_text))
+        return asyncio.run(call_mcp_tool(metadata, task_text, arguments=arguments))
 
     result: Dict[str, Any] = {}
     error: list[BaseException] = []
 
     def _run() -> None:
         try:
-            result.update(asyncio.run(call_mcp_tool(metadata, task_text)))
+            result.update(asyncio.run(call_mcp_tool(metadata, task_text, arguments=arguments)))
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             error.append(exc)
 
@@ -598,15 +603,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def _strip_sse(raw: str) -> str:
     text = raw.strip()
-    if not text.startswith("data:"):
-        return text
     chunks = []
     for line in text.splitlines():
         if line.startswith("data:"):
             value = line[5:].strip()
             if value and value != "[DONE]":
                 chunks.append(value)
-    return "\n".join(chunks).strip()
+    return "\n".join(chunks).strip() if chunks else text
 
 
 def _tool_from_any(item: Any) -> MCPToolRecord:
@@ -633,13 +636,20 @@ def _tool_from_any(item: Any) -> MCPToolRecord:
 def _arguments_from_schema(schema: Dict[str, Any], task_text: str) -> Dict[str, Any]:
     props = schema.get("properties") if isinstance(schema, dict) else {}
     required = [str(item) for item in schema.get("required") or []] if isinstance(schema, dict) else []
+    if isinstance(props, dict) and not props:
+        return {}
+    if isinstance(props, dict) and {"libraryId", "query"}.issubset(props):
+        match = re.search(r"(/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)", task_text)
+        return {"libraryId": match.group(1) if match else task_text[:1000], "query": task_text[:1000]}
     if isinstance(props, dict) and len(required) == 1:
         return {required[0]: task_text[:1000]}
     if isinstance(props, dict) and "query" in props:
         return {"query": task_text[:1000]}
     if isinstance(props, dict) and "task" in props:
         return {"task": task_text[:1000]}
-    return {"task": task_text[:1000]}
+    # An MCP schema without a recognised argument must not receive an
+    # invented ``task`` field: strict servers reject unknown properties.
+    return {}
 
 
 def _is_builtin_demo_endpoint(endpoint: str) -> bool:
