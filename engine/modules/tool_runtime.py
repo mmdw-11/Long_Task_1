@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from .mcp_integration import call_mcp_tool_sync
+from .mcp_integration import _arguments_from_schema, _strip_sse, call_mcp_tool_sync
 from .product_ops import ToolCatalogStore, ToolRecord
+from .tools import mcp_error_message
 
 
 @dataclass
@@ -90,7 +91,15 @@ class ToolRuntime:
                     " ".join(tool.tags),
                 ]
             ).lower()
-            score = sum(1 for token in _tokens(blob) if token and token in normalized)
+            terms = _tokens(blob)
+            score = sum(1 for token in terms if token and token in normalized)
+            # Chinese phrases are not separated by whitespace.  A task such
+            # as “请发送邮件给客户” should still match a “发送邮件” tool.
+            score += sum(
+                1 for token in terms
+                if len(token) >= 2 and any("\u4e00" <= char <= "\u9fff" for char in token)
+                and (token in normalized or any(token in candidate for candidate in _tokens(normalized)))
+            )
             adapter = str(tool.metadata.get("adapter") or tool.name).lower()
             if adapter in {"current_time", "time", "now"} and re.search(r"时间|日期|today|now|time|date", normalized):
                 score += 4
@@ -104,9 +113,19 @@ class ToolRuntime:
                 scored.append((score, tool))
         return [tool for _, tool in sorted(scored, key=lambda item: item[0], reverse=True)[:3]]
 
-    def execute(self, tool: ToolRecord, task_text: str, *, bypass_approval: bool = False) -> ToolRuntimeResult:
+    def execute(
+        self,
+        tool: ToolRecord,
+        task_text: str,
+        *,
+        arguments: Optional[Dict[str, Any]] = None,
+        bypass_approval: bool = False,
+    ) -> ToolRuntimeResult:
         adapter = str(tool.metadata.get("adapter") or tool.name).strip().lower()
-        risk = str(tool.metadata.get("risk") or "low").lower()
+        # A third-party MCP tool without a verified risk declaration is never
+        # silently auto-approved.  Built-ins retain their explicit low risk.
+        default_risk = "high" if adapter in {"mcp_http", "mcp_url", "mcp", "mcp_tool", "agent_mcp_tool"} else "low"
+        risk = str(tool.metadata.get("risk") or default_risk).lower()
         approval_required = risk not in {"low", "read"}
         if approval_required and not bypass_approval:
             return ToolRuntimeResult(
@@ -114,7 +133,7 @@ class ToolRuntime:
                 name=tool.name,
                 display_name=tool.display_name,
                 status="approval_required",
-                arguments={"task": task_text[:500]},
+                arguments=dict(arguments or {"task": task_text[:500]}),
                 approval_required=True,
                 risk=risk,
             )
@@ -128,10 +147,10 @@ class ToolRuntime:
                 args = {"expression": expression}
             elif adapter in {"echo", "note"}:
                 result = task_text[:1000]
-                args = {"text": task_text[:1000]}
+                args = dict(arguments or {"text": task_text[:1000]})
             elif adapter in {"mcp_http", "mcp_url", "mcp"}:
-                args = {"url": str(tool.metadata.get("mcp_url") or tool.metadata.get("url") or "")}
-                result = _call_mcp_http(tool.metadata, task_text)
+                args = dict(arguments or _arguments_from_schema(dict(tool.metadata.get("input_schema") or {}), task_text))
+                result = _call_mcp_http(tool.metadata, task_text, arguments=args)
             elif adapter == "openapi_http":
                 args = {"url": str(tool.metadata.get("operation_url") or "")}
                 result = _call_openapi_http(tool.metadata, task_text)
@@ -140,7 +159,7 @@ class ToolRuntime:
                     "server": str(tool.metadata.get("mcp_name") or tool.metadata.get("mcp_server_id") or ""),
                     "tool": str(tool.metadata.get("tool_name") or tool.name),
                 }
-                result = call_mcp_tool_sync(tool.metadata, task_text)
+                result = call_mcp_tool_sync(tool.metadata, task_text, arguments=arguments)
             elif adapter in {"script", "python_script"}:
                 args = {"language": str(tool.metadata.get("language") or "python")}
                 result = _run_script_tool(tool.metadata, task_text)
@@ -185,7 +204,7 @@ def ensure_builtin_tools(catalog: ToolCatalogStore) -> None:
             "description": "读取当前 UTC 时间，用于需要日期、时间戳或运行时间判断的任务。",
             "category": "system",
             "tags": ["time", "date", "read"],
-            "metadata": {"adapter": "current_time", "risk": "low", "schema": {"timezone": "string"}},
+            "metadata": {"source": "builtin", "adapter": "current_time", "risk": "low", "schema": {"timezone": "string"}},
         },
         {
             "name": "calculator",
@@ -193,7 +212,7 @@ def ensure_builtin_tools(catalog: ToolCatalogStore) -> None:
             "description": "执行简单安全的四则运算表达式。",
             "category": "utility",
             "tags": ["math", "calculate", "read"],
-            "metadata": {"adapter": "calculator", "risk": "low", "schema": {"expression": "string"}},
+            "metadata": {"source": "builtin", "adapter": "calculator", "risk": "low", "schema": {"expression": "string"}},
         },
         {
             "name": "task_note",
@@ -201,7 +220,7 @@ def ensure_builtin_tools(catalog: ToolCatalogStore) -> None:
             "description": "把当前任务片段作为可审计记录回传给模型，不访问外部系统。",
             "category": "utility",
             "tags": ["note", "debug", "read"],
-            "metadata": {"adapter": "echo", "risk": "low", "schema": {"text": "string"}},
+            "metadata": {"source": "builtin", "adapter": "echo", "risk": "low", "schema": {"text": "string"}},
         },
     ]
     for item in defaults:
@@ -213,17 +232,20 @@ def _tokens(text: str) -> List[str]:
     return [item for item in re.split(r"[^a-z0-9_\u4e00-\u9fff]+", text.lower()) if item]
 
 
-def _call_mcp_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+def _call_mcp_http(
+    metadata: Dict[str, Any], task_text: str, *, arguments: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     url = str(metadata.get("mcp_url") or metadata.get("url") or "").strip()
     if not url:
         raise ValueError("mcp_url is required")
     method = str(metadata.get("method") or "tools/call")
     remote_name = str(metadata.get("remote_tool_name") or "")
+    resolved_arguments = dict(arguments or _arguments_from_schema(dict(metadata.get("input_schema") or {}), task_text))
     payload = {
         "jsonrpc": "2.0",
         "id": f"agentforge-{datetime.now(timezone.utc).timestamp()}",
         "method": method,
-        "params": metadata.get("params") or ({"name": remote_name, "arguments": {"input": task_text[:1000]}} if remote_name else {"task": task_text[:1000]}),
+        "params": metadata.get("params") or ({"name": remote_name, "arguments": resolved_arguments} if remote_name else resolved_arguments),
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -240,9 +262,12 @@ def _call_mcp_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:
         with urllib.request.urlopen(request, timeout=float(metadata.get("timeout_seconds") or 8)) as response:
             text = response.read(200_000).decode("utf-8", errors="replace")
             try:
-                parsed: Any = json.loads(text)
+                parsed: Any = json.loads(_strip_sse(text))
             except json.JSONDecodeError:
                 parsed = text
+            error = mcp_error_message(parsed)
+            if error:
+                raise RuntimeError(error)
             return {"url": url, "method": method, "response": parsed}
     except urllib.error.URLError as exc:
         raise RuntimeError(f"MCP HTTP request failed: {exc}") from exc

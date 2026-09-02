@@ -33,6 +33,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -88,7 +89,7 @@ from ..modules.skills import (
     SkillTraceStore,
 )
 from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowStore
-from ..modules.tool_runtime import ToolRuntime, ensure_builtin_tools
+from ..modules.tools import ToolRuntime, ensure_builtin_tools
 from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
 from ..modules.knowledge import KnowledgeStore
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
@@ -475,6 +476,16 @@ def _build_run_summary(record: RunRecord) -> Dict[str, Any]:
     }
 
 
+def _approval_follow_up(result: Dict[str, Any]) -> str:
+    """Create a safe, concise continuation visible after a tool decision."""
+    name = str(result.get("display_name") or result.get("name") or "工具")
+    if result.get("status") != "succeeded":
+        return f"已批准 {name}，但调用失败：{result.get('error') or '未知错误'}"
+    value = result.get("result")
+    rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return f"已批准并完成 {name}。工具结果：{rendered[:1800]}"
+
+
 def create_app(
     orchestrator: Optional[Orchestrator] = None,
     *,
@@ -574,6 +585,46 @@ def create_app(
         mcp_config_store=mcp_configs,
         knowledge_store=knowledge,
     )
+
+    def _approval_requests(record: RunRecord) -> List[Dict[str, Any]]:
+        return [event for event in record.events if event.get("type") == "approval_required"]
+
+    def _unresolved_approvals(record: RunRecord) -> List[Dict[str, Any]]:
+        decisions = dict(record.metadata.get("approval_decisions") or {})
+        return [event for event in _approval_requests(record) if str(event.get("sequence")) not in decisions]
+
+    def _approval_tool_context(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        try:
+            metadata = dict(tools.get(str(tool_call.get("id") or "")).metadata)
+        except KeyError:
+            pass
+        endpoint = str(metadata.get("mcp_url") or metadata.get("operation_url") or "")
+        host = urllib.parse.urlparse(endpoint).hostname or ""
+        service_name = str(
+            metadata.get("connection_name")
+            or metadata.get("mcp_name")
+            or ("平台内置工具" if metadata.get("source") == "builtin" else host)
+            or "外部工具服务"
+        )
+        return {
+            "service_name": service_name,
+            "service_host": host,
+            "source": str(metadata.get("source") or "external"),
+        }
+
+    def _approval_waiting_text(record: RunRecord) -> str:
+        pending = _unresolved_approvals(record)
+        names = "、".join(
+            str((event.get("tool_call") or {}).get("display_name") or (event.get("tool_call") or {}).get("name") or "工具")
+            for event in pending
+        )
+        return f"任务已暂停，正在等待你批准以下工具调用：{names}。批准后我会使用真实结果继续完成任务；拒绝后我会说明未完成原因并收尾。"
+
+    def _approval_spec(record: RunRecord, node_name: str):
+        target = _orchestrator_for_run(record.workflow_id, record)
+        return next((item for item in target.list_agents() if item.name == node_name), None)
+
     workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
@@ -1185,6 +1236,9 @@ def create_app(
                         )
                         _append_event(record, child_event)
                     for tool_call in event.get("tool_calls") or []:
+                        approval_context = _approval_tool_context(tool_call)
+                        if tool_call.get("status") == "approval_required":
+                            tool_call = {**tool_call, **approval_context}
                         _append_event(
                             record,
                             {
@@ -1195,6 +1249,12 @@ def create_app(
                                 ),
                                 "node": event.get("node"),
                                 "tool_call": tool_call,
+                                "approval_prompt": (
+                                    f"是否允许 {event.get('node')} 使用 {approval_context['service_name']} 的 "
+                                    f"{tool_call.get('display_name') or tool_call.get('name')} 执行本次操作？"
+                                    if tool_call.get("status") == "approval_required"
+                                    else ""
+                                ),
                                 "message": (
                                     f"{event.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
                                     if tool_call.get("status") == "approval_required"
@@ -1206,6 +1266,27 @@ def create_app(
                 if event.get("type") == "final":
                     record.state = dict(event.get("state") or {})
                 runs.save(record)
+            pending_approvals = _unresolved_approvals(record)
+            if pending_approvals:
+                waiting_text = _approval_waiting_text(record)
+                record.status = "waiting_approval"
+                record.finished_at = None
+                record.state = {
+                    **dict(record.state or {}),
+                    "input": waiting_text,
+                    "approval_follow_up": waiting_text,
+                }
+                record.metadata = {
+                    **record.metadata,
+                    "active_agent": None,
+                    "duration_ms": round((time.perf_counter() - started_clock) * 1000, 2),
+                    "pending_approval_sequences": [int(item.get("sequence") or 0) for item in pending_approvals],
+                    "summary": _build_run_summary(record),
+                }
+                record.metadata["summary"]["title"] = "等待工具审批"
+                record.metadata["summary"]["final_output"] = waiting_text
+                runs.save(record)
+                return
             record.status = "succeeded"
             record.finished_at = _utc_now()
             used_skills=[]
@@ -1620,7 +1701,7 @@ def create_app(
                     cursor += 1
                     yield f"id: {cursor}\nevent: run_event\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
                     idle_ticks = 0
-                if record.status in {"succeeded", "failed", "canceled"}:
+                if record.status in {"succeeded", "failed", "canceled", "waiting_approval"}:
                     completed = {
                         "type": "run_completed",
                         "status": record.status,
@@ -1675,6 +1756,8 @@ def create_app(
         if target is None:
             raise HTTPException(status_code=404, detail="approval event not found")
         decisions = dict(record.metadata.get("approval_decisions") or {})
+        if str(sequence) in decisions:
+            raise HTTPException(status_code=409, detail="该工具调用已经完成审批")
         decisions[str(sequence)] = {
             "approved": approved,
             "reason": reason,
@@ -1693,12 +1776,24 @@ def create_app(
             },
         )
         tool_call = dict(target.get("tool_call") or {})
-        # 高风险工具不会在模型选择阶段执行；只有批准后才在这里以绕过二次审批的方式执行。
+        result: Dict[str, Any]
         if approved:
             try:
-                tool = tools.get(str(tool_call.get("id") or ""))
-                task_text = str((tool_call.get("arguments") or {}).get("task") or record.input.get("input") or "")
-                result = ToolRuntime(tools).execute(tool, task_text, bypass_approval=True).to_dict()
+                tool_id = str(tool_call.get("id") or "")
+                try:
+                    tool = tools.get(tool_id)
+                except KeyError:
+                    spec = _approval_spec(record, str(target.get("node") or ""))
+                    dynamic = mcp_configs.runtime_tools_for_agent(spec.id) if spec is not None else []
+                    payload = next((item for item in dynamic if str(item.get("id")) == tool_id), None)
+                    if payload is None:
+                        raise KeyError(f"tool {tool_id!r} not found")
+                    tool = ToolRecord.from_dict(payload)
+                call_arguments = dict(tool_call.get("arguments") or {})
+                task_text = str(call_arguments.get("task") or record.input.get("input") or "")
+                result = ToolRuntime(tools).execute(
+                    tool, task_text, arguments=call_arguments, bypass_approval=True
+                ).to_dict()
             except Exception as exc:  # noqa: BLE001 - 审批后的执行错误必须留在审计轨迹中
                 result = {**tool_call, "status": "failed", "error": str(exc)}
             _append_event(
@@ -1706,20 +1801,102 @@ def create_app(
                 {
                     "type": "tool_result",
                     "node": target.get("node"),
+                    "approval_sequence": sequence,
                     "tool_call": result,
                     "message": f"审批后已执行工具 {result.get('display_name') or result.get('name')}",
                 },
             )
         else:
+            result = {**tool_call, "status": "rejected", "error": reason or "用户拒绝执行"}
             _append_event(
                 record,
                 {
                     "type": "tool_result",
                     "node": target.get("node"),
-                    "tool_call": {**tool_call, "status": "rejected", "error": reason or "用户拒绝执行"},
+                    "approval_sequence": sequence,
+                    "tool_call": result,
                     "message": "工具调用已被用户拒绝",
                 },
             )
+
+        pending = _unresolved_approvals(record)
+        if pending:
+            follow_up = _approval_waiting_text(record)
+            record.status = "waiting_approval"
+            record.metadata["pending_approval_sequences"] = [int(item.get("sequence") or 0) for item in pending]
+            record.state = {**dict(record.state or {}), "input": follow_up, "approval_follow_up": follow_up}
+            record.metadata["summary"] = _build_run_summary(record)
+            record.metadata["summary"]["title"] = "等待工具审批"
+            record.metadata["summary"]["final_output"] = follow_up
+            runs.save(record)
+            return record.to_dict()
+
+        outcomes: List[Dict[str, Any]] = []
+        for request_event in _approval_requests(record):
+            request_sequence = int(request_event.get("sequence") or 0)
+            decision = decisions.get(str(request_sequence)) or {}
+            result_event = next(
+                (
+                    event for event in reversed(record.events)
+                    if event.get("type") == "tool_result" and int(event.get("approval_sequence") or 0) == request_sequence
+                ),
+                {},
+            )
+            outcomes.append(
+                {
+                    "approved": bool(decision.get("approved")),
+                    "reason": str(decision.get("reason") or ""),
+                    "tool_call": dict(request_event.get("tool_call") or {}),
+                    "result": dict(result_event.get("tool_call") or {}),
+                }
+            )
+        spec = _approval_spec(record, str(target.get("node") or ""))
+        task_text = str(record.input.get("original_goal") or record.input.get("input") or "")
+        if isinstance(runtime_factory, AgentRuntimeFactory) and spec is not None:
+            continuation = runtime_factory.continue_after_tool_decisions(
+                spec,
+                task_text=task_text,
+                outcomes=outcomes,
+                state=record.state,
+            )
+            follow_up = continuation.text
+            continuation_meta = continuation.to_dict()
+        else:
+            rejected = [item for item in outcomes if not item.get("approved")]
+            follow_up = (
+                f"因为当前所需工具未得到批准，所以相关操作没有执行。你可以重新发起并批准，或让我改用其他方式。"
+                if rejected
+                else _approval_follow_up(result)
+            )
+            continuation_meta = {"executor": "ApprovalContinuation", "model": "", "metadata": {"fallback": True}}
+
+        record.status = "succeeded"
+        record.finished_at = _utc_now()
+        record.error = None
+        record.state = {**dict(record.state or {}), "input": follow_up, "approval_follow_up": follow_up}
+        messages = list(record.state.get("messages") or [])
+        messages.append({"agent": str(target.get("node") or "工具审批"), "content": follow_up, "runtime": "approval_continuation", "result": continuation_meta})
+        record.state["messages"] = messages
+        rejected_any = any(not item.get("approved") for item in outcomes)
+        record.metadata["approval_outcome"] = "rejected" if rejected_any else "approved"
+        record.metadata["pending_approval_sequences"] = []
+        _append_event(record, {
+            "type": "approval_continuation",
+            "node": target.get("node"),
+            "message": follow_up,
+            "executor": continuation_meta.get("executor"),
+            "model": continuation_meta.get("model"),
+            "approval_outcome": record.metadata["approval_outcome"],
+        })
+        record.metadata["summary"] = _build_run_summary(record)
+        conversation_id = str(record.metadata.get("conversation_id") or "")
+        if conversation_id:
+            try:
+                conversation = conversations.get(conversation_id)
+                conversation.messages.append({"role": "assistant", "content": follow_up, "created_at": _utc_now(), "run_id": record.id})
+                conversations.save(conversation)
+            except KeyError:
+                pass
         runs.save(record)
         return record.to_dict()
 
@@ -2509,11 +2686,13 @@ def create_app(
         return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
 
     # ------------------------- 百炼式资源市场 ------------------------- #
-    # 这些条目是可安装的本地模板，不声明为已接入第三方云服务。
+    # 市场只展示有明确来源的工具：平台内置工具在前端直接来自工具目录；
+    # MCP 条目是可验证的远程服务或明确标注为“需配置”的连接模板。
     mcp_market = [
         {"slug":"local-demo","name":"本地演示 MCP","provider":"AgentForge","category":"开发测试","description":"零权限 JSON-RPC 演示服务，用于验证 MCP 发现、选择与调用链。","cover":"violet","mcp_url":"http://127.0.0.1:8000/mcp/demo","verified":True,"tools":[{"name":"preview_email","title":"邮件预览","description":"仅生成邮件预览，不发送真实邮件"},{"name":"lookup_demo","title":"演示检索","description":"返回本地演示检索结果"}]},
+        {"slug":"context7","name":"Context7 文档 MCP","provider":"Context7","category":"开发工具","description":"查询公开的软件库与框架最新文档；无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"mint","mcp_url":"https://mcp.context7.com/mcp","verified":True,"tools":[{"name":"resolve-library-id","title":"解析文档库","description":"把库名解析为 Context7 文档库 ID","inputSchema":{"type":"object","properties":{"libraryName":{"type":"string"}},"required":["libraryName"]}},{"name":"query-docs","title":"查询文档","description":"基于已解析的库 ID 查询文档","inputSchema":{"type":"object","properties":{"libraryId":{"type":"string"},"query":{"type":"string"}},"required":["libraryId","query"]}}]},
         {"slug":"web-search","name":"联网检索 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入组织已采购的检索 MCP；安装后需要填写实际服务地址和凭据。","cover":"mint","verified":False},
-        {"slug":"calendar","name":"日历与会议 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入日历服务，用于查询空闲时间和创建会议；安装后需要配置。","cover":"violet","verified":False},
+        {"slug":"github","name":"GitHub MCP","provider":"GitHub","category":"代码协作","description":"用于仓库、Issue 与 PR 协作；服务真实可用，但需在自定义连接中配置 GitHub 认证后再安装。","cover":"violet","verified":False},
         {"slug":"enterprise-knowledge","name":"企业知识检索 MCP 模板","provider":"项目精选目录","category":"知识库","description":"接入企业文档检索服务；安装后需要填写实际 MCP 地址。","cover":"cyan","verified":False},
     ]
     def _tool_connection_payload(connection: ToolConnectionRecord) -> Dict[str, Any]:
@@ -2578,8 +2757,19 @@ def create_app(
             payload=_tool_connection_payload(existing)
             return {"installed":False,"connection":payload,"tool":payload["tools"][0] if payload["tools"] else None,"message":"该 MCP 已安装到工作区"}
         connection = tool_connections.create(id=f"market-{slug}",type="mcp",name=item["name"],source="market",market_slug=slug,endpoint=item.get("mcp_url", ""),status="installed" if item.get("mcp_url") else "configuration_required",metadata={"provider":item.get("provider", ""),"verified":bool(item.get("verified"))})
-        for remote in item.get("tools") or []:
-            record = tools.create(name=f"mcp_{slug}_{remote['name']}",display_name=str(remote.get("title") or remote["name"]),description=str(remote.get("description") or "MCP 工具"),category="mcp",tags=["mcp","market"],metadata={"source":"mcp","adapter":"mcp_http","connection_id":connection.id,"market_slug":slug,"mcp_url":connection.endpoint,"method":"tools/call","remote_tool_name":remote["name"],"input_schema":remote.get("inputSchema") or {"type":"object"},"risk":"read","sync_status":"synced","needs_configuration":False})
+        remote_tools = item.get("tools") or []
+        # Fetch the live schema where possible.  The bundled schema remains a
+        # safe fallback so the marketplace stays usable if a remote service is
+        # temporarily unavailable during installation.
+        if connection.endpoint.startswith("https://"):
+            try:
+                remote_tools = discover_mcp_tools(connection.endpoint, "", 12)
+            except Exception:
+                pass
+        for remote in remote_tools:
+            annotations = dict(remote.get("annotations") or {})
+            risk = "read" if annotations.get("readOnlyHint") is True else "high"
+            record = tools.create(name=f"mcp_{slug}_{remote['name']}",display_name=str(remote.get("title") or remote["name"]),description=str(remote.get("description") or "MCP 工具"),category="mcp",tags=["mcp","market"],metadata={"source":"mcp","adapter":"mcp_http","connection_id":connection.id,"market_slug":slug,"mcp_url":connection.endpoint,"method":"tools/call","remote_tool_name":remote["name"],"input_schema":remote.get("inputSchema") or remote.get("input_schema") or {"type":"object"},"risk":risk,"mcp_annotations":annotations,"sync_status":"synced","needs_configuration":False})
             connection.tool_ids.append(record.id)
         connection.last_synced_at=_utc_now() if connection.tool_ids else "";tool_connections.save(connection)
         message = "MCP 已安装到工作区，请按需添加子工具" if connection.tool_ids else "MCP 模板已安装，请先完成服务配置"
@@ -2936,7 +3126,11 @@ def create_app(
             for remote in discover_mcp_tools(url, credential_env, timeout):
                 remote_name = str(remote["name"])
                 slug = f"mcp_{connection_id}_{remote_name}".replace("-", "_")
-                metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection_id,"connection_name":name,"mcp_url":url,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or {},"credential_env":credential_env,"risk":str(req.get("risk") or "read"),"sync_status":"synced","timeout_seconds":timeout}
+                annotations = dict(remote.get("annotations") or {})
+                # MCP annotations are advisory.  Unknown and write-capable
+                # tools default to approval-required instead of "read".
+                discovered_risk = "read" if annotations.get("readOnlyHint") is True else "high"
+                metadata = {"source":"mcp","adapter":"mcp_http","connection_id":connection_id,"connection_name":name,"mcp_url":url,"method":"tools/call","remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or remote.get("input_schema") or {},"credential_env":credential_env,"risk":str(req.get("risk") or discovered_risk),"mcp_annotations":annotations,"sync_status":"synced","timeout_seconds":timeout}
                 record=tools.create(name=slug,display_name=str(remote.get("title") or remote_name),description=str(remote.get("description") or f"{name} MCP 工具"),category="mcp",tags=["mcp","external"],metadata=metadata);imported.append(record.to_dict());connection.tool_ids.append(record.id)
             connection.status="installed";connection.last_synced_at=_utc_now();tool_connections.save(connection)
             return {"connection_id":connection_id,"connection":_tool_connection_payload(connection),"tools":imported}
@@ -3000,7 +3194,8 @@ def create_app(
             for remote in remote_tools:
                 remote_name = str(remote["name"])
                 item = by_name.get(remote_name)
-                metadata = {**seed.metadata,"remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or {},"sync_status":"synced"}
+                annotations = dict(remote.get("annotations") or {})
+                metadata = {**seed.metadata,"remote_tool_name":remote_name,"input_schema":remote.get("inputSchema") or remote.get("input_schema") or {},"mcp_annotations":annotations,"risk":"read" if annotations.get("readOnlyHint") is True else "high","sync_status":"synced"}
                 if item:
                     item.display_name=str(remote.get("title") or remote_name);item.description=str(remote.get("description") or item.description);item.metadata=metadata;synced.append(tools.save(item).to_dict())
                 else:

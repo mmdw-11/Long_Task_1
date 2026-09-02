@@ -47,6 +47,22 @@ def test_marketplace_installation_and_memory_bank(tmp_path, monkeypatch):
     assert client.get("/api/memory-banks").json()[0]["name"] == "客户沟通记忆库"
 
 
+def test_marketplace_separates_real_remote_mcp_from_builtin_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.setenv("SEED_BUILTIN_TOOLS", "1")
+    app = create_app(tool_catalog_store=ToolCatalogStore(tmp_path / "tools"))
+    client = TestClient(app)
+
+    market = {item["slug"]: item for item in client.get("/api/marketplace/mcp").json()}
+
+    assert market["context7"]["mcp_url"] == "https://mcp.context7.com/mcp"
+    assert market["context7"]["availability"] == "ready"
+    assert market["github"]["requires_configuration"] is True
+    builtins = client.get("/api/tools").json()
+    assert {item["name"] for item in builtins} >= {"current_time", "calculator", "task_note"}
+    assert all(item["metadata"].get("source") == "builtin" for item in builtins)
+
+
 def test_component_and_console_resources_are_actionable(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
     app = create_app(

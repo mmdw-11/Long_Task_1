@@ -55,7 +55,16 @@ def discover_mcp_tools(url: str, credential_env: str = "", timeout: float = 8) -
         raw = response.read(MAX_REMOTE_BYTES + 1)
     if len(raw) > MAX_REMOTE_BYTES:
         raise ValueError("MCP 响应超过 2MB 限制")
-    parsed = json.loads(raw.decode("utf-8"))
+    text = raw.decode("utf-8", errors="replace").strip()
+    # Streamable HTTP MCP servers commonly return a JSON-RPC message wrapped
+    # in SSE.  Treat both JSON and SSE as first-class MCP responses.
+    sse_chunks = [
+        line[5:].strip() for line in text.splitlines()
+        if line.startswith("data:") and line[5:].strip() not in {"[DONE]", ""}
+    ]
+    if sse_chunks:
+        text = "\n".join(sse_chunks)
+    parsed = json.loads(text)
     if parsed.get("error"):
         raise ValueError(f"MCP 工具发现失败：{parsed['error']}")
     discovered = (parsed.get("result") or {}).get("tools") or []
