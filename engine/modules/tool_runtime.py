@@ -18,7 +18,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .mcp_integration import _arguments_from_schema, _strip_sse, call_mcp_tool_sync
 from .product_ops import ToolCatalogStore, ToolRecord
-from .tools import mcp_error_message
+from .tools.contracts import mcp_error_message
+from .tools.mcp_remote import MCPAuthorizationStore, call_tool as call_remote_mcp_tool
 
 
 @dataclass
@@ -50,8 +51,9 @@ class ToolRuntimeResult:
 class ToolRuntime:
     """Resolve allowed tools for an AgentSpec and execute safe adapters."""
 
-    def __init__(self, catalog: ToolCatalogStore) -> None:
+    def __init__(self, catalog: ToolCatalogStore, mcp_oauth_store: MCPAuthorizationStore | None = None) -> None:
         self.catalog = catalog
+        self.mcp_oauth_store = mcp_oauth_store
 
     def available_for_agent(self, tool_ids: Iterable[str] | None) -> List[ToolRecord]:
         ids = [str(item) for item in (tool_ids or []) if str(item).strip()]
@@ -113,6 +115,36 @@ class ToolRuntime:
                 scored.append((score, tool))
         return [tool for _, tool in sorted(scored, key=lambda item: item[0], reverse=True)[:3]]
 
+    def select_for_model(self, tools: List[ToolRecord], text: str, *, limit: int = 12) -> List[ToolRecord]:
+        """Keep a large MCP catalogue from distracting the model.
+
+        Remote providers can expose hundreds of administration tools. Passing
+        every one to a function-calling model leads to setup calls (mailbox
+        creation, templates, WhatsApp, etc.) instead of the requested action.
+        This is a relevance *allowlist*, not an execution decision.
+        """
+        if len(tools) <= limit:
+            return tools
+        normalized = text.lower()
+        wants_email = bool(re.search(r"邮件|邮箱|email|mail", normalized))
+        wants_send = wants_email and bool(re.search(r"发送|发给|寄|send|deliver", normalized))
+        scored: list[tuple[int, ToolRecord]] = []
+        for index, tool in enumerate(tools):
+            remote = str(tool.metadata.get("remote_tool_name") or tool.name).lower()
+            blob = f"{remote} {tool.display_name} {tool.description}".lower()
+            score = sum(1 for token in _tokens(normalized) if token in blob)
+            if wants_email:
+                if "email" in remote or "email" in blob: score += 8
+                else: score -= 10
+            if wants_send:
+                if remote == "email_send" or ("email" in remote and "send" in remote): score += 100
+                elif remote == "email_domains_list": score += 80  # required safe preflight
+                elif remote in {"email_mailboxes_list", "whoami", "workspace_get"}: score += 15
+                elif any(word in remote for word in ("create", "delete", "update", "template", "whatsapp", "sms")): score -= 30
+            scored.append((score, tool))
+        selected = [tool for score, tool in sorted(scored, key=lambda item: item[0], reverse=True) if score > 0][:limit]
+        return selected or tools[:limit]
+
     def execute(
         self,
         tool: ToolRecord,
@@ -126,6 +158,12 @@ class ToolRuntime:
         # silently auto-approved.  Built-ins retain their explicit low risk.
         default_risk = "high" if adapter in {"mcp_http", "mcp_url", "mcp", "mcp_tool", "agent_mcp_tool"} else "low"
         risk = str(tool.metadata.get("risk") or default_risk).lower()
+        preflight_error = _bird_email_preflight_error(tool.metadata, dict(arguments or {}), self.mcp_oauth_store)
+        if preflight_error:
+            return ToolRuntimeResult(
+                id=tool.id, name=tool.name, display_name=tool.display_name,
+                status="blocked", arguments=dict(arguments or {}), error=preflight_error, risk=risk,
+            )
         approval_required = risk not in {"low", "read"}
         if approval_required and not bypass_approval:
             return ToolRuntimeResult(
@@ -150,7 +188,7 @@ class ToolRuntime:
                 args = dict(arguments or {"text": task_text[:1000]})
             elif adapter in {"mcp_http", "mcp_url", "mcp"}:
                 args = dict(arguments or _arguments_from_schema(dict(tool.metadata.get("input_schema") or {}), task_text))
-                result = _call_mcp_http(tool.metadata, task_text, arguments=args)
+                result = _call_mcp_http(tool.metadata, task_text, arguments=args, oauth_store=self.mcp_oauth_store)
             elif adapter == "openapi_http":
                 args = {"url": str(tool.metadata.get("operation_url") or "")}
                 result = _call_openapi_http(tool.metadata, task_text)
@@ -233,44 +271,53 @@ def _tokens(text: str) -> List[str]:
 
 
 def _call_mcp_http(
-    metadata: Dict[str, Any], task_text: str, *, arguments: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any], task_text: str, *, arguments: Optional[Dict[str, Any]] = None,
+    oauth_store: MCPAuthorizationStore | None = None,
 ) -> Dict[str, Any]:
     url = str(metadata.get("mcp_url") or metadata.get("url") or "").strip()
     if not url:
         raise ValueError("mcp_url is required")
-    method = str(metadata.get("method") or "tools/call")
     remote_name = str(metadata.get("remote_tool_name") or "")
     resolved_arguments = dict(arguments or _arguments_from_schema(dict(metadata.get("input_schema") or {}), task_text))
-    payload = {
-        "jsonrpc": "2.0",
-        "id": f"agentforge-{datetime.now(timezone.utc).timestamp()}",
-        "method": method,
-        "params": metadata.get("params") or ({"name": remote_name, "arguments": resolved_arguments} if remote_name else resolved_arguments),
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if not remote_name:
+        raise ValueError("MCP 工具缺少 remote_tool_name")
     credential_env = str(metadata.get("credential_env") or "")
-    if credential_env and os.environ.get(credential_env):
-        headers["Authorization"] = f"Bearer {os.environ[credential_env]}"
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
+    token = os.environ.get(credential_env, "") if credential_env else ""
+    if not token and oauth_store is not None:
+        token = oauth_store.token_for(str(metadata.get("connection_id") or ""))
     try:
-        with urllib.request.urlopen(request, timeout=float(metadata.get("timeout_seconds") or 8)) as response:
-            text = response.read(200_000).decode("utf-8", errors="replace")
-            try:
-                parsed: Any = json.loads(_strip_sse(text))
-            except json.JSONDecodeError:
-                parsed = text
-            error = mcp_error_message(parsed)
-            if error:
-                raise RuntimeError(error)
-            return {"url": url, "method": method, "response": parsed}
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"MCP HTTP request failed: {exc}") from exc
+        response = call_remote_mcp_tool(url, remote_name, resolved_arguments, token=token, timeout=float(metadata.get("timeout_seconds") or 8))
+        return {"url": url, "method": "tools/call", "response": response}
+    except Exception as exc:
+        if not token:
+            raise RuntimeError("MCP 尚未授权。请在“已安装”中完成浏览器登录后再试。") from exc
+        raise RuntimeError(f"MCP 工具调用失败：{exc}") from exc
+
+
+def _bird_email_preflight_error(metadata: Dict[str, Any], arguments: Dict[str, Any], oauth_store: MCPAuthorizationStore | None) -> str:
+    """Block invalid Bird email sends before asking the user to approve them."""
+    if str(metadata.get("remote_tool_name") or "") != "email_send" or "mcp.bird.com" not in str(metadata.get("mcp_url") or ""):
+        return ""
+    sender = str(arguments.get("from") or "").strip().lower()
+    credential_env = str(metadata.get("credential_env") or "")
+    token = os.environ.get(credential_env, "") if credential_env else ""
+    if not token and oauth_store is not None:
+        token = oauth_store.token_for(str(metadata.get("connection_id") or ""))
+    if not token:
+        return "Bird 尚未授权，请先完成 MCP 登录授权。"
+    try:
+        response = call_remote_mcp_tool(str(metadata.get("mcp_url")), "email_domains_list", {}, token=token, timeout=12)
+        text = next((str(item.get("text") or "") for item in response.get("content") or [] if isinstance(item, dict)), "")
+        data = json.loads(text).get("data") if text else []
+    except Exception as exc:
+        return f"无法验证 Bird 发件域，因此没有发送邮件：{exc}"
+    domains = [str(item.get("domain") or item.get("name") or "") for item in data or [] if isinstance(item, dict)]
+    if not domains:
+        return "Bird 工作区没有已验证的发件域，因此不能发送邮件。请先在 Bird 控制台添加并验证发信域名（SPF/DKIM），然后重新发起任务。"
+    sender_domain = sender.rsplit("@", 1)[-1] if "@" in sender else ""
+    if sender.endswith("@example.com") or sender == "noreply@example.com" or sender_domain not in domains:
+        return f"发件地址 {sender or '未提供'} 不属于已验证域。请使用以下已验证域的地址：{', '.join(domains[:5])}。"
+    return ""
 
 
 def _call_openapi_http(metadata: Dict[str, Any], task_text: str) -> Dict[str, Any]:

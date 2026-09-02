@@ -636,6 +636,8 @@ def _tool_from_any(item: Any) -> MCPToolRecord:
 def _arguments_from_schema(schema: Dict[str, Any], task_text: str) -> Dict[str, Any]:
     props = schema.get("properties") if isinstance(schema, dict) else {}
     required = [str(item) for item in schema.get("required") or []] if isinstance(schema, dict) else []
+    if isinstance(props, dict) and not props:
+        return {}
     if isinstance(props, dict) and {"libraryId", "query"}.issubset(props):
         match = re.search(r"(/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)", task_text)
         return {"libraryId": match.group(1) if match else task_text[:1000], "query": task_text[:1000]}
@@ -645,7 +647,9 @@ def _arguments_from_schema(schema: Dict[str, Any], task_text: str) -> Dict[str, 
         return {"query": task_text[:1000]}
     if isinstance(props, dict) and "task" in props:
         return {"task": task_text[:1000]}
-    return {"task": task_text[:1000]}
+    # An MCP schema without a recognised argument must not receive an
+    # invented ``task`` field: strict servers reject unknown properties.
+    return {}
 
 
 def _is_builtin_demo_endpoint(endpoint: str) -> bool:

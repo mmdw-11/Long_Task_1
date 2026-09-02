@@ -19,7 +19,7 @@ from ..modules.model_connections import ModelConnectionStore, connection_api_key
 from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
 from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity
-from ..modules.tools import ToolRuntime, decode_tool_arguments, tool_function_schema
+from ..modules.tools import MCPAuthorizationStore, ToolRuntime, decode_tool_arguments, tool_function_schema
 from .knowledge import KnowledgeStore
 from ..modules.skills import SKILL_CONTEXT_TEXT_KEY
 from ..node import Node, NodeType
@@ -39,12 +39,13 @@ class AgentRuntimeFactory:
         tool_catalog_store: Optional[ToolCatalogStore] = None,
         model_connection_store: Optional[ModelConnectionStore] = None,
         mcp_config_store: Optional[MCPConfigStore] = None,
+        mcp_oauth_store: Optional[MCPAuthorizationStore] = None,
         knowledge_store: Optional[KnowledgeStore] = None,
         max_attempts: int = 3,
     ) -> None:
         self.scheduler = scheduler or AdaptiveResourceScheduler()
         self.registry = registry or ExecutorRegistry.default()
-        self.tool_runtime = ToolRuntime(tool_catalog_store) if tool_catalog_store is not None else None
+        self.tool_runtime = ToolRuntime(tool_catalog_store, mcp_oauth_store) if tool_catalog_store is not None else None
         self.model_connections = model_connection_store
         self.mcp_config_store = mcp_config_store
         self.knowledge_store = knowledge_store
@@ -84,6 +85,7 @@ class AgentRuntimeFactory:
             system_prompt = self._render_variables(spec.sys_prompt, state)
             available_tools = self._available_tools(spec)
             if available_tools and self._supports_native_tool_loop(spec):
+                available_tools = self.tool_runtime.select_for_model(available_tools, self._state_input_text(state))
                 result, tool_calls = self._run_model_tool_loop(
                     spec, prompt, system_prompt, available_tools, state
                 )
@@ -400,7 +402,7 @@ class AgentRuntimeFactory:
         functions = [tool_function_schema(tool) for tool in available_tools]
         by_name = {str(tool.name): tool for tool in available_tools}
         messages: list[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt or "Answer concisely and accurately."},
+            {"role": "system", "content": (system_prompt or "Answer concisely and accurately.") + "\n\n工具规则：只能依据真实工具结果说明已完成的操作。工具返回 isError、failed 或 blocked 时不得称任务成功。对于外部写操作，选择与用户目标直接对应的工具，不得把创建邮箱、模板或其他配置操作当作发送完成。"},
             {"role": "user", "content": prompt},
         ]
         audit_calls: list[Dict[str, Any]] = []

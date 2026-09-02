@@ -16,6 +16,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .tools.mcp_remote import discover_tools
+
 
 MAX_REMOTE_BYTES = 2_000_000
 MAX_SKILL_FILES = 100
@@ -43,34 +45,11 @@ def read_remote_document(url: str) -> bytes:
     return content
 
 
-def discover_mcp_tools(url: str, credential_env: str = "", timeout: float = 8) -> List[Dict[str, Any]]:
+def discover_mcp_tools(url: str, credential_env: str = "", timeout: float = 8, access_token: str = "") -> List[Dict[str, Any]]:
     """Discover tools exposed by a remote MCP HTTP endpoint."""
     endpoint = validate_remote_url(url)
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-    if credential_env and os.environ.get(credential_env):
-        headers["Authorization"] = f"Bearer {os.environ[credential_env]}"
-    payload = json.dumps({"jsonrpc": "2.0", "id": "agentforge-discovery", "method": "tools/list", "params": {}}).encode("utf-8")
-    request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - URL validated above
-        raw = response.read(MAX_REMOTE_BYTES + 1)
-    if len(raw) > MAX_REMOTE_BYTES:
-        raise ValueError("MCP 响应超过 2MB 限制")
-    text = raw.decode("utf-8", errors="replace").strip()
-    # Streamable HTTP MCP servers commonly return a JSON-RPC message wrapped
-    # in SSE.  Treat both JSON and SSE as first-class MCP responses.
-    sse_chunks = [
-        line[5:].strip() for line in text.splitlines()
-        if line.startswith("data:") and line[5:].strip() not in {"[DONE]", ""}
-    ]
-    if sse_chunks:
-        text = "\n".join(sse_chunks)
-    parsed = json.loads(text)
-    if parsed.get("error"):
-        raise ValueError(f"MCP 工具发现失败：{parsed['error']}")
-    discovered = (parsed.get("result") or {}).get("tools") or []
-    if not isinstance(discovered, list) or not discovered:
-        raise ValueError("MCP 服务未返回可用工具")
-    return [item for item in discovered if isinstance(item, dict) and item.get("name")]
+    token = access_token or (os.environ.get(credential_env, "") if credential_env else "")
+    return discover_tools(endpoint, token=token, timeout=timeout)
 
 
 def parse_openapi(content: bytes) -> Dict[str, Any]:
