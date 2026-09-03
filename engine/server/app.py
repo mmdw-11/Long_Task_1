@@ -1794,28 +1794,45 @@ def create_app(
         if target is None:
             raise HTTPException(status_code=404, detail="approval event not found")
         decisions = dict(record.metadata.get("approval_decisions") or {})
-        if str(sequence) in decisions:
-            raise HTTPException(status_code=409, detail="该工具调用已经完成审批")
-        decisions[str(sequence)] = {
-            "approved": approved,
-            "reason": reason,
-            "decided_at": _utc_now(),
-        }
-        record.metadata["approval_decisions"] = decisions
-        _append_event(
-            record,
-            {
-                "type": "approval_decision",
-                "approval_sequence": sequence,
+        existing_decision = decisions.get(str(sequence))
+        # An approval can have completed its side effect just before a model
+        # continuation fails.  Treat an identical retry as a safe resume:
+        # never execute the tool twice, only rebuild the continuation from its
+        # recorded result.  This also makes browser retries idempotent.
+        replay_completed_decision = existing_decision is not None
+        if replay_completed_decision:
+            if bool(existing_decision.get("approved")) != approved:
+                raise HTTPException(status_code=409, detail="该工具调用已经完成相反的审批决定")
+            result_event = next(
+                (
+                    event for event in reversed(record.events)
+                    if event.get("type") == "tool_result" and int(event.get("approval_sequence") or 0) == sequence
+                ),
+                None,
+            )
+            if result_event is None:
+                raise HTTPException(status_code=409, detail="该工具调用正在处理，请稍后重试")
+            result = dict(result_event.get("tool_call") or {})
+        else:
+            decisions[str(sequence)] = {
                 "approved": approved,
                 "reason": reason,
-                "tool_call": target.get("tool_call"),
-                "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
-            },
-        )
+                "decided_at": _utc_now(),
+            }
+            record.metadata["approval_decisions"] = decisions
+            _append_event(
+                record,
+                {
+                    "type": "approval_decision",
+                    "approval_sequence": sequence,
+                    "approved": approved,
+                    "reason": reason,
+                    "tool_call": target.get("tool_call"),
+                    "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
+                },
+            )
         tool_call = dict(target.get("tool_call") or {})
-        result: Dict[str, Any]
-        if approved:
+        if not replay_completed_decision and approved:
             try:
                 tool_id = str(tool_call.get("id") or "")
                 try:
@@ -1844,7 +1861,7 @@ def create_app(
                     "message": f"审批后已执行工具 {result.get('display_name') or result.get('name')}",
                 },
             )
-        else:
+        elif not replay_completed_decision:
             result = {**tool_call, "status": "rejected", "error": reason or "用户拒绝执行"}
             _append_event(
                 record,
@@ -1890,8 +1907,9 @@ def create_app(
             )
         spec = _approval_spec(record, str(target.get("node") or ""))
         task_text = str(record.input.get("original_goal") or record.input.get("input") or "")
+        continuation_tool_calls: List[Dict[str, Any]] = []
         if isinstance(runtime_factory, AgentRuntimeFactory) and spec is not None:
-            continuation = runtime_factory.continue_after_tool_decisions(
+            continuation, continuation_tool_calls = runtime_factory.continue_tool_loop_after_tool_decisions(
                 spec,
                 task_text=task_text,
                 outcomes=outcomes,
@@ -1907,6 +1925,61 @@ def create_app(
                 else _approval_follow_up(result)
             )
             continuation_meta = {"executor": "ApprovalContinuation", "model": "", "metadata": {"fallback": True}}
+
+        if not continuation_meta.get("success", True):
+            record.status = "failed"
+            record.finished_at = _utc_now()
+            record.error = str(continuation_meta.get("error") or "审批后的模型续跑失败")
+            record.state = {**dict(record.state or {}), "input": follow_up, "approval_follow_up": follow_up}
+            _append_event(record, {
+                "type": "approval_continuation_failed",
+                "node": target.get("node"),
+                "message": follow_up,
+                "error": record.error,
+                "retryable": bool(continuation_meta.get("retryable")),
+            })
+            record.metadata["summary"] = _build_run_summary(record)
+            runs.save(record)
+            return record.to_dict()
+
+        for tool_call in continuation_tool_calls:
+            approval_context = _approval_tool_context(tool_call)
+            if tool_call.get("status") == "approval_required":
+                tool_call = {**tool_call, **approval_context}
+            _append_event(
+                record,
+                {
+                    "type": "approval_required" if tool_call.get("status") == "approval_required" else "tool_result",
+                    "node": target.get("node"),
+                    "tool_call": tool_call,
+                    "approval_prompt": (
+                        f"是否允许 {target.get('node')} 使用 {approval_context['service_name']} 的 "
+                        f"{tool_call.get('display_name') or tool_call.get('name')} 执行本次操作？"
+                        if tool_call.get("status") == "approval_required"
+                        else ""
+                    ),
+                    "message": (
+                        f"{target.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
+                        if tool_call.get("status") == "approval_required"
+                        else f"{target.get('node')} 已调用工具 {tool_call.get('display_name') or tool_call.get('name')}"
+                    ),
+                },
+            )
+
+        pending_after_continuation = _unresolved_approvals(record)
+        if pending_after_continuation:
+            waiting_text = _approval_waiting_text(record)
+            record.status = "waiting_approval"
+            record.finished_at = None
+            record.error = None
+            record.state = {**dict(record.state or {}), "input": waiting_text, "approval_follow_up": waiting_text}
+            record.metadata["approval_outcome"] = "approved"
+            record.metadata["pending_approval_sequences"] = [int(item.get("sequence") or 0) for item in pending_after_continuation]
+            record.metadata["summary"] = _build_run_summary(record)
+            record.metadata["summary"]["title"] = "等待工具审批"
+            record.metadata["summary"]["final_output"] = waiting_text
+            runs.save(record)
+            return record.to_dict()
 
         record.status = "succeeded"
         record.finished_at = _utc_now()
