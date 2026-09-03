@@ -92,6 +92,7 @@ from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowSto
 from ..modules.tools import GMAIL_STATIC_OAUTH_SCHEMA, MCPAuthorizationRequired, MCPAuthorizationStore, ToolRuntime, complete_authorization, ensure_builtin_tools, inspect_connection, missing_required, start_authorization
 from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
 from ..modules.knowledge import KnowledgeStore
+from ..modules.workspace_tools import WorkspaceStore
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -101,6 +102,7 @@ BUILTIN_SKILLS = [
     {"slug":"travel-planner","name":"旅行计划","category":"通用办公","description":"生成兼顾时间、预算、天气与交通的行程方案。","content":"# 旅行计划\n\n确认目的地、日期、预算、同行人和偏好；涉及实时信息时建议调用已授权工具。"},
     {"slug":"meeting-summary","name":"会议纪要","category":"通用办公","description":"将会议材料整理为结论、行动项、负责人和截止时间。","content":"# 会议纪要\n\n以结论、行动项、负责人、截止时间四部分输出；缺失信息明确标记待补充。"},
     {"slug":"web-design","name":"网页设计","category":"代码开发","description":"把用户需求转为信息架构、界面层级和可实施的前端建议。","content":"# 网页设计\n\n先给出页面目标、用户路径和组件清单，再输出可实施的视觉与交互建议。"},
+    {"slug":"software-engineer","name":"本地软件工程","category":"代码开发","description":"在已选工作区内规划、修改、测试和审查代码，并坚持验收标准与最小修改范围。","content":"# 本地软件工程\n\n先读取工作区和相关代码，再给出简洁计划。需要修改时只调用已挂载的工作区工具；每次写入或测试均等待审批。修改后必须读取 diff 并运行适当测试。出现错误时依据真实日志定位原因，避免猜测。不得访问工作区外路径，不得声称未执行的测试已经通过。"},
     {"slug":"data-analysis","name":"数据分析","category":"金融","description":"帮助解释指标、识别异常并给出可复现的分析路径。","content":"# 数据分析\n\n明确数据范围与口径，区分计算结果和业务推断，给出复核步骤。"},
 ]
 
@@ -246,6 +248,15 @@ class TestToolReq(BaseModel):
     """从控制台验证工具适配器；高风险工具只返回审批请求。"""
 
     task: str = "请执行工具连通性测试"
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateWorkspaceReq(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    root_path: str
+    read_only: bool = False
+    allowed_commands: List[str] = Field(default_factory=list)
+    create_if_missing: bool = False
 
 
 class CreateApiKeyReq(BaseModel):
@@ -510,6 +521,7 @@ def create_app(
     model_connection_store: Optional[ModelConnectionStore] = None,
     conversation_store: Optional[ConversationStore] = None,
     memory_audit_store: Optional[MemoryAuditStore] = None,
+    workspace_store: Optional[WorkspaceStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -551,6 +563,7 @@ def create_app(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
     mcp_configs = mcp_config_store or MCPConfigStore(os.environ.get("MCP_CONFIG_ROOT") or "runs/mcp")
+    workspaces = workspace_store or WorkspaceStore(os.environ.get("WORKSPACE_STORE_ROOT") or str(applications.root_dir.parent / "workspaces"))
     auth = auth_store or AuthStore(os.environ.get("AUTH_DB_PATH") or "runs/auth/users.sqlite3")
     # 内置 Skill 是平台可信只读能力，启动时幂等预置并直接发布。
     for template in BUILTIN_SKILLS:
@@ -586,6 +599,7 @@ def create_app(
         mcp_config_store=mcp_configs,
         mcp_oauth_store=mcp_oauth,
         knowledge_store=knowledge,
+        workspace_store=workspaces,
     )
 
     def _approval_requests(record: RunRecord) -> List[Dict[str, Any]]:
@@ -615,6 +629,26 @@ def create_app(
             "source": str(metadata.get("source") or "external"),
         }
 
+    def _approval_scope(tool_call: Dict[str, Any]) -> str:
+        """A task-scoped grant covers only bounded local edits and checks."""
+        try:
+            adapter = str(tools.get(str(tool_call.get("id") or "")).metadata.get("adapter") or "")
+        except KeyError:
+            adapter = str(tool_call.get("name") or "")
+        return "workspace_engineering" if adapter in {
+            "workspace_apply_patch", "workspace_write_files", "workspace_run_command",
+        } else ""
+
+    def _approval_prompt(node_name: Any, tool_call: Dict[str, Any], approval_context: Dict[str, str]) -> str:
+        tool_name = tool_call.get("display_name") or tool_call.get("name") or "工具"
+        if _approval_scope(tool_call) == "workspace_engineering":
+            return (
+                f"是否允许 {node_name} 在当前已选本地代码工作区执行本次工程任务？"
+                f"批准后，本任务内的受限文件创建/修改和白名单本地检查会自动继续；"
+                f"外部服务、恢复/删除等更高风险操作仍会单独请求批准。"
+            )
+        return f"是否允许 {node_name} 使用 {approval_context['service_name']} 的 {tool_name} 执行本次操作？"
+
     def _approval_waiting_text(record: RunRecord) -> str:
         pending = _unresolved_approvals(record)
         names = "、".join(
@@ -627,7 +661,7 @@ def create_app(
         target = _orchestrator_for_run(record.workflow_id, record)
         return next((item for item in target.list_agents() if item.name == node_name), None)
 
-    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -1189,7 +1223,7 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
-            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth) if is_visual_workflow else None
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces) if is_visual_workflow else None
             compiled = target.build_graph(
                 node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
@@ -1273,12 +1307,9 @@ def create_app(
                                 ),
                                 "node": event.get("node"),
                                 "tool_call": tool_call,
-                                "approval_prompt": (
-                                    f"是否允许 {event.get('node')} 使用 {approval_context['service_name']} 的 "
-                                    f"{tool_call.get('display_name') or tool_call.get('name')} 执行本次操作？"
-                                    if tool_call.get("status") == "approval_required"
-                                    else ""
-                                ),
+                                "approval_prompt": _approval_prompt(event.get("node"), tool_call, approval_context)
+                                if tool_call.get("status") == "approval_required"
+                                else "",
                                 "message": (
                                     f"{event.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
                                     if tool_call.get("status") == "approval_required"
@@ -1780,28 +1811,45 @@ def create_app(
         if target is None:
             raise HTTPException(status_code=404, detail="approval event not found")
         decisions = dict(record.metadata.get("approval_decisions") or {})
-        if str(sequence) in decisions:
-            raise HTTPException(status_code=409, detail="该工具调用已经完成审批")
-        decisions[str(sequence)] = {
-            "approved": approved,
-            "reason": reason,
-            "decided_at": _utc_now(),
-        }
-        record.metadata["approval_decisions"] = decisions
-        _append_event(
-            record,
-            {
-                "type": "approval_decision",
-                "approval_sequence": sequence,
+        existing_decision = decisions.get(str(sequence))
+        # An approval can have completed its side effect just before a model
+        # continuation fails.  Treat an identical retry as a safe resume:
+        # never execute the tool twice, only rebuild the continuation from its
+        # recorded result.  This also makes browser retries idempotent.
+        replay_completed_decision = existing_decision is not None
+        if replay_completed_decision:
+            if bool(existing_decision.get("approved")) != approved:
+                raise HTTPException(status_code=409, detail="该工具调用已经完成相反的审批决定")
+            result_event = next(
+                (
+                    event for event in reversed(record.events)
+                    if event.get("type") == "tool_result" and int(event.get("approval_sequence") or 0) == sequence
+                ),
+                None,
+            )
+            if result_event is None:
+                raise HTTPException(status_code=409, detail="该工具调用正在处理，请稍后重试")
+            result = dict(result_event.get("tool_call") or {})
+        else:
+            decisions[str(sequence)] = {
                 "approved": approved,
                 "reason": reason,
-                "tool_call": target.get("tool_call"),
-                "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
-            },
-        )
+                "decided_at": _utc_now(),
+            }
+            record.metadata["approval_decisions"] = decisions
+            _append_event(
+                record,
+                {
+                    "type": "approval_decision",
+                    "approval_sequence": sequence,
+                    "approved": approved,
+                    "reason": reason,
+                    "tool_call": target.get("tool_call"),
+                    "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
+                },
+            )
         tool_call = dict(target.get("tool_call") or {})
-        result: Dict[str, Any]
-        if approved:
+        if not replay_completed_decision and approved:
             try:
                 tool_id = str(tool_call.get("id") or "")
                 try:
@@ -1815,7 +1863,7 @@ def create_app(
                     tool = ToolRecord.from_dict(payload)
                 call_arguments = dict(tool_call.get("arguments") or {})
                 task_text = str(call_arguments.get("task") or record.input.get("input") or "")
-                result = ToolRuntime(tools, mcp_oauth).execute(
+                result = ToolRuntime(tools, mcp_oauth, workspaces).execute(
                     tool, task_text, arguments=call_arguments, bypass_approval=True
                 ).to_dict()
             except Exception as exc:  # noqa: BLE001 - 审批后的执行错误必须留在审计轨迹中
@@ -1830,7 +1878,7 @@ def create_app(
                     "message": f"审批后已执行工具 {result.get('display_name') or result.get('name')}",
                 },
             )
-        else:
+        elif not replay_completed_decision:
             result = {**tool_call, "status": "rejected", "error": reason or "用户拒绝执行"}
             _append_event(
                 record,
@@ -1842,6 +1890,13 @@ def create_app(
                     "message": "工具调用已被用户拒绝",
                 },
             )
+
+        if approved and result.get("status") == "succeeded":
+            scope = _approval_scope(tool_call)
+            if scope:
+                state = dict(record.state or {})
+                state["__approved_tool_scopes__"] = sorted(set(state.get("__approved_tool_scopes__") or []) | {scope})
+                record.state = state
 
         pending = _unresolved_approvals(record)
         if pending:
@@ -1876,8 +1931,9 @@ def create_app(
             )
         spec = _approval_spec(record, str(target.get("node") or ""))
         task_text = str(record.input.get("original_goal") or record.input.get("input") or "")
+        continuation_tool_calls: List[Dict[str, Any]] = []
         if isinstance(runtime_factory, AgentRuntimeFactory) and spec is not None:
-            continuation = runtime_factory.continue_after_tool_decisions(
+            continuation, continuation_tool_calls = runtime_factory.continue_tool_loop_after_tool_decisions(
                 spec,
                 task_text=task_text,
                 outcomes=outcomes,
@@ -1893,6 +1949,58 @@ def create_app(
                 else _approval_follow_up(result)
             )
             continuation_meta = {"executor": "ApprovalContinuation", "model": "", "metadata": {"fallback": True}}
+
+        if not continuation_meta.get("success", True):
+            record.status = "failed"
+            record.finished_at = _utc_now()
+            record.error = str(continuation_meta.get("error") or "审批后的模型续跑失败")
+            record.state = {**dict(record.state or {}), "input": follow_up, "approval_follow_up": follow_up}
+            _append_event(record, {
+                "type": "approval_continuation_failed",
+                "node": target.get("node"),
+                "message": follow_up,
+                "error": record.error,
+                "retryable": bool(continuation_meta.get("retryable")),
+            })
+            record.metadata["summary"] = _build_run_summary(record)
+            runs.save(record)
+            return record.to_dict()
+
+        for tool_call in continuation_tool_calls:
+            approval_context = _approval_tool_context(tool_call)
+            if tool_call.get("status") == "approval_required":
+                tool_call = {**tool_call, **approval_context}
+            _append_event(
+                record,
+                {
+                    "type": "approval_required" if tool_call.get("status") == "approval_required" else "tool_result",
+                    "node": target.get("node"),
+                    "tool_call": tool_call,
+                    "approval_prompt": _approval_prompt(target.get("node"), tool_call, approval_context)
+                    if tool_call.get("status") == "approval_required"
+                    else "",
+                    "message": (
+                        f"{target.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
+                        if tool_call.get("status") == "approval_required"
+                        else f"{target.get('node')} 已调用工具 {tool_call.get('display_name') or tool_call.get('name')}"
+                    ),
+                },
+            )
+
+        pending_after_continuation = _unresolved_approvals(record)
+        if pending_after_continuation:
+            waiting_text = _approval_waiting_text(record)
+            record.status = "waiting_approval"
+            record.finished_at = None
+            record.error = None
+            record.state = {**dict(record.state or {}), "input": waiting_text, "approval_follow_up": waiting_text}
+            record.metadata["approval_outcome"] = "approved"
+            record.metadata["pending_approval_sequences"] = [int(item.get("sequence") or 0) for item in pending_after_continuation]
+            record.metadata["summary"] = _build_run_summary(record)
+            record.metadata["summary"]["title"] = "等待工具审批"
+            record.metadata["summary"]["final_output"] = waiting_text
+            runs.save(record)
+            return record.to_dict()
 
         record.status = "succeeded"
         record.finished_at = _utc_now()
@@ -2252,6 +2360,9 @@ def create_app(
                 if errors:
                     raise HTTPException(status_code=400, detail="；".join(errors))
             input_payload = dict(req.input or {})
+            workspace_id = str(app_record.metadata.get("workspace_id") or "").strip()
+            if workspace_id and not input_payload.get("workspace_id"):
+                input_payload["workspace_id"] = workspace_id
             memory_config = normalize_memory_config(app_record.memory_config)
             conversation = None
             if memory_config["short_term_enabled"]:
@@ -2719,9 +2830,18 @@ def create_app(
     mcp_market = [
         {"slug":"local-demo","name":"本地演示 MCP","provider":"AgentForge","category":"开发测试","description":"零权限 JSON-RPC 演示服务，用于验证 MCP 发现、选择与调用链。","cover":"violet","mcp_url":"http://127.0.0.1:8000/mcp/demo","verified":True,"tools":[{"name":"preview_email","title":"邮件预览","description":"仅生成邮件预览，不发送真实邮件"},{"name":"lookup_demo","title":"演示检索","description":"返回本地演示检索结果"}]},
         {"slug":"context7","name":"Context7 文档 MCP","provider":"Context7","category":"开发工具","description":"查询公开的软件库与框架最新文档；无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"mint","mcp_url":"https://mcp.context7.com/mcp","verified":True,"tools":[{"name":"resolve-library-id","title":"解析文档库","description":"把库名解析为 Context7 文档库 ID","inputSchema":{"type":"object","properties":{"libraryName":{"type":"string"}},"required":["libraryName"]}},{"name":"query-docs","title":"查询文档","description":"基于已解析的库 ID 查询文档","inputSchema":{"type":"object","properties":{"libraryId":{"type":"string"},"query":{"type":"string"}},"required":["libraryId","query"]}}]},
+        {"slug":"deepwiki","name":"DeepWiki 仓库问答 MCP","provider":"DeepWiki","category":"开发工具","description":"对任意 GitHub 开源仓库进行 AI 问答与文档 Wiki 浏览；官方公开服务，无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"cyan","mcp_url":"https://mcp.deepwiki.com/mcp","verified":True,"tools":[{"name":"ask_question","title":"仓库问答","description":"针对 GitHub 仓库提问并获得基于上下文的回答","inputSchema":{"type":"object","properties":{"repoName":{"type":"string","description":"owner/repo 格式的仓库名"},"question":{"type":"string"}},"required":["repoName","question"]}},{"name":"read_wiki_structure","title":"读取文档结构","description":"获取仓库文档 Wiki 的主题目录","inputSchema":{"type":"object","properties":{"repoName":{"type":"string"}},"required":["repoName"]}},{"name":"read_wiki_contents","title":"阅读文档内容","description":"阅读仓库 DeepWiki 文档内容","inputSchema":{"type":"object","properties":{"repoName":{"type":"string"}},"required":["repoName"]}}]},
+        {"slug":"ms-learn","name":"Microsoft Learn 文档 MCP","provider":"Microsoft","category":"文档检索","description":"检索 Microsoft Learn 与 Azure 官方文档、代码示例并转为 Markdown；官方公开服务，无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"violet","mcp_url":"https://learn.microsoft.com/api/mcp","verified":True,"tools":[{"name":"microsoft_docs_search","title":"搜索官方文档","description":"搜索 Microsoft 与 Azure 官方文档","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"microsoft_code_sample_search","title":"搜索代码示例","description":"在官方文档中检索代码片段与示例","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"language":{"type":"string"}},"required":["query"]}},{"name":"microsoft_docs_fetch","title":"抓取文档页","description":"把 Microsoft Learn 文档页转换为 Markdown","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}]},
+        {"slug":"cloudflare-docs","name":"Cloudflare 文档 MCP","provider":"Cloudflare","category":"云服务文档","description":"检索 Cloudflare 产品（Workers、R2、DNS 等）官方文档；官方公开服务，无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"mint","mcp_url":"https://docs.mcp.cloudflare.com/sse","verified":True,"tools":[{"name":"search_cloudflare_documentation","title":"搜索 Cloudflare 文档","description":"检索 Cloudflare 产品官方文档并返回相关章节","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"migrate_pages_to_workers_guide","title":"Pages 迁移指南","description":"获取 Pages 项目迁移到 Workers 的官方指南","inputSchema":{"type":"object","properties":{}}}]},
+        {"slug":"exa","name":"Exa 联网检索 MCP","provider":"Exa","category":"联网检索","description":"语义化网页搜索与正文抓取，获取模型训练截止之后的实时信息；公开端点可直接测试，工具调用仍需逐次批准。","cover":"cyan","mcp_url":"https://mcp.exa.ai/mcp","verified":True,"tools":[{"name":"web_search_exa","title":"语义网页搜索","description":"按自然语言语义检索网页并返回干净正文","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"numResults":{"type":"number"}},"required":["query"]}},{"name":"web_fetch_exa","title":"抓取网页正文","description":"把指定 URL 的网页内容抓取为干净 Markdown","inputSchema":{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"}},"maxCharacters":{"type":"number"}},"required":["urls"]}}]},
         {"slug":"web-search","name":"联网检索 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入组织已采购的检索 MCP；安装后需要填写实际服务地址和凭据。","cover":"mint","verified":False},
         {"slug":"gmail","name":"Gmail MCP","provider":"Google","category":"邮件办公","description":"使用 Google OAuth 创建草稿、读取或发送 Gmail；普通用户连接账号即可。当前 Google 官方 MCP 需要管理员预先配置 OAuth 应用。","cover":"cyan","mcp_url":"https://gmailmcp.googleapis.com/mcp/v1","verified":False,"connection_schema":GMAIL_STATIC_OAUTH_SCHEMA},
         {"slug":"github","name":"GitHub MCP","provider":"GitHub","category":"代码协作","description":"用于仓库、Issue 与 PR 协作；服务真实可用，但需在自定义连接中配置 GitHub 认证后再安装。","cover":"violet","verified":False},
+        {"slug":"notion","name":"Notion 工作区 MCP","provider":"Notion","category":"知识库","description":"连接 Notion 工作区，搜索与更新页面、数据库；官方服务真实可用，需在自定义连接中填写 https://mcp.notion.com/mcp 并完成 OAuth 登录授权后安装。","cover":"mint","verified":False},
+        {"slug":"slack","name":"Slack 协作 MCP","provider":"Slack","category":"即时通讯","description":"读写 Slack 频道消息与串、整理团队讨论；官方服务真实可用，需在自定义连接中填写 https://mcp.slack.com/mcp 并完成 OAuth 登录授权后安装。","cover":"violet","verified":False},
+        {"slug":"sentry","name":"Sentry 监控 MCP","provider":"Sentry","category":"监控运维","description":"查询错误事件、Issue 堆栈与发布状态；官方服务真实可用，需在自定义连接中填写 https://mcp.sentry.dev/mcp 并完成 OAuth 登录授权后安装。","cover":"cyan","verified":False},
+        {"slug":"amap","name":"高德地图 MCP","provider":"高德开放平台","category":"位置服务","description":"地理编码、POI 检索与驾车/步行路线规划；需在高德开放平台申请 Key 后，在自定义连接中填写服务地址与 Key 再安装。","cover":"mint","verified":False},
+        {"slug":"tavily","name":"Tavily 联网检索 MCP","provider":"Tavily","category":"信息检索","description":"面向大模型的实时联网检索与网页内容抽取；需在 tavily.com 申请 API Key 后，在自定义连接中填写服务地址与密钥再安装。","cover":"violet","verified":False},
         {"slug":"enterprise-knowledge","name":"企业知识检索 MCP 模板","provider":"项目精选目录","category":"知识库","description":"接入企业文档检索服务；安装后需要填写实际 MCP 地址。","cover":"cyan","verified":False},
     ]
     def _tool_connection_payload(connection: ToolConnectionRecord) -> Dict[str, Any]:
@@ -3348,6 +3468,23 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.get("/api/workspaces")
+    def list_workspaces() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in workspaces.list()]
+
+    @app.post("/api/workspaces")
+    def create_workspace(req: CreateWorkspaceReq) -> Dict[str, Any]:
+        try:
+            return workspaces.create(name=req.name, root_path=req.root_path, read_only=req.read_only,
+                                     allowed_commands=req.allowed_commands or None, create_if_missing=req.create_if_missing).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/workspaces/{workspace_id}")
+    def delete_workspace(workspace_id: str) -> Dict[str, Any]:
+        workspaces.delete(workspace_id)
+        return {"ok": True}
+
     @app.get("/api/tools")
     def list_tools(enabled: Optional[bool] = None) -> List[Dict[str, Any]]:
         return [item.to_dict() for item in tools.list(enabled=enabled)]
@@ -3365,7 +3502,7 @@ def create_app(
             tool = tools.get(tool_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
-        return ToolRuntime(tools, mcp_oauth).execute(tool, req.task).to_dict()
+        return ToolRuntime(tools, mcp_oauth, workspaces).execute(tool, req.task, arguments=req.arguments or None).to_dict()
 
     @app.put("/api/tools/{tool_id}")
     def update_tool(tool_id: str, req: UpdateToolReq) -> Dict[str, Any]:

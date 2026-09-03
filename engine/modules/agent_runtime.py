@@ -20,6 +20,7 @@ from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
 from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity
 from ..modules.tools import MCPAuthorizationStore, ToolRuntime, decode_tool_arguments, tool_function_schema
+from ..modules.workspace_tools import WorkspaceStore
 from .knowledge import KnowledgeStore
 from ..modules.skills import SKILL_CONTEXT_TEXT_KEY
 from ..node import Node, NodeType
@@ -41,11 +42,12 @@ class AgentRuntimeFactory:
         mcp_config_store: Optional[MCPConfigStore] = None,
         mcp_oauth_store: Optional[MCPAuthorizationStore] = None,
         knowledge_store: Optional[KnowledgeStore] = None,
+        workspace_store: Optional[WorkspaceStore] = None,
         max_attempts: int = 3,
     ) -> None:
         self.scheduler = scheduler or AdaptiveResourceScheduler()
         self.registry = registry or ExecutorRegistry.default()
-        self.tool_runtime = ToolRuntime(tool_catalog_store, mcp_oauth_store) if tool_catalog_store is not None else None
+        self.tool_runtime = ToolRuntime(tool_catalog_store, mcp_oauth_store, workspace_store) if tool_catalog_store is not None else None
         self.model_connections = model_connection_store
         self.mcp_config_store = mcp_config_store
         self.knowledge_store = knowledge_store
@@ -398,6 +400,7 @@ class AgentRuntimeFactory:
             api_key=connection_api_key(connection) or "not-needed",
             base_url=connection.base_url,
             timeout=60,
+            max_retries=0,
         )
         functions = [tool_function_schema(tool) for tool in available_tools]
         by_name = {str(tool.name): tool for tool in available_tools}
@@ -427,14 +430,21 @@ class AgentRuntimeFactory:
                     ),
                     audit_calls,
                 )
-            messages.append({
+            assistant_message: Dict[str, Any] = {
                 "role": "assistant",
                 "content": message.content or "",
                 "tool_calls": [
                     {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
                     for call in raw_calls
                 ],
-            })
+            }
+            # DeepSeek thinking models require this field to be sent back on
+            # every subsequent tool-turn.  OpenAI-compatible providers that
+            # do not expose it are unaffected.
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content:
+                assistant_message["reasoning_content"] = reasoning_content
+            messages.append(assistant_message)
             for call in raw_calls:
                 tool = by_name.get(str(call.function.name))
                 if tool is None:
@@ -442,16 +452,28 @@ class AgentRuntimeFactory:
                 else:
                     try:
                         arguments = decode_tool_arguments(call.function.arguments)
+                        # The selected workspace belongs to the run state,
+                        # not to model-controlled text.  Supplying it here
+                        # prevents a model from accidentally targeting a
+                        # different registered workspace.
+                        if str(getattr(tool, "metadata", {}).get("adapter") or "").startswith("workspace_"):
+                            workspace_id = str(state.get("workspace_id") or "")
+                            if workspace_id:
+                                arguments["workspace_id"] = workspace_id
                         rendered = self.tool_runtime.execute(
                             tool,
                             self._state_input_text(state),
                             arguments=arguments,
+                            bypass_approval=self._has_engineering_scope(state, tool),
                         ).to_dict()
+                        rendered["tool_call_id"] = call.id
+                        rendered["requested_name"] = str(call.function.name)
                     except Exception as exc:  # invalid arguments must return to the model, never execute
                         rendered = {
                             "id": getattr(tool, "id", ""), "name": str(call.function.name),
                             "display_name": getattr(tool, "display_name", str(call.function.name)),
                             "status": "failed", "arguments": {}, "error": str(exc), "risk": "high",
+                            "tool_call_id": call.id, "requested_name": str(call.function.name),
                         }
                 audit_calls.append(rendered)
                 messages.append({
@@ -481,6 +503,179 @@ class AgentRuntimeFactory:
             ),
             audit_calls,
         )
+
+    def continue_tool_loop_after_tool_decisions(
+        self,
+        spec: "AgentSpec",
+        *,
+        task_text: str,
+        outcomes: list[Dict[str, Any]],
+        state: Optional[Dict[str, Any]] = None,
+    ) -> tuple[InferenceResult, list[Dict[str, Any]]]:
+        """Resume the native tool loop after approved tool calls have run."""
+        if self.tool_runtime is None or self.model_connections is None:
+            return self.continue_after_tool_decisions(spec, task_text=task_text, outcomes=outcomes, state=state), []
+        if not self._supports_native_tool_loop(spec):
+            return self.continue_after_tool_decisions(spec, task_text=task_text, outcomes=outcomes, state=state), []
+        rejected = [item for item in outcomes if not item.get("approved")]
+        if rejected:
+            return self.continue_after_tool_decisions(spec, task_text=task_text, outcomes=outcomes, state=state), []
+
+        run_state = {**dict(state or {}), "input": task_text}
+        system_prompt = self._render_variables(spec.sys_prompt, run_state)
+        available_tools = self.tool_runtime.select_for_model(self._available_tools(spec), task_text)
+        if not available_tools:
+            return self.continue_after_tool_decisions(spec, task_text=task_text, outcomes=outcomes, state=state), []
+
+        connection = self.model_connections.get(spec.model)
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=connection_api_key(connection) or "not-needed",
+            base_url=connection.base_url,
+            timeout=60,
+            max_retries=0,
+        )
+        functions = [tool_function_schema(tool) for tool in available_tools]
+        by_name = {str(tool.name): tool for tool in available_tools}
+        approved_summaries: list[Dict[str, Any]] = []
+        for item in outcomes:
+            result = dict(item.get("result") or {})
+            if result.get("status") == "succeeded":
+                approved_summaries.append({
+                    "tool": result.get("display_name") or result.get("name"),
+                    "arguments": result.get("arguments") or {},
+                    "result": result.get("result"),
+                })
+        if not approved_summaries:
+            return self.continue_after_tool_decisions(spec, task_text=task_text, outcomes=outcomes, state=state), []
+
+        # Do not fabricate an earlier assistant tool-call message here.  Some
+        # reasoning models (including DeepSeek thinking mode) require their
+        # private reasoning_content to accompany that exact message.  A fresh
+        # continuation turn with audited tool evidence is portable and still
+        # gives the model the facts it needs for the next action.
+        # The normal first turn receives the full governed context.  An
+        # approval continuation only needs the original goal plus immutable
+        # execution evidence.  Keeping this turn lean avoids re-sending a
+        # large ledger after every single file approval.
+        prompt = (
+            f"原始用户任务：\n{task_text}\n\n已获用户批准并已真实执行的工具结果：\n"
+            f"{json.dumps(approved_summaries, ensure_ascii=False, default=str)}\n\n"
+            "请继续完成原始任务。不要重复已完成的操作；若还需高风险操作，正常发起下一次工具调用并等待批准。"
+        )
+        messages: list[Dict[str, Any]] = [
+            {"role": "system", "content": (system_prompt or "Answer concisely and accurately.") + "\n\n工具规则：你正在从用户已审批的工具结果继续执行原始任务。若还需要写文件、运行命令或其他高风险工具，继续正常发起工具调用，等待下一次审批。只能依据真实工具结果说明已完成的操作。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        audit_calls: list[Dict[str, Any]] = []
+        for _ in range(8):
+            try:
+                response = client.chat.completions.create(
+                    model=connection.model_id,
+                    messages=messages,  # type: ignore[arg-type]
+                    tools=functions,
+                    tool_choice="auto",
+                    temperature=0,
+                )
+            except Exception as exc:  # noqa: BLE001 - approval API must not become HTTP 500
+                return (
+                    InferenceResult(
+                        text="已执行获批工具，但模型在继续任务时失败；已保留所有已完成的文件修改，可重试继续执行。",
+                        executor="ModelConnectionExecutor",
+                        endpoint=connection.base_url,
+                        model=connection.model_id,
+                        metadata={"provider": connection.provider, "connection_id": connection.id, "tool_loop": True, "approval_outcome": "approved"},
+                        success=False,
+                        error=str(exc),
+                        retryable=True,
+                    ),
+                    audit_calls,
+                )
+            message = response.choices[0].message
+            raw_calls = list(message.tool_calls or [])
+            if not raw_calls:
+                return (
+                    InferenceResult(
+                        text=message.content or "工具调用完成，但模型没有返回正文。",
+                        executor="ModelConnectionExecutor",
+                        endpoint=connection.base_url,
+                        model=connection.model_id,
+                        metadata={"provider": connection.provider, "connection_id": connection.id, "tool_loop": True, "approval_outcome": "approved"},
+                    ),
+                    audit_calls,
+                )
+            assistant_message = {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
+                    for call in raw_calls
+                ],
+            }
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content:
+                assistant_message["reasoning_content"] = reasoning_content
+            messages.append(assistant_message)
+            for call in raw_calls:
+                tool = by_name.get(str(call.function.name))
+                if tool is None:
+                    rendered = {
+                        "id": "", "name": str(call.function.name), "display_name": str(call.function.name),
+                        "status": "failed", "arguments": {}, "error": f"模型请求了未挂载工具 {call.function.name}",
+                        "risk": "high", "tool_call_id": call.id, "requested_name": str(call.function.name),
+                    }
+                else:
+                    try:
+                        arguments = decode_tool_arguments(call.function.arguments)
+                        if str(getattr(tool, "metadata", {}).get("adapter") or "").startswith("workspace_"):
+                            workspace_id = str(run_state.get("workspace_id") or "")
+                            if workspace_id:
+                                arguments["workspace_id"] = workspace_id
+                        rendered = self.tool_runtime.execute(tool, self._state_input_text(run_state), arguments=arguments, bypass_approval=self._has_engineering_scope(run_state, tool)).to_dict()
+                        rendered["tool_call_id"] = call.id
+                        rendered["requested_name"] = str(call.function.name)
+                    except Exception as exc:
+                        rendered = {
+                            "id": getattr(tool, "id", ""), "name": str(call.function.name),
+                            "display_name": getattr(tool, "display_name", str(call.function.name)),
+                            "status": "failed", "arguments": {}, "error": str(exc), "risk": "high",
+                            "tool_call_id": call.id, "requested_name": str(call.function.name),
+                        }
+                audit_calls.append(rendered)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(rendered, ensure_ascii=False, default=str)})
+                if rendered.get("status") == "approval_required":
+                    names = "、".join(str(item.get("display_name") or item.get("name") or "工具") for item in audit_calls if item.get("status") == "approval_required")
+                    return (
+                        InferenceResult(
+                            text=f"{names}需要你的批准，批准后才能继续执行。",
+                            executor="ModelConnectionExecutor",
+                            endpoint=connection.base_url,
+                            model=connection.model_id,
+                            metadata={"provider": connection.provider, "connection_id": connection.id, "tool_loop": True, "paused_for_approval": True, "approval_outcome": "approved"},
+                        ),
+                        audit_calls,
+                    )
+        return (
+            InferenceResult(
+                text="工具调用轮次达到上限，已停止继续执行。请缩小任务范围后重试。",
+                executor="ModelConnectionExecutor",
+                endpoint=connection.base_url,
+                model=connection.model_id,
+                metadata={"provider": connection.provider, "connection_id": connection.id, "tool_loop": True, "max_rounds": True, "approval_outcome": "approved"},
+            ),
+            audit_calls,
+        )
+
+    @staticmethod
+    def _has_engineering_scope(state: Dict[str, Any], tool: Any) -> bool:
+        """Apply a single explicit task grant to bounded local engineering work."""
+        adapter = str(getattr(tool, "metadata", {}).get("adapter") or getattr(tool, "name", ""))
+        scopes = set(state.get("__approved_tool_scopes__") or [])
+        return "workspace_engineering" in scopes and adapter in {
+            "workspace_apply_patch", "workspace_write_files", "workspace_run_command",
+        }
 
     def _state_input_text(self, state: Dict[str, Any]) -> str:
         value = state.get("input", state)
