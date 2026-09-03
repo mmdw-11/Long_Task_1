@@ -20,6 +20,7 @@ from .mcp_integration import _arguments_from_schema, _strip_sse, call_mcp_tool_s
 from .product_ops import ToolCatalogStore, ToolRecord
 from .tools.contracts import mcp_error_message
 from .tools.mcp_remote import MCPAuthorizationStore, call_tool as call_remote_mcp_tool
+from .workspace_tools import WorkspaceStore, WorkspaceToolExecutor
 
 
 @dataclass
@@ -51,9 +52,15 @@ class ToolRuntimeResult:
 class ToolRuntime:
     """Resolve allowed tools for an AgentSpec and execute safe adapters."""
 
-    def __init__(self, catalog: ToolCatalogStore, mcp_oauth_store: MCPAuthorizationStore | None = None) -> None:
+    def __init__(
+        self,
+        catalog: ToolCatalogStore,
+        mcp_oauth_store: MCPAuthorizationStore | None = None,
+        workspace_store: WorkspaceStore | None = None,
+    ) -> None:
         self.catalog = catalog
         self.mcp_oauth_store = mcp_oauth_store
+        self.workspace_tools = WorkspaceToolExecutor(workspace_store)
 
     def available_for_agent(self, tool_ids: Iterable[str] | None) -> List[ToolRecord]:
         ids = [str(item) for item in (tool_ids or []) if str(item).strip()]
@@ -201,6 +208,11 @@ class ToolRuntime:
             elif adapter in {"script", "python_script"}:
                 args = {"language": str(tool.metadata.get("language") or "python")}
                 result = _run_script_tool(tool.metadata, task_text)
+            elif adapter.startswith("workspace_"):
+                args = dict(arguments or {})
+                # A workspace must be explicit.  It is never inferred from a
+                # file path or process working directory.
+                result = self.workspace_tools.execute(adapter, args)
             else:
                 return ToolRuntimeResult(
                     id=tool.id,
@@ -243,6 +255,51 @@ def ensure_builtin_tools(catalog: ToolCatalogStore) -> None:
             "category": "system",
             "tags": ["time", "date", "read"],
             "metadata": {"source": "builtin", "adapter": "current_time", "risk": "low", "schema": {"timezone": "string"}},
+        },
+        {
+            "name": "workspace_list_files", "display_name": "列出工作区文件", "description": "列出已选本地工作区中的文件和目录。仅读取工作区内路径。",
+            "category": "workspace", "tags": ["workspace", "files", "read"],
+            "metadata": {"source": "builtin", "adapter": "workspace_list_files", "risk": "read", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["workspace_id"]}},
+        },
+        {
+            "name": "workspace_read_file", "display_name": "读取代码文件", "description": "读取已选本地工作区中的一个文本文件。",
+            "category": "workspace", "tags": ["workspace", "files", "read", "code"],
+            "metadata": {"source": "builtin", "adapter": "workspace_read_file", "risk": "read", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"},"path":{"type":"string"}},"required":["workspace_id","path"]}},
+        },
+        {
+            "name": "workspace_search", "display_name": "搜索工作区代码", "description": "在已选本地工作区内搜索文本，返回匹配文件、行号和片段。",
+            "category": "workspace", "tags": ["workspace", "search", "read", "code"],
+            "metadata": {"source": "builtin", "adapter": "workspace_search", "risk": "read", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"},"query":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["workspace_id","query"]}},
+        },
+        {
+            "name": "workspace_apply_patch", "display_name": "应用代码修改", "description": "以精确 old_text/new_text 修改或创建工作区内文件。每次调用均需要用户批准。",
+            "category": "workspace", "tags": ["workspace", "write", "patch", "code"],
+            "metadata": {"source": "builtin", "adapter": "workspace_apply_patch", "risk": "high", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"},"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"create":{"type":"boolean"}},"required":["workspace_id","path","new_text"]}},
+        },
+        {
+            "name": "workspace_run_command", "display_name": "运行项目检查", "description": "在已选工作区内运行白名单测试、构建或静态检查命令。每次调用均需要用户批准。",
+            "category": "workspace", "tags": ["workspace", "test", "build", "command"],
+            "metadata": {"source": "builtin", "adapter": "workspace_run_command", "risk": "high", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"},"action":{"type":"string","enum":["pytest","npm_test","npm_run_build","npm_run_lint","python_compile"]},"target":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["workspace_id","action"]}},
+        },
+        {
+            "name": "workspace_git_status", "display_name": "查看 Git 状态", "description": "读取工作区 Git 修改状态。",
+            "category": "workspace", "tags": ["workspace", "git", "read"],
+            "metadata": {"source": "builtin", "adapter": "workspace_git_status", "risk": "read", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"}},"required":["workspace_id"]}},
+        },
+        {
+            "name": "workspace_git_diff", "display_name": "查看代码 Diff", "description": "读取工作区 Git diff，供审查和防漂移检查。",
+            "category": "workspace", "tags": ["workspace", "git", "diff", "read"],
+            "metadata": {"source": "builtin", "adapter": "workspace_git_diff", "risk": "read", "input_schema": {"type":"object","properties":{"workspace_id":{"type":"string"},"path":{"type":"string"}},"required":["workspace_id"]}},
+        },
+        {
+            "name": "workspace_create_restore_point", "display_name": "创建恢复点", "description": "为当前工作区创建可恢复快照。需要用户批准。",
+            "category": "workspace", "tags": ["workspace", "backup", "restore"],
+            "metadata": {"source":"builtin","adapter":"workspace_create_restore_point","risk":"high","input_schema":{"type":"object","properties":{"workspace_id":{"type":"string"}},"required":["workspace_id"]}},
+        },
+        {
+            "name": "workspace_restore_point", "display_name": "恢复工作区", "description": "从指定恢复点恢复工作区文件。需要用户批准。",
+            "category": "workspace", "tags": ["workspace", "restore", "write"],
+            "metadata": {"source":"builtin","adapter":"workspace_restore_point","risk":"high","input_schema":{"type":"object","properties":{"workspace_id":{"type":"string"},"restore_point_id":{"type":"string"}},"required":["workspace_id","restore_point_id"]}},
         },
         {
             "name": "calculator",

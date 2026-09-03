@@ -725,6 +725,8 @@ class ProductStatusService:
                 "runtime_tool_execution": True,
                 "run_todo_stream": True,
                 "approval_events": True,
+                "workspace_tools": True,
+                "software_engineering_workflow": True,
             },
             "models": {
                 "device": {

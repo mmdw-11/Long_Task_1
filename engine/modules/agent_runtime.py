@@ -20,6 +20,7 @@ from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
 from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity
 from ..modules.tools import MCPAuthorizationStore, ToolRuntime, decode_tool_arguments, tool_function_schema
+from ..modules.workspace_tools import WorkspaceStore
 from .knowledge import KnowledgeStore
 from ..modules.skills import SKILL_CONTEXT_TEXT_KEY
 from ..node import Node, NodeType
@@ -41,11 +42,12 @@ class AgentRuntimeFactory:
         mcp_config_store: Optional[MCPConfigStore] = None,
         mcp_oauth_store: Optional[MCPAuthorizationStore] = None,
         knowledge_store: Optional[KnowledgeStore] = None,
+        workspace_store: Optional[WorkspaceStore] = None,
         max_attempts: int = 3,
     ) -> None:
         self.scheduler = scheduler or AdaptiveResourceScheduler()
         self.registry = registry or ExecutorRegistry.default()
-        self.tool_runtime = ToolRuntime(tool_catalog_store, mcp_oauth_store) if tool_catalog_store is not None else None
+        self.tool_runtime = ToolRuntime(tool_catalog_store, mcp_oauth_store, workspace_store) if tool_catalog_store is not None else None
         self.model_connections = model_connection_store
         self.mcp_config_store = mcp_config_store
         self.knowledge_store = knowledge_store
@@ -442,6 +444,14 @@ class AgentRuntimeFactory:
                 else:
                     try:
                         arguments = decode_tool_arguments(call.function.arguments)
+                        # The selected workspace belongs to the run state,
+                        # not to model-controlled text.  Supplying it here
+                        # prevents a model from accidentally targeting a
+                        # different registered workspace.
+                        if str(getattr(tool, "metadata", {}).get("adapter") or "").startswith("workspace_"):
+                            workspace_id = str(state.get("workspace_id") or "")
+                            if workspace_id:
+                                arguments["workspace_id"] = workspace_id
                         rendered = self.tool_runtime.execute(
                             tool,
                             self._state_input_text(state),

@@ -92,6 +92,7 @@ from ..modules.workflows import RunRecord, RunStore, WorkflowRecord, WorkflowSto
 from ..modules.tools import GMAIL_STATIC_OAUTH_SCHEMA, MCPAuthorizationRequired, MCPAuthorizationStore, ToolRuntime, complete_authorization, ensure_builtin_tools, inspect_connection, missing_required, start_authorization
 from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
 from ..modules.knowledge import KnowledgeStore
+from ..modules.workspace_tools import WorkspaceStore
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
 
 
@@ -101,6 +102,7 @@ BUILTIN_SKILLS = [
     {"slug":"travel-planner","name":"旅行计划","category":"通用办公","description":"生成兼顾时间、预算、天气与交通的行程方案。","content":"# 旅行计划\n\n确认目的地、日期、预算、同行人和偏好；涉及实时信息时建议调用已授权工具。"},
     {"slug":"meeting-summary","name":"会议纪要","category":"通用办公","description":"将会议材料整理为结论、行动项、负责人和截止时间。","content":"# 会议纪要\n\n以结论、行动项、负责人、截止时间四部分输出；缺失信息明确标记待补充。"},
     {"slug":"web-design","name":"网页设计","category":"代码开发","description":"把用户需求转为信息架构、界面层级和可实施的前端建议。","content":"# 网页设计\n\n先给出页面目标、用户路径和组件清单，再输出可实施的视觉与交互建议。"},
+    {"slug":"software-engineer","name":"本地软件工程","category":"代码开发","description":"在已选工作区内规划、修改、测试和审查代码，并坚持验收标准与最小修改范围。","content":"# 本地软件工程\n\n先读取工作区和相关代码，再给出简洁计划。需要修改时只调用已挂载的工作区工具；每次写入或测试均等待审批。修改后必须读取 diff 并运行适当测试。出现错误时依据真实日志定位原因，避免猜测。不得访问工作区外路径，不得声称未执行的测试已经通过。"},
     {"slug":"data-analysis","name":"数据分析","category":"金融","description":"帮助解释指标、识别异常并给出可复现的分析路径。","content":"# 数据分析\n\n明确数据范围与口径，区分计算结果和业务推断，给出复核步骤。"},
 ]
 
@@ -246,6 +248,15 @@ class TestToolReq(BaseModel):
     """从控制台验证工具适配器；高风险工具只返回审批请求。"""
 
     task: str = "请执行工具连通性测试"
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateWorkspaceReq(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    root_path: str
+    read_only: bool = False
+    allowed_commands: List[str] = Field(default_factory=list)
+    create_if_missing: bool = False
 
 
 class CreateApiKeyReq(BaseModel):
@@ -510,6 +521,7 @@ def create_app(
     model_connection_store: Optional[ModelConnectionStore] = None,
     conversation_store: Optional[ConversationStore] = None,
     memory_audit_store: Optional[MemoryAuditStore] = None,
+    workspace_store: Optional[WorkspaceStore] = None,
 ) -> "FastAPI":
     """创建并返回 FastAPI 应用。可注入已有 Orchestrator，便于测试。"""
     orch = orchestrator or Orchestrator()
@@ -551,6 +563,7 @@ def create_app(
         os.environ.get("API_AUDIT_LOG_PATH") or "runs/audit/api_audit.jsonl"
     )
     mcp_configs = mcp_config_store or MCPConfigStore(os.environ.get("MCP_CONFIG_ROOT") or "runs/mcp")
+    workspaces = workspace_store or WorkspaceStore(os.environ.get("WORKSPACE_STORE_ROOT") or str(applications.root_dir.parent / "workspaces"))
     auth = auth_store or AuthStore(os.environ.get("AUTH_DB_PATH") or "runs/auth/users.sqlite3")
     # 内置 Skill 是平台可信只读能力，启动时幂等预置并直接发布。
     for template in BUILTIN_SKILLS:
@@ -586,6 +599,7 @@ def create_app(
         mcp_config_store=mcp_configs,
         mcp_oauth_store=mcp_oauth,
         knowledge_store=knowledge,
+        workspace_store=workspaces,
     )
 
     def _approval_requests(record: RunRecord) -> List[Dict[str, Any]]:
@@ -627,7 +641,7 @@ def create_app(
         target = _orchestrator_for_run(record.workflow_id, record)
         return next((item for item in target.list_agents() if item.name == node_name), None)
 
-    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -1189,7 +1203,7 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
-            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth) if is_visual_workflow else None
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces) if is_visual_workflow else None
             compiled = target.build_graph(
                 node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
@@ -1815,7 +1829,7 @@ def create_app(
                     tool = ToolRecord.from_dict(payload)
                 call_arguments = dict(tool_call.get("arguments") or {})
                 task_text = str(call_arguments.get("task") or record.input.get("input") or "")
-                result = ToolRuntime(tools, mcp_oauth).execute(
+                result = ToolRuntime(tools, mcp_oauth, workspaces).execute(
                     tool, task_text, arguments=call_arguments, bypass_approval=True
                 ).to_dict()
             except Exception as exc:  # noqa: BLE001 - 审批后的执行错误必须留在审计轨迹中
@@ -2252,6 +2266,9 @@ def create_app(
                 if errors:
                     raise HTTPException(status_code=400, detail="；".join(errors))
             input_payload = dict(req.input or {})
+            workspace_id = str(app_record.metadata.get("workspace_id") or "").strip()
+            if workspace_id and not input_payload.get("workspace_id"):
+                input_payload["workspace_id"] = workspace_id
             memory_config = normalize_memory_config(app_record.memory_config)
             conversation = None
             if memory_config["short_term_enabled"]:
@@ -3348,6 +3365,23 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.get("/api/workspaces")
+    def list_workspaces() -> List[Dict[str, Any]]:
+        return [item.to_dict() for item in workspaces.list()]
+
+    @app.post("/api/workspaces")
+    def create_workspace(req: CreateWorkspaceReq) -> Dict[str, Any]:
+        try:
+            return workspaces.create(name=req.name, root_path=req.root_path, read_only=req.read_only,
+                                     allowed_commands=req.allowed_commands or None, create_if_missing=req.create_if_missing).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/workspaces/{workspace_id}")
+    def delete_workspace(workspace_id: str) -> Dict[str, Any]:
+        workspaces.delete(workspace_id)
+        return {"ok": True}
+
     @app.get("/api/tools")
     def list_tools(enabled: Optional[bool] = None) -> List[Dict[str, Any]]:
         return [item.to_dict() for item in tools.list(enabled=enabled)]
@@ -3365,7 +3399,7 @@ def create_app(
             tool = tools.get(tool_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
-        return ToolRuntime(tools, mcp_oauth).execute(tool, req.task).to_dict()
+        return ToolRuntime(tools, mcp_oauth, workspaces).execute(tool, req.task, arguments=req.arguments or None).to_dict()
 
     @app.put("/api/tools/{tool_id}")
     def update_tool(tool_id: str, req: UpdateToolReq) -> Dict[str, Any]:
