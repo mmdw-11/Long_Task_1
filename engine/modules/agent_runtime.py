@@ -464,6 +464,7 @@ class AgentRuntimeFactory:
                             tool,
                             self._state_input_text(state),
                             arguments=arguments,
+                            bypass_approval=self._has_engineering_scope(state, tool),
                         ).to_dict()
                         rendered["tool_call_id"] = call.id
                         rendered["requested_name"] = str(call.function.name)
@@ -632,7 +633,7 @@ class AgentRuntimeFactory:
                             workspace_id = str(run_state.get("workspace_id") or "")
                             if workspace_id:
                                 arguments["workspace_id"] = workspace_id
-                        rendered = self.tool_runtime.execute(tool, self._state_input_text(run_state), arguments=arguments).to_dict()
+                        rendered = self.tool_runtime.execute(tool, self._state_input_text(run_state), arguments=arguments, bypass_approval=self._has_engineering_scope(run_state, tool)).to_dict()
                         rendered["tool_call_id"] = call.id
                         rendered["requested_name"] = str(call.function.name)
                     except Exception as exc:
@@ -666,6 +667,15 @@ class AgentRuntimeFactory:
             ),
             audit_calls,
         )
+
+    @staticmethod
+    def _has_engineering_scope(state: Dict[str, Any], tool: Any) -> bool:
+        """Apply a single explicit task grant to bounded local engineering work."""
+        adapter = str(getattr(tool, "metadata", {}).get("adapter") or getattr(tool, "name", ""))
+        scopes = set(state.get("__approved_tool_scopes__") or [])
+        return "workspace_engineering" in scopes and adapter in {
+            "workspace_apply_patch", "workspace_write_files", "workspace_run_command",
+        }
 
     def _state_input_text(self, state: Dict[str, Any]) -> str:
         value = state.get("input", state)

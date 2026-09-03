@@ -629,6 +629,26 @@ def create_app(
             "source": str(metadata.get("source") or "external"),
         }
 
+    def _approval_scope(tool_call: Dict[str, Any]) -> str:
+        """A task-scoped grant covers only bounded local edits and checks."""
+        try:
+            adapter = str(tools.get(str(tool_call.get("id") or "")).metadata.get("adapter") or "")
+        except KeyError:
+            adapter = str(tool_call.get("name") or "")
+        return "workspace_engineering" if adapter in {
+            "workspace_apply_patch", "workspace_write_files", "workspace_run_command",
+        } else ""
+
+    def _approval_prompt(node_name: Any, tool_call: Dict[str, Any], approval_context: Dict[str, str]) -> str:
+        tool_name = tool_call.get("display_name") or tool_call.get("name") or "工具"
+        if _approval_scope(tool_call) == "workspace_engineering":
+            return (
+                f"是否允许 {node_name} 在当前已选本地代码工作区执行本次工程任务？"
+                f"批准后，本任务内的受限文件创建/修改和白名单本地检查会自动继续；"
+                f"外部服务、恢复/删除等更高风险操作仍会单独请求批准。"
+            )
+        return f"是否允许 {node_name} 使用 {approval_context['service_name']} 的 {tool_name} 执行本次操作？"
+
     def _approval_waiting_text(record: RunRecord) -> str:
         pending = _unresolved_approvals(record)
         names = "、".join(
@@ -1287,12 +1307,9 @@ def create_app(
                                 ),
                                 "node": event.get("node"),
                                 "tool_call": tool_call,
-                                "approval_prompt": (
-                                    f"是否允许 {event.get('node')} 使用 {approval_context['service_name']} 的 "
-                                    f"{tool_call.get('display_name') or tool_call.get('name')} 执行本次操作？"
-                                    if tool_call.get("status") == "approval_required"
-                                    else ""
-                                ),
+                                "approval_prompt": _approval_prompt(event.get("node"), tool_call, approval_context)
+                                if tool_call.get("status") == "approval_required"
+                                else "",
                                 "message": (
                                     f"{event.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
                                     if tool_call.get("status") == "approval_required"
@@ -1874,6 +1891,13 @@ def create_app(
                 },
             )
 
+        if approved and result.get("status") == "succeeded":
+            scope = _approval_scope(tool_call)
+            if scope:
+                state = dict(record.state or {})
+                state["__approved_tool_scopes__"] = sorted(set(state.get("__approved_tool_scopes__") or []) | {scope})
+                record.state = state
+
         pending = _unresolved_approvals(record)
         if pending:
             follow_up = _approval_waiting_text(record)
@@ -1952,12 +1976,9 @@ def create_app(
                     "type": "approval_required" if tool_call.get("status") == "approval_required" else "tool_result",
                     "node": target.get("node"),
                     "tool_call": tool_call,
-                    "approval_prompt": (
-                        f"是否允许 {target.get('node')} 使用 {approval_context['service_name']} 的 "
-                        f"{tool_call.get('display_name') or tool_call.get('name')} 执行本次操作？"
-                        if tool_call.get("status") == "approval_required"
-                        else ""
-                    ),
+                    "approval_prompt": _approval_prompt(target.get("node"), tool_call, approval_context)
+                    if tool_call.get("status") == "approval_required"
+                    else "",
                     "message": (
                         f"{target.get('node')} 请求审批工具 {tool_call.get('display_name') or tool_call.get('name')}"
                         if tool_call.get("status") == "approval_required"
@@ -2809,9 +2830,18 @@ def create_app(
     mcp_market = [
         {"slug":"local-demo","name":"本地演示 MCP","provider":"AgentForge","category":"开发测试","description":"零权限 JSON-RPC 演示服务，用于验证 MCP 发现、选择与调用链。","cover":"violet","mcp_url":"http://127.0.0.1:8000/mcp/demo","verified":True,"tools":[{"name":"preview_email","title":"邮件预览","description":"仅生成邮件预览，不发送真实邮件"},{"name":"lookup_demo","title":"演示检索","description":"返回本地演示检索结果"}]},
         {"slug":"context7","name":"Context7 文档 MCP","provider":"Context7","category":"开发工具","description":"查询公开的软件库与框架最新文档；无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"mint","mcp_url":"https://mcp.context7.com/mcp","verified":True,"tools":[{"name":"resolve-library-id","title":"解析文档库","description":"把库名解析为 Context7 文档库 ID","inputSchema":{"type":"object","properties":{"libraryName":{"type":"string"}},"required":["libraryName"]}},{"name":"query-docs","title":"查询文档","description":"基于已解析的库 ID 查询文档","inputSchema":{"type":"object","properties":{"libraryId":{"type":"string"},"query":{"type":"string"}},"required":["libraryId","query"]}}]},
+        {"slug":"deepwiki","name":"DeepWiki 仓库问答 MCP","provider":"DeepWiki","category":"开发工具","description":"对任意 GitHub 开源仓库进行 AI 问答与文档 Wiki 浏览；官方公开服务，无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"cyan","mcp_url":"https://mcp.deepwiki.com/mcp","verified":True,"tools":[{"name":"ask_question","title":"仓库问答","description":"针对 GitHub 仓库提问并获得基于上下文的回答","inputSchema":{"type":"object","properties":{"repoName":{"type":"string","description":"owner/repo 格式的仓库名"},"question":{"type":"string"}},"required":["repoName","question"]}},{"name":"read_wiki_structure","title":"读取文档结构","description":"获取仓库文档 Wiki 的主题目录","inputSchema":{"type":"object","properties":{"repoName":{"type":"string"}},"required":["repoName"]}},{"name":"read_wiki_contents","title":"阅读文档内容","description":"阅读仓库 DeepWiki 文档内容","inputSchema":{"type":"object","properties":{"repoName":{"type":"string"}},"required":["repoName"]}}]},
+        {"slug":"ms-learn","name":"Microsoft Learn 文档 MCP","provider":"Microsoft","category":"文档检索","description":"检索 Microsoft Learn 与 Azure 官方文档、代码示例并转为 Markdown；官方公开服务，无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"violet","mcp_url":"https://learn.microsoft.com/api/mcp","verified":True,"tools":[{"name":"microsoft_docs_search","title":"搜索官方文档","description":"搜索 Microsoft 与 Azure 官方文档","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"microsoft_code_sample_search","title":"搜索代码示例","description":"在官方文档中检索代码片段与示例","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"language":{"type":"string"}},"required":["query"]}},{"name":"microsoft_docs_fetch","title":"抓取文档页","description":"把 Microsoft Learn 文档页转换为 Markdown","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}]},
+        {"slug":"cloudflare-docs","name":"Cloudflare 文档 MCP","provider":"Cloudflare","category":"云服务文档","description":"检索 Cloudflare 产品（Workers、R2、DNS 等）官方文档；官方公开服务，无需平台密钥即可测试，工具调用仍需逐次批准。","cover":"mint","mcp_url":"https://docs.mcp.cloudflare.com/sse","verified":True,"tools":[{"name":"search_cloudflare_documentation","title":"搜索 Cloudflare 文档","description":"检索 Cloudflare 产品官方文档并返回相关章节","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"migrate_pages_to_workers_guide","title":"Pages 迁移指南","description":"获取 Pages 项目迁移到 Workers 的官方指南","inputSchema":{"type":"object","properties":{}}}]},
+        {"slug":"exa","name":"Exa 联网检索 MCP","provider":"Exa","category":"联网检索","description":"语义化网页搜索与正文抓取，获取模型训练截止之后的实时信息；公开端点可直接测试，工具调用仍需逐次批准。","cover":"cyan","mcp_url":"https://mcp.exa.ai/mcp","verified":True,"tools":[{"name":"web_search_exa","title":"语义网页搜索","description":"按自然语言语义检索网页并返回干净正文","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"numResults":{"type":"number"}},"required":["query"]}},{"name":"web_fetch_exa","title":"抓取网页正文","description":"把指定 URL 的网页内容抓取为干净 Markdown","inputSchema":{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"}},"maxCharacters":{"type":"number"}},"required":["urls"]}}]},
         {"slug":"web-search","name":"联网检索 MCP 模板","provider":"项目精选目录","category":"通用办公","description":"接入组织已采购的检索 MCP；安装后需要填写实际服务地址和凭据。","cover":"mint","verified":False},
         {"slug":"gmail","name":"Gmail MCP","provider":"Google","category":"邮件办公","description":"使用 Google OAuth 创建草稿、读取或发送 Gmail；普通用户连接账号即可。当前 Google 官方 MCP 需要管理员预先配置 OAuth 应用。","cover":"cyan","mcp_url":"https://gmailmcp.googleapis.com/mcp/v1","verified":False,"connection_schema":GMAIL_STATIC_OAUTH_SCHEMA},
         {"slug":"github","name":"GitHub MCP","provider":"GitHub","category":"代码协作","description":"用于仓库、Issue 与 PR 协作；服务真实可用，但需在自定义连接中配置 GitHub 认证后再安装。","cover":"violet","verified":False},
+        {"slug":"notion","name":"Notion 工作区 MCP","provider":"Notion","category":"知识库","description":"连接 Notion 工作区，搜索与更新页面、数据库；官方服务真实可用，需在自定义连接中填写 https://mcp.notion.com/mcp 并完成 OAuth 登录授权后安装。","cover":"mint","verified":False},
+        {"slug":"slack","name":"Slack 协作 MCP","provider":"Slack","category":"即时通讯","description":"读写 Slack 频道消息与串、整理团队讨论；官方服务真实可用，需在自定义连接中填写 https://mcp.slack.com/mcp 并完成 OAuth 登录授权后安装。","cover":"violet","verified":False},
+        {"slug":"sentry","name":"Sentry 监控 MCP","provider":"Sentry","category":"监控运维","description":"查询错误事件、Issue 堆栈与发布状态；官方服务真实可用，需在自定义连接中填写 https://mcp.sentry.dev/mcp 并完成 OAuth 登录授权后安装。","cover":"cyan","verified":False},
+        {"slug":"amap","name":"高德地图 MCP","provider":"高德开放平台","category":"位置服务","description":"地理编码、POI 检索与驾车/步行路线规划；需在高德开放平台申请 Key 后，在自定义连接中填写服务地址与 Key 再安装。","cover":"mint","verified":False},
+        {"slug":"tavily","name":"Tavily 联网检索 MCP","provider":"Tavily","category":"信息检索","description":"面向大模型的实时联网检索与网页内容抽取；需在 tavily.com 申请 API Key 后，在自定义连接中填写服务地址与密钥再安装。","cover":"violet","verified":False},
         {"slug":"enterprise-knowledge","name":"企业知识检索 MCP 模板","provider":"项目精选目录","category":"知识库","description":"接入企业文档检索服务；安装后需要填写实际 MCP 地址。","cover":"cyan","verified":False},
     ]
     def _tool_connection_payload(connection: ToolConnectionRecord) -> Dict[str, Any]:

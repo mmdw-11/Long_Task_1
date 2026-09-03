@@ -28,7 +28,7 @@ class WorkspaceRecord:
     name: str
     root_path: str
     read_only: bool = False
-    allowed_commands: list[str] = field(default_factory=lambda: ["pytest", "npm_test", "npm_run_build", "npm_run_lint", "python_compile"])
+    allowed_commands: list[str] = field(default_factory=lambda: ["pytest", "npm_test", "npm_run_build", "npm_run_lint", "python_compile", "javac_compile"])
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -41,8 +41,11 @@ class WorkspaceRecord:
         name, root = str(data.get("name") or "").strip(), str(data.get("root_path") or "").strip()
         if not name or not root:
             raise ValueError("workspace name and root_path are required")
+        allowed_commands = [str(x) for x in data.get("allowed_commands") or []] or cls("", "x", "x").allowed_commands
+        if "python_compile" in allowed_commands and "javac_compile" not in allowed_commands:
+            allowed_commands.append("javac_compile")
         return cls(id=str(data.get("id") or f"workspace-{uuid.uuid4().hex[:12]}"), name=name, root_path=root,
-                   read_only=bool(data.get("read_only", False)), allowed_commands=[str(x) for x in data.get("allowed_commands") or []] or cls("", "x", "x").allowed_commands,
+                   read_only=bool(data.get("read_only", False)), allowed_commands=allowed_commands,
                    created_at=str(data.get("created_at") or _now()), updated_at=str(data.get("updated_at") or _now()))
 
 
@@ -99,6 +102,7 @@ class WorkspaceToolExecutor:
             target = self._resolve(root, str(arguments.get("path") or "")); return {"path": self._relative(root, target), "content": target.read_text(encoding="utf-8", errors="replace")[:200_000]}
         if adapter == "workspace_search": return {"matches": self._search(root, str(arguments.get("query") or ""), str(arguments.get("path") or ""), int(arguments.get("limit") or 80))}
         if adapter == "workspace_apply_patch": return self._apply_edit(workspace, root, arguments)
+        if adapter == "workspace_write_files": return self._write_files(workspace, root, arguments)
         if adapter == "workspace_git_status": return self._git(root, ["status", "--short"])
         if adapter == "workspace_git_diff": return self._git(root, ["diff", "--", str(arguments.get("path") or "")])
         if adapter == "workspace_run_command": return self._run_command(workspace, root, arguments)
@@ -154,6 +158,23 @@ class WorkspaceToolExecutor:
             path.write_text(content.replace(old,new,1),encoding="utf-8")
         return {"path":self._relative(root,path),"created":create,"bytes":path.stat().st_size}
 
+    def _write_files(self, workspace: WorkspaceRecord, root: Path, args: dict[str, Any]) -> dict[str, Any]:
+        """Create a small project scaffold in one atomic, reviewed operation."""
+        if workspace.read_only: raise PermissionError("该工作区为只读")
+        files = list(args.get("files") or [])
+        if not files or len(files) > 80: raise ValueError("files 必须包含 1 至 80 个文件")
+        prepared=[]; total=0
+        for item in files:
+            if not isinstance(item, dict): raise ValueError("files 中的每一项必须是对象")
+            path=self._resolve(root,str(item.get("path") or "")); content=str(item.get("content") or "")
+            if path.exists() and not bool(item.get("overwrite", False)): raise ValueError(f"文件已存在：{self._relative(root,path)}")
+            total += len(content.encode("utf-8"))
+            prepared.append((path, content))
+        if total > 2_000_000: raise ValueError("批量写入内容不能超过 2MB")
+        for path, content in prepared:
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_text(content, encoding="utf-8")
+        return {"files":[self._relative(root,path) for path,_ in prepared],"count":len(prepared),"bytes":total}
+
     def _git(self, root: Path, args: list[str]) -> dict[str, Any]:
         completed=subprocess.run(["git",*args],cwd=root,text=True,capture_output=True,timeout=20,check=False)
         return {"exit_code":completed.returncode,"stdout":completed.stdout[-40_000:],"stderr":completed.stderr[-8_000:]}
@@ -161,7 +182,7 @@ class WorkspaceToolExecutor:
     def _run_command(self, workspace: WorkspaceRecord, root: Path, args: dict[str, Any]) -> dict[str, Any]:
         action=str(args.get("action") or "")
         if action not in workspace.allowed_commands: raise PermissionError(f"工作区不允许执行 {action}")
-        commands={"pytest":["python","-m","pytest"],"npm_test":["npm","test","--","--runInBand"],"npm_run_build":["npm","run","build"],"npm_run_lint":["npm","run","lint"],"python_compile":["python","-m","compileall"]}
+        commands={"pytest":["python","-m","pytest"],"npm_test":["npm","test","--","--runInBand"],"npm_run_build":["npm","run","build"],"npm_run_lint":["npm","run","lint"],"python_compile":["python","-m","compileall"],"javac_compile":["javac","-encoding","UTF-8"]}
         command=[*commands[action]]
         target=str(args.get("target") or "").strip()
         if target:
