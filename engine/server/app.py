@@ -661,7 +661,7 @@ def create_app(
         target = _orchestrator_for_run(record.workflow_id, record)
         return next((item for item in target.list_agents() if item.name == node_name), None)
 
-    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces, skill_repository=skills, run_store=runs)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -983,7 +983,10 @@ def create_app(
             errors.append("工作流入口必须指向开始节点")
         for edge in connections:
             source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
-            if source not in ids or (target != "END" and target not in ids):
+            # Conditional connections use ``<conditional>`` as a serialized
+            # sentinel; their real targets are carried by ``path_map`` below.
+            # It is not a node id and must not be reported as a dangling edge.
+            if source not in ids or (target not in {"END", "<conditional>"} and target not in ids):
                 errors.append("工作流包含指向不存在节点的连线")
             if source == target:
                 errors.append("节点不能连接到自身")
@@ -1008,10 +1011,18 @@ def create_app(
                         errors.append(f"节点 {item.get('name') or item.get('id')} 包含未挂载到当前工作流的工具")
         if starts:
             adjacency: Dict[str, set[str]] = {node_id: set() for node_id in ids}
+            contained_by_parent: Dict[str, set[str]] = {node_id: set() for node_id in ids}
             for edge in connections:
                 source = str(edge.get("source") or "")
                 targets = list((edge.get("path_map") or {}).values()) if edge.get("conditional") else [edge.get("target")]
                 adjacency.setdefault(source, set()).update(str(target) for target in targets if target in ids)
+            for item in agents:
+                parent_id = str(item.get("parent_id") or "")
+                if parent_id in ids:
+                    contained_by_parent.setdefault(parent_id, set()).add(str(item.get("id")))
+                for child_id in item.get("children") or []:
+                    if str(child_id) in ids:
+                        contained_by_parent.setdefault(str(item.get("id")), set()).add(str(child_id))
             reached, pending = set(), [str(starts[0].get("id"))]
             while pending:
                 current_id = pending.pop()
@@ -1019,6 +1030,9 @@ def create_app(
                     continue
                 reached.add(current_id)
                 pending.extend(adjacency.get(current_id, set()) - reached)
+                # Entering a team/container makes its members reachable even
+                # though they intentionally have no static workflow edges.
+                pending.extend(contained_by_parent.get(current_id, set()) - reached)
             if reached != ids:
                 errors.append("所有节点必须能够从开始节点到达")
             if ends and str(ends[0].get("id")) not in reached:
@@ -1027,7 +1041,7 @@ def create_app(
             config = item.get("config") or {}
             if kind == "tool" and not config.get("tool_id"):
                 errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
-            if kind in {"condition", "intent", "loop", "batch"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
+            if kind in {"condition", "intent", "loop", "batch", "goal_gate", "recovery_boundary"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
                 errors.append(f"逻辑节点“{item.get('name')}”尚未配置分支连线")
             if kind == "intent" and not (config.get("model") or item.get("model")):
                 errors.append(f"意图分类节点“{item.get('name')}”尚未选择模型")
@@ -1041,6 +1055,14 @@ def create_app(
                 child_ids = set(item.get("children") or [])
                 if any(str((child.get("config") or {}).get("node_kind")) in {"loop", "batch"} for child in agents if child.get("id") in child_ids):
                     errors.append(f"{item.get('name')}内不能嵌套循环或批处理")
+            if kind == "agent_team":
+                child_ids = {str(value) for value in item.get("children") or []}
+                members = [child for child in agents if str(child.get("id")) in child_ids and str((child.get("config") or {}).get("node_kind") or "agent") not in {"start", "end", "loop_start", "loop_end", "batch_start", "batch_end"}]
+                if not members:
+                    errors.append(f"动态智能体团队“{item.get('name')}”至少需要一个成员")
+                supervisor_id = str(config.get("supervisor_id") or "")
+                if supervisor_id and supervisor_id not in child_ids:
+                    errors.append(f"动态智能体团队“{item.get('name')}”的主管必须是团队成员")
         return list(dict.fromkeys(errors))
 
     def _append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1052,6 +1074,35 @@ def create_app(
         record.events.append(enriched)
         runs.save(record)
         return enriched
+
+    def _runtime_child_event_message(event: Dict[str, Any]) -> str:
+        """Human-readable trace labels for nested batch and dynamic-team events."""
+        labels = {
+            "team_started": "动态团队开始评估可用成员",
+            "candidate_filtered": "已完成资源硬过滤与多指标候选评分",
+            "topology_reconfigured": "动态团队已重构本轮协作拓扑",
+            "delegation_selected": "主管已动态委派子智能体",
+            "handoff_selected": "主管已批准智能体自主 Handoff",
+            "handoff_rejected": "主管拒绝 Handoff 请求",
+            "team_member_started": "子智能体开始处理委派任务",
+            "team_member_completed": "子智能体已返回委派结果",
+            "goal_checked": "团队已完成本轮目标检查",
+            "team_member_failed": "子智能体执行失败，正在评估替代成员",
+            "fallback_selected": "已选择备用子智能体接管任务",
+            "team_aggregated": "动态团队已汇聚成员结果",
+        }
+        if event.get("type") in labels:
+            parts = [labels[event["type"]]]
+            if event.get("source") and event.get("target"):
+                parts.append(f"：{event['source']} → {event['target']}")
+            elif event.get("node"):
+                parts.append(f"：{event['node']}")
+            return "".join(parts)
+        return (
+            f"{event.get('node')} 已完成批处理项"
+            if event.get("type") == "node_end"
+            else f"进入 {event.get('node')}，开始处理批处理项"
+        )
 
     def _task_text(payload: Dict[str, Any]) -> str:
         for key in ("input", "task", "goal", "query"):
@@ -1223,7 +1274,7 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
-            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces) if is_visual_workflow else None
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces, skill_repository=skills, run_store=runs) if is_visual_workflow else None
             compiled = target.build_graph(
                 node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
@@ -1250,7 +1301,10 @@ def create_app(
                     event["message"] = f"进入 {event.get('node')}，开始处理当前步骤"
                 elif event.get("type") == "node_end":
                     update = dict(event.get("update") or {})
-                    child_events = list(update.pop("__runtime_child_events__", []) or [])
+                    child_events = [
+                        *list(update.pop("__runtime_child_events__", []) or []),
+                        *list(update.pop("__runtime_team_events__", []) or []),
+                    ]
                     event["update"] = update
                     messages = list(update.get("messages") or [])
                     latest_message = messages[-1] if messages else {}
@@ -1288,9 +1342,7 @@ def create_app(
                         _append_event(record,{"type":"knowledge_retrieval_end","node":event.get("node"),"retrieval_metadata":retrieval_metadata,"citations":list((event.get("update") or {}).get("citations") or []),"message":f"{event.get('node')} 已完成知识库检索，命中 {retrieval_metadata.get('result_count',0)} 条，耗时 {retrieval_metadata.get('latency_ms','—')} ms"})
                     for child_event in child_events:
                         child_event["message"] = child_event.get("message") or (
-                            f"{child_event.get('node')} 已完成批处理项"
-                            if child_event.get("type") == "node_end"
-                            else f"进入 {child_event.get('node')}，开始处理批处理项"
+                            _runtime_child_event_message(child_event)
                         )
                         _append_event(record, child_event)
                     for tool_call in event.get("tool_calls") or []:

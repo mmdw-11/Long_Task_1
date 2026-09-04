@@ -733,14 +733,15 @@ class AgentRuntimeFactory:
         return rendered
 
     def _has_ready_auto_model(self) -> bool:
-        """Use the local development fallback until a tested AUTO model exists."""
+        """Only enter AUTO when the complete device/edge/cloud topology is ready.
+
+        ``_run_auto_model`` requires all three tested default connections;
+        keeping this predicate identical prevents partial model configuration
+        from turning a normal offline Agent call into an avoidable 400.
+        """
         if self.model_connections is None:
             return False
-        return any(
-            item.enabled and item.configured and item.auto_default and item.test_status == "succeeded"
-            and bool(connection_api_key(item))
-            for item in self.model_connections.list()
-        )
+        return bool(self.model_connections.auto_status().get("ready"))
 
     def continue_after_tool_decisions(
         self,
