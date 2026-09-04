@@ -419,4 +419,12 @@ def _tokenize(value: str) -> list[str]:
     """Small dependency-free tokenizer for explainable capability routing."""
     import re
 
-    return re.findall(r"[\u4e00-\u9fff]{1,}|[A-Za-z0-9_]+", value.lower())
+    tokens: list[str] = []
+    for token in re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]+", value.lower()):
+        tokens.append(token)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            # Capability labels are commonly short Chinese words ("检索",
+            # "代码", "评审").  Character bigrams preserve useful overlap
+            # without depending on a heavyweight Chinese segmenter.
+            tokens.extend(token[index:index + 2] for index in range(max(0, len(token) - 1)))
+    return tokens
