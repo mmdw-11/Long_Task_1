@@ -12,8 +12,10 @@ from .agent_runtime import AgentRuntimeFactory
 from .product_ops import ToolCatalogStore
 from .model_connections import ModelConnectionStore
 from .tool_runtime import ToolRuntime
+from .tools.mcp_remote import MCPAuthorizationStore
 from .knowledge import KnowledgeStore
 from .workflow_scripts import run_workflow_script
+from .workspace_tools import WorkspaceStore
 
 
 class WorkflowNodeRuntimeFactory:
@@ -25,10 +27,14 @@ class WorkflowNodeRuntimeFactory:
         models: ModelConnectionStore | None = None,
         graph: Dict[str, Any] | None = None,
         knowledge_store: KnowledgeStore | None = None,
+        mcp_oauth_store: MCPAuthorizationStore | None = None,
+        workspace_store: WorkspaceStore | None = None,
     ) -> None:
         self.tools = tools
-        self.tool_runtime = ToolRuntime(tools)
-        self.agent_runtime = AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=models, knowledge_store=knowledge_store)
+        self.mcp_oauth_store = mcp_oauth_store
+        self.workspace_store = workspace_store
+        self.tool_runtime = ToolRuntime(tools, mcp_oauth_store, workspace_store)
+        self.agent_runtime = AgentRuntimeFactory(tool_catalog_store=tools, model_connection_store=models, knowledge_store=knowledge_store, mcp_oauth_store=mcp_oauth_store, workspace_store=workspace_store)
         self.knowledge_store = knowledge_store
         self.models = models
         self.graph = graph or {}
@@ -57,9 +63,10 @@ class WorkflowNodeRuntimeFactory:
                 tool = self.tools.get(tool_id)
                 task = _get(state, str(config.get("input_field") or "input"))
                 task_text = task if isinstance(task, str) else json.dumps(task, ensure_ascii=False, default=str)
-                result = self.tool_runtime.execute(tool, task_text).to_dict()
-                if result["status"] == "failed":
-                    raise RuntimeError(result.get("error") or "工具调用失败")
+                arguments = {"workspace_id": state.get("workspace_id")} if str(tool.metadata.get("adapter") or "").startswith("workspace_") else None
+                result = self.tool_runtime.execute(tool, task_text, arguments=arguments).to_dict()
+                if result["status"] != "succeeded":
+                    raise RuntimeError(result.get("error") or "工具调用未完成")
                 output_key = str(config.get("output_field") or "tool_output")
                 return {output_key: result.get("result"), "input": result.get("result"), "__runtime_tool_calls__": [result]}
             if kind == "knowledge":
@@ -102,6 +109,24 @@ class WorkflowNodeRuntimeFactory:
                 fallback = str(config.get("default_route") or "default")
                 value: Any = routes if str(config.get("mode") or "single") == "multiple" else (routes[0] if routes else fallback)
                 return {str(config.get("route_key") or f"route_{spec.id}"): value, str(config.get("output_field") or "intent_result"): allowed}
+            if kind == "drift_guard":
+                # Deterministic guardrail: do not let a coding loop silently
+                # touch files outside the declared plan/workspace policy.
+                changed = _get(state, str(config.get("changed_files_field") or "changed_files")) or []
+                changed = [str(item.get("path") if isinstance(item, dict) else item) for item in changed]
+                allowed_paths = [str(item).replace("\\", "/").rstrip("/") for item in config.get("allowed_paths") or []]
+                unexpected = [path for path in changed if allowed_paths and not any(path == prefix or path.startswith(prefix + "/") for prefix in allowed_paths)]
+                plan = _get(state, str(config.get("plan_field") or "engineering_plan"))
+                criteria = (plan or {}).get("acceptance_criteria", []) if isinstance(plan, dict) else []
+                tests = _get(state, str(config.get("test_result_field") or "test_result")) or {}
+                test_failed = isinstance(tests, dict) and tests.get("exit_code") not in {None, 0}
+                violations = []
+                if unexpected: violations.append({"type":"scope", "files":unexpected, "reason":"修改文件不在当前计划允许范围"})
+                if test_failed: violations.append({"type":"validation", "reason":"测试或构建尚未通过"})
+                report = {"passed": not violations, "violations": violations, "acceptance_criteria": criteria, "changed_files": changed}
+                route_key = str(config.get("route_key") or f"route_{spec.id}")
+                route = config.get("pass_route", "pass") if not violations else config.get("fail_route", "revise")
+                return {str(config.get("output_field") or "drift_report"): report, route_key: str(route)}
             if kind == "script":
                 if config.get("code"):
                     params = {str(item.get("name")): _get(state, str(item.get("path") or item.get("name"))) for item in config.get("inputs") or []}
@@ -201,7 +226,7 @@ class WorkflowNodeRuntimeFactory:
         if not start: raise RuntimeError("批处理子流程缺少批处理开始节点")
         child_graph = {"entry": start["id"], "agents": agents, "connections": connections}
         orchestrator = Orchestrator.from_dict(child_graph)
-        factory = WorkflowNodeRuntimeFactory(self.tools, self.models, graph=child_graph, knowledge_store=self.knowledge_store)
+        factory = WorkflowNodeRuntimeFactory(self.tools, self.models, graph=child_graph, knowledge_store=self.knowledge_store, mcp_oauth_store=self.mcp_oauth_store, workspace_store=self.workspace_store)
         compiled = orchestrator.build_graph(node_factory=factory, recursion_limit=50)
         events, output = [], state
         async for event in compiled.astream(state, 50):

@@ -7,6 +7,7 @@ LocalEchoExecutor 会作为 fallback 执行，从而保证接口链路可直接�
 from fastapi.testclient import TestClient
 
 from engine.modules.product_ops import ToolCatalogStore
+from engine.modules.model_connections import ModelConnectionStore
 from engine.modules.workflows import RunStore, WorkflowStore
 from engine.server.app import create_app
 
@@ -79,6 +80,7 @@ def test_background_run_streams_plan_todo_and_tool_events(tmp_path, monkeypatch)
         workflow_store=WorkflowStore(tmp_path / "workflows"),
         run_store=RunStore(tmp_path / "runs"),
         tool_catalog_store=tool_store,
+        model_connection_store=ModelConnectionStore(tmp_path / "models"),
     )
     client = TestClient(app)
 
@@ -160,6 +162,7 @@ def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
         workflow_store=WorkflowStore(tmp_path / "workflows"),
         run_store=RunStore(tmp_path / "runs"),
         tool_catalog_store=tool_store,
+        model_connection_store=ModelConnectionStore(tmp_path / "models-approval-reject"),
     )
     client = TestClient(app)
 
@@ -175,6 +178,7 @@ def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
     created = client.post("/api/runs", json={"input": {"input": "请进行桌面控制"}}).json()
     record = client.get(f"/api/runs/{created['id']}").json()
     approval = next(event for event in record["events"] if event["type"] == "approval_required")
+    assert record["status"] == "waiting_approval"
 
     decided = client.post(
         f"/api/runs/{created['id']}/approvals/{approval['sequence']}/reject",
@@ -184,8 +188,11 @@ def test_tool_approval_decision_is_audited(tmp_path, monkeypatch):
     assert decided.status_code == 200
     payload = decided.json()
     assert payload["metadata"]["approval_decisions"][str(approval["sequence"])]["approved"] is False
-    assert payload["events"][-1]["type"] == "tool_result"
-    assert payload["events"][-1]["tool_call"]["status"] == "rejected"
+    assert payload["status"] == "succeeded"
+    assert payload["events"][-1]["type"] == "approval_continuation"
+    assert "未得到批准" in payload["state"]["input"]
+    rejected_result = next(event for event in payload["events"] if event["type"] == "tool_result")
+    assert rejected_result["tool_call"]["status"] == "rejected"
 
 
 def test_approved_high_risk_tool_executes_after_decision(tmp_path, monkeypatch):
@@ -196,7 +203,7 @@ def test_approved_high_risk_tool_executes_after_decision(tmp_path, monkeypatch):
         name="send_mail_demo", display_name="邮件发送演示", description="发送邮件",
         metadata={"adapter": "echo", "risk": "high"},
     )
-    app = create_app(run_store=RunStore(tmp_path / "runs"), tool_catalog_store=tool_store)
+    app = create_app(run_store=RunStore(tmp_path / "runs"), tool_catalog_store=tool_store, model_connection_store=ModelConnectionStore(tmp_path / "models"))
     client = TestClient(app)
     agent_id = client.post(
         "/api/agents", json={"name": "邮件助手", "description": "发送邮件", "config": {"tool_ids": [risky_tool.id]}}
@@ -205,13 +212,17 @@ def test_approved_high_risk_tool_executes_after_decision(tmp_path, monkeypatch):
     created = client.post("/api/runs", json={"input": {"input": "请发送邮件给客户"}}).json()
     record = client.get(f"/api/runs/{created['id']}").json()
     approval = next(event for event in record["events"] if event["type"] == "approval_required")
+    assert record["status"] == "waiting_approval"
 
     approved = client.post(f"/api/runs/{created['id']}/approvals/{approval['sequence']}/approve", json={}).json()
-    result = approved["events"][-1]["tool_call"]
+    result = next(event["tool_call"] for event in reversed(approved["events"]) if event["type"] == "tool_result")
 
     assert approved["metadata"]["approval_decisions"][str(approval["sequence"])]["approved"] is True
+    assert approved["status"] == "succeeded"
     assert result["status"] == "succeeded"
     assert result["name"] == "send_mail_demo"
+    assert approved["events"][-1]["type"] == "approval_continuation"
+    assert "工具调用已获批准并执行完成" in approved["state"]["input"]
 
 
 def test_script_tool_is_registered_but_disabled_by_default(tmp_path, monkeypatch):
