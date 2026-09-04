@@ -983,7 +983,10 @@ def create_app(
             errors.append("工作流入口必须指向开始节点")
         for edge in connections:
             source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
-            if source not in ids or (target != "END" and target not in ids):
+            # Conditional connections use ``<conditional>`` as a serialized
+            # sentinel; their real targets are carried by ``path_map`` below.
+            # It is not a node id and must not be reported as a dangling edge.
+            if source not in ids or (target not in {"END", "<conditional>"} and target not in ids):
                 errors.append("工作流包含指向不存在节点的连线")
             if source == target:
                 errors.append("节点不能连接到自身")
@@ -1008,10 +1011,18 @@ def create_app(
                         errors.append(f"节点 {item.get('name') or item.get('id')} 包含未挂载到当前工作流的工具")
         if starts:
             adjacency: Dict[str, set[str]] = {node_id: set() for node_id in ids}
+            contained_by_parent: Dict[str, set[str]] = {node_id: set() for node_id in ids}
             for edge in connections:
                 source = str(edge.get("source") or "")
                 targets = list((edge.get("path_map") or {}).values()) if edge.get("conditional") else [edge.get("target")]
                 adjacency.setdefault(source, set()).update(str(target) for target in targets if target in ids)
+            for item in agents:
+                parent_id = str(item.get("parent_id") or "")
+                if parent_id in ids:
+                    contained_by_parent.setdefault(parent_id, set()).add(str(item.get("id")))
+                for child_id in item.get("children") or []:
+                    if str(child_id) in ids:
+                        contained_by_parent.setdefault(str(item.get("id")), set()).add(str(child_id))
             reached, pending = set(), [str(starts[0].get("id"))]
             while pending:
                 current_id = pending.pop()
@@ -1019,8 +1030,10 @@ def create_app(
                     continue
                 reached.add(current_id)
                 pending.extend(adjacency.get(current_id, set()) - reached)
-            contained = {str(child_id) for item in agents for child_id in (item.get("children") or [])}
-            if reached != ids - contained:
+                # Entering a team/container makes its members reachable even
+                # though they intentionally have no static workflow edges.
+                pending.extend(contained_by_parent.get(current_id, set()) - reached)
+            if reached != ids:
                 errors.append("所有节点必须能够从开始节点到达")
             if ends and str(ends[0].get("id")) not in reached:
                 errors.append("结束节点必须能够从开始节点到达")
