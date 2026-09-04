@@ -72,6 +72,36 @@ def test_dynamic_team_substitutes_backup_after_member_failure(tmp_path, monkeypa
     assert "fallback_selected" in event_types
 
 
+def test_dynamic_team_hard_filters_missing_resources_and_audits_score(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    graph = _team_graph()
+    team = next(item for item in graph["agents"] if item["id"] == "team")
+    team["config"]["member_profiles"]["worker-search"]["requirements"] = {"tool_ids": ["tool-not-installed"]}
+    events = _run(graph)
+    update = next(event for event in events if event.get("type") == "node_end" and event.get("node") == "research-team")["update"]
+    assert update["team_results"][0]["member"] == "backup-worker"
+    filtered = next(event for event in update["__runtime_team_events__"] if event["type"] == "candidate_filtered")
+    rejected = next(item for item in filtered["candidates"] if item["member_id"] == "worker-search")
+    assert rejected["eligible"] is False
+    assert "必要工具不可用" in rejected["excluded_reasons"]
+    assert "semantic_similarity" in rejected["score_breakdown"]
+
+
+def test_dynamic_team_supervisor_approves_structured_handoff(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    graph = _team_graph()
+    search = next(item for item in graph["agents"] if item["id"] == "worker-search")
+    search["config"]["code"] = "def main(params):\n    return {'answer': 'need specialist', 'handoff_request': {'status': 'needs_handoff', 'remaining_task': 'resolve backup search facts', 'required_capabilities': ['backup'], 'reason': 'specialist needed'}}"
+    team = next(item for item in graph["agents"] if item["id"] == "team")
+    team["config"]["delegation"] = {"mode": "single", "selection_top_k": 1, "max_parallel": 1, "allow_handoff": True, "max_handoffs": 2}
+    events = _run(graph)
+    update = next(event for event in events if event.get("type") == "node_end" and event.get("node") == "research-team")["update"]
+    handoff = next(event for event in update["__runtime_team_events__"] if event["type"] == "handoff_selected")
+    assert handoff["source"] == "search-worker"
+    assert handoff["target"] == "backup-worker"
+    assert any(item["member"] == "backup-worker" for item in update["team_results"])
+
+
 def test_dynamic_team_runs_through_saved_workflow_api(tmp_path, monkeypatch):
     """The persisted canvas graph produces delegation events in a real Run."""
     monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")

@@ -661,7 +661,7 @@ def create_app(
         target = _orchestrator_for_run(record.workflow_id, record)
         return next((item for item in target.list_agents() if item.name == node_name), None)
 
-    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces, skill_repository=skills, run_store=runs)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -1066,10 +1066,14 @@ def create_app(
         """Human-readable trace labels for nested batch and dynamic-team events."""
         labels = {
             "team_started": "动态团队开始评估可用成员",
+            "candidate_filtered": "已完成资源硬过滤与多指标候选评分",
             "topology_reconfigured": "动态团队已重构本轮协作拓扑",
             "delegation_selected": "主管已动态委派子智能体",
+            "handoff_selected": "主管已批准智能体自主 Handoff",
+            "handoff_rejected": "主管拒绝 Handoff 请求",
             "team_member_started": "子智能体开始处理委派任务",
             "team_member_completed": "子智能体已返回委派结果",
+            "goal_checked": "团队已完成本轮目标检查",
             "team_member_failed": "子智能体执行失败，正在评估替代成员",
             "fallback_selected": "已选择备用子智能体接管任务",
             "team_aggregated": "动态团队已汇聚成员结果",
@@ -1257,7 +1261,7 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
-            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces) if is_visual_workflow else None
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces, skill_repository=skills, run_store=runs) if is_visual_workflow else None
             compiled = target.build_graph(
                 node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
