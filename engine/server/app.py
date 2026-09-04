@@ -1019,7 +1019,8 @@ def create_app(
                     continue
                 reached.add(current_id)
                 pending.extend(adjacency.get(current_id, set()) - reached)
-            if reached != ids:
+            contained = {str(child_id) for item in agents for child_id in (item.get("children") or [])}
+            if reached != ids - contained:
                 errors.append("所有节点必须能够从开始节点到达")
             if ends and str(ends[0].get("id")) not in reached:
                 errors.append("结束节点必须能够从开始节点到达")
@@ -1027,7 +1028,7 @@ def create_app(
             config = item.get("config") or {}
             if kind == "tool" and not config.get("tool_id"):
                 errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
-            if kind in {"condition", "intent", "loop", "batch"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
+            if kind in {"condition", "intent", "loop", "batch", "goal_gate", "recovery_boundary"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
                 errors.append(f"逻辑节点“{item.get('name')}”尚未配置分支连线")
             if kind == "intent" and not (config.get("model") or item.get("model")):
                 errors.append(f"意图分类节点“{item.get('name')}”尚未选择模型")
@@ -1041,6 +1042,14 @@ def create_app(
                 child_ids = set(item.get("children") or [])
                 if any(str((child.get("config") or {}).get("node_kind")) in {"loop", "batch"} for child in agents if child.get("id") in child_ids):
                     errors.append(f"{item.get('name')}内不能嵌套循环或批处理")
+            if kind == "agent_team":
+                child_ids = {str(value) for value in item.get("children") or []}
+                members = [child for child in agents if str(child.get("id")) in child_ids and str((child.get("config") or {}).get("node_kind") or "agent") not in {"start", "end", "loop_start", "loop_end", "batch_start", "batch_end"}]
+                if not members:
+                    errors.append(f"动态智能体团队“{item.get('name')}”至少需要一个成员")
+                supervisor_id = str(config.get("supervisor_id") or "")
+                if supervisor_id and supervisor_id not in child_ids:
+                    errors.append(f"动态智能体团队“{item.get('name')}”的主管必须是团队成员")
         return list(dict.fromkeys(errors))
 
     def _append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1052,6 +1061,31 @@ def create_app(
         record.events.append(enriched)
         runs.save(record)
         return enriched
+
+    def _runtime_child_event_message(event: Dict[str, Any]) -> str:
+        """Human-readable trace labels for nested batch and dynamic-team events."""
+        labels = {
+            "team_started": "动态团队开始评估可用成员",
+            "topology_reconfigured": "动态团队已重构本轮协作拓扑",
+            "delegation_selected": "主管已动态委派子智能体",
+            "team_member_started": "子智能体开始处理委派任务",
+            "team_member_completed": "子智能体已返回委派结果",
+            "team_member_failed": "子智能体执行失败，正在评估替代成员",
+            "fallback_selected": "已选择备用子智能体接管任务",
+            "team_aggregated": "动态团队已汇聚成员结果",
+        }
+        if event.get("type") in labels:
+            parts = [labels[event["type"]]]
+            if event.get("source") and event.get("target"):
+                parts.append(f"：{event['source']} → {event['target']}")
+            elif event.get("node"):
+                parts.append(f"：{event['node']}")
+            return "".join(parts)
+        return (
+            f"{event.get('node')} 已完成批处理项"
+            if event.get("type") == "node_end"
+            else f"进入 {event.get('node')}，开始处理批处理项"
+        )
 
     def _task_text(payload: Dict[str, Any]) -> str:
         for key in ("input", "task", "goal", "query"):
@@ -1250,7 +1284,10 @@ def create_app(
                     event["message"] = f"进入 {event.get('node')}，开始处理当前步骤"
                 elif event.get("type") == "node_end":
                     update = dict(event.get("update") or {})
-                    child_events = list(update.pop("__runtime_child_events__", []) or [])
+                    child_events = [
+                        *list(update.pop("__runtime_child_events__", []) or []),
+                        *list(update.pop("__runtime_team_events__", []) or []),
+                    ]
                     event["update"] = update
                     messages = list(update.get("messages") or [])
                     latest_message = messages[-1] if messages else {}
@@ -1288,9 +1325,7 @@ def create_app(
                         _append_event(record,{"type":"knowledge_retrieval_end","node":event.get("node"),"retrieval_metadata":retrieval_metadata,"citations":list((event.get("update") or {}).get("citations") or []),"message":f"{event.get('node')} 已完成知识库检索，命中 {retrieval_metadata.get('result_count',0)} 条，耗时 {retrieval_metadata.get('latency_ms','—')} ms"})
                     for child_event in child_events:
                         child_event["message"] = child_event.get("message") or (
-                            f"{child_event.get('node')} 已完成批处理项"
-                            if child_event.get("type") == "node_end"
-                            else f"进入 {child_event.get('node')}，开始处理批处理项"
+                            _runtime_child_event_message(child_event)
                         )
                         _append_event(record, child_event)
                     for tool_call in event.get("tool_calls") or []:

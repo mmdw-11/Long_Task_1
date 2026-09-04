@@ -41,11 +41,41 @@ class WorkflowNodeRuntimeFactory:
 
     def __call__(self, spec: AgentSpec) -> Node:
         kind = str(spec.config.get("node_kind") or "agent")
+        if kind == "agent_team":
+            return Node(
+                spec.name,
+                lambda state: self._run_agent_team(spec, state),
+                NodeType.SUBGRAPH,
+                {"id": spec.id, "node_kind": kind, "children": list(spec.children), **spec.config},
+            )
         if kind in {"agent", "llm"}:
             return self.agent_runtime(spec)
 
         async def run(state: Dict[str, Any]) -> Dict[str, Any]:
             config = spec.config
+            if kind == "task_planner":
+                task = str(_get(state, str(config.get("input_field") or "input")) or "")
+                separators = [line.strip(" -•\t") for line in task.replace("；", "\n").replace(";", "\n").splitlines()]
+                subtasks = [line for line in separators if line] or [task]
+                plan = [{"id": f"{spec.id}-{index + 1}", "description": item, "status": "pending"} for index, item in enumerate(subtasks[: max(1, min(20, int(config.get("max_subtasks") or 8)))])]
+                return {str(config.get("output_field") or "task_plan"): plan, "task_plan": plan, "input": task}
+            if kind == "result_aggregator":
+                raw = _get(state, str(config.get("input_field") or "team_results")) or []
+                items = raw if isinstance(raw, list) else [raw]
+                successful = [item for item in items if not isinstance(item, dict) or item.get("status", "succeeded") == "succeeded"]
+                pieces = [str(item.get("output", item)) if isinstance(item, dict) else str(item) for item in successful]
+                mode = str(config.get("mode") or "concat")
+                value: Any = pieces[0] if mode == "first" and pieces else "\n\n".join(pieces)
+                return {str(config.get("output_field") or "aggregated_result"): value, "input": value, "aggregation": {"mode": mode, "source_count": len(items), "success_count": len(successful)}}
+            if kind == "goal_gate":
+                value = _get(state, str(config.get("check_field") or "input"))
+                complete = bool(value) if str(config.get("operator") or "not_empty") == "not_empty" else _compare(value, config.get("expected_value"), str(config.get("operator") or "equals"))
+                route = str((config.get("complete_route") or "complete") if complete else (config.get("continue_route") or "continue"))
+                return {str(config.get("route_key") or f"route_{spec.id}"): route, str(config.get("output_field") or "goal_check"): {"complete": complete, "checked_field": str(config.get("check_field") or "input")}}
+            if kind == "recovery_boundary":
+                failures = list(state.get("__team_failures__") or [])
+                route = str(config.get("recover_route") or "recover") if failures else str(config.get("pass_route") or "pass")
+                return {str(config.get("route_key") or f"route_{spec.id}"): route, str(config.get("output_field") or "recovery_report"): {"failure_count": len(failures), "route": route}}
             if kind == "start":
                 return {"input": state.get("input", state)}
             if kind in {"loop_start", "batch_start"}:
@@ -218,6 +248,104 @@ class WorkflowNodeRuntimeFactory:
 
         return Node(spec.name, run, NodeType.FUNCTION, {"id": spec.id, "node_kind": kind, **spec.config})
 
+    async def _run_agent_team(self, team: AgentSpec, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a supervisor-owned member pool with per-run sparse delegation.
+
+        Membership is authored on the canvas via ``children``.  The selected
+        members, temporary edges and fallback substitutions live only in the
+        run trace, never in the persisted workflow graph.
+        """
+        config = team.config
+        members = [self._spec_for(member_id) for member_id in team.children]
+        members = [member for member in members if member is not None]
+        if not members:
+            raise RuntimeError("动态智能体团队至少需要一个成员")
+
+        task = _get(state, str(config.get("input_field") or "input"))
+        task_text = task if isinstance(task, str) else json.dumps(task, ensure_ascii=False, default=str)
+        profiles = config.get("member_profiles") if isinstance(config.get("member_profiles"), dict) else {}
+        candidates = [member for member in members if bool((profiles.get(member.id) or {}).get("enabled", True))]
+        if not candidates:
+            raise RuntimeError("动态智能体团队没有可用成员")
+        ranked = sorted(candidates, key=lambda member: self._member_score(member, task_text, profiles.get(member.id) or {}), reverse=True)
+        delegation = config.get("delegation") if isinstance(config.get("delegation"), dict) else {}
+        mode = str(delegation.get("mode") or "hybrid_selector")
+        requested = int(delegation.get("selection_top_k") or (1 if mode in {"single", "handoff"} else delegation.get("max_parallel") or 1))
+        max_parallel = max(1, min(8, int(delegation.get("max_parallel") or 2)))
+        selected = ranked[: max(1, min(len(ranked), requested, max_parallel))]
+        events: list[Dict[str, Any]] = [
+            {"type": "team_started", "team": team.name, "team_id": team.id, "member_count": len(candidates), "mode": mode},
+            {"type": "topology_reconfigured", "team": team.name, "active_members": [item.name for item in selected], "edge_ttl": int((config.get("topology") or {}).get("edge_ttl") or 1), "reason": "task_capability_match"},
+        ]
+        for member in selected:
+            events.append({"type": "delegation_selected", "team": team.name, "source": team.name, "target": member.name, "reason": "capability_score", "score": round(self._member_score(member, task_text, profiles.get(member.id) or {}), 4), "temporary": True})
+
+        async def invoke(member: AgentSpec) -> Dict[str, Any]:
+            child_state = dict(state)
+            child_state["input"] = task
+            child_state["__team_id__"] = team.id
+            child_state["__team_name__"] = team.name
+            events.append({"type": "team_member_started", "team": team.name, "node": member.name, "parent_node_id": team.id})
+            try:
+                update = await self(member).invoke(child_state) or {}
+                output = update.get("input", update.get(member.name, update))
+                events.append({"type": "team_member_completed", "team": team.name, "node": member.name, "parent_node_id": team.id})
+                return {"member_id": member.id, "member": member.name, "status": "succeeded", "output": output, "update": update}
+            except Exception as exc:  # member failure is contained by the team boundary
+                events.append({"type": "team_member_failed", "team": team.name, "node": member.name, "parent_node_id": team.id, "error": str(exc)})
+                return {"member_id": member.id, "member": member.name, "status": "failed", "error": str(exc)}
+
+        results = await asyncio.gather(*(invoke(member) for member in selected))
+        used = {item["member_id"] for item in results}
+        if bool((config.get("recovery") or {}).get("allow_substitution", True)):
+            for failed in [item for item in results if item["status"] == "failed"]:
+                fallback = next((member for member in ranked if member.id not in used), None)
+                if fallback is None:
+                    continue
+                used.add(fallback.id)
+                events.append({"type": "fallback_selected", "team": team.name, "failed_member": failed["member"], "target": fallback.name, "reason": "member_failure", "temporary": True})
+                results.append(await invoke(fallback))
+
+        successful = [item for item in results if item["status"] == "succeeded"]
+        aggregation = config.get("aggregation") if isinstance(config.get("aggregation"), dict) else {}
+        aggregate_mode = str(aggregation.get("mode") or "concat")
+        outputs = [item["output"] for item in successful]
+        if aggregate_mode == "first":
+            output: Any = outputs[0] if outputs else ""
+        elif aggregate_mode == "structured":
+            output = {item["member"]: item["output"] for item in successful}
+        else:
+            output = "\n\n".join(f"[{item['member']}] {item['output']}" for item in successful)
+        events.append({"type": "team_aggregated", "team": team.name, "mode": aggregate_mode, "success_count": len(successful), "failure_count": len(results) - len(successful)})
+        if not successful:
+            raise RuntimeError("动态智能体团队的所有成员均执行失败")
+        return {
+            str(config.get("output_field") or "team_result"): output,
+            "team_results": results,
+            "input": output,
+            "__team_failures__": [item for item in results if item["status"] != "succeeded"],
+            "__runtime_team_events__": events,
+        }
+
+    def _spec_for(self, agent_id: str) -> AgentSpec | None:
+        item = next((item for item in self.graph.get("agents", []) if str(item.get("id")) == agent_id), None)
+        if item is None:
+            return None
+        return AgentSpec(
+            id=str(item["id"]), name=str(item.get("name") or item["id"]), sys_prompt=str(item.get("sys_prompt") or ""),
+            model=str(item.get("model") or ""), description=str(item.get("description") or ""),
+            children=[str(value) for value in item.get("children") or []], config=dict(item.get("config") or {}),
+        )
+
+    @staticmethod
+    def _member_score(member: AgentSpec, task: str, profile: Dict[str, Any]) -> float:
+        """Explainable first-version selector; a learned controller can replace it."""
+        task_tokens = {token for token in _tokenize(task) if len(token) > 1}
+        capability = " ".join([member.name, member.description, member.sys_prompt[:400], " ".join(str(value) for value in profile.get("capabilities") or [])])
+        cap_tokens = {token for token in _tokenize(capability) if len(token) > 1}
+        overlap = len(task_tokens & cap_tokens) / max(1, len(task_tokens))
+        return overlap + float(profile.get("priority") or 0) * 0.01
+
     async def _run_child_graph(self, parent: AgentSpec, state: Dict[str, Any]) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
         child_ids = set(parent.children)
         agents = [item for item in self.graph.get("agents", []) if item.get("id") in child_ids]
@@ -285,3 +413,10 @@ def _assign(current: Any, value: Any, operation: str) -> Any:
     if operation == "add": return float(current or 0) + float(value or 0)
     if operation == "merge": return {**(current if isinstance(current, dict) else {}), **(value if isinstance(value, dict) else {})}
     return value
+
+
+def _tokenize(value: str) -> list[str]:
+    """Small dependency-free tokenizer for explainable capability routing."""
+    import re
+
+    return re.findall(r"[\u4e00-\u9fff]{1,}|[A-Za-z0-9_]+", value.lower())
