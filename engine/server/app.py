@@ -2139,6 +2139,17 @@ def create_app(
     def update_model_connection(connection_id: str, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
             current = model_connections.get(connection_id)
+            if req.get("enabled") is False:
+                if current.auto_default:
+                    raise ValueError("请先替换或取消该连接的 AUTO 默认配置，再停用")
+                referenced = any(item.model == connection_id for item in applications.list())
+                referenced = referenced or any(
+                    str(node.get("model") or "") == connection_id
+                    for workflow in workflows.list()
+                    for node in workflow.graph.get("agents", [])
+                )
+                if referenced:
+                    raise ValueError("该模型仍被应用或工作流引用，请先替换模型后再停用")
             # Merge from storage so an omitted write-only api_key is retained.
             return model_connections.save(ModelConnection.from_dict({**current.to_storage_dict(), **req, "id": connection_id})).to_dict()
         except KeyError as exc:
@@ -3171,7 +3182,9 @@ def create_app(
     @app.delete("/api/model-connections/{connection_id}")
     def delete_model_connection(connection_id: str) -> Dict[str, Any]:
         try:
-            model_connections.get(connection_id)
+            current = model_connections.get(connection_id)
+            if current.auto_default:
+                raise ValueError("请先替换或取消该连接的 AUTO 默认配置，再删除")
             references: List[str] = []
             for application in applications.list():
                 if application.model == connection_id:
