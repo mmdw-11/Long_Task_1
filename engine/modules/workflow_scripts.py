@@ -26,7 +26,9 @@ main = scope.get("main")
 if not callable(main): raise ValueError("必须定义 main(params) 函数")
 result = main(params)
 if not isinstance(result, dict): raise ValueError("main(params) 必须返回对象")
-print(json.dumps(result, ensure_ascii=False, default=str))
+# The parent/child transport stays ASCII even when ``-I`` ignores
+# PYTHONIOENCODING and Windows chooses a legacy console encoding.
+print(json.dumps(result, ensure_ascii=True, default=str))
 '''
 
 _JS_WRAPPER = r'''const vm=require("vm"), fs=require("fs");
@@ -50,7 +52,10 @@ def run_workflow_script(language: str, code: str, params: Dict[str, Any], timeou
     with tempfile.TemporaryDirectory(prefix="workflow-script-") as temp:
         if language == "python":
             command = [sys.executable, "-I", "-S", "-c", _PY_WRAPPER]
-            payload = json.dumps({"code": code, "params": params}, ensure_ascii=False, default=str)
+            # Keep the stdin protocol ASCII-only.  On Windows, a subprocess
+            # launched from a non-UTF-8 console can otherwise corrupt CJK
+            # text before the isolated interpreter parses the JSON frame.
+            payload = json.dumps({"code": code, "params": params}, ensure_ascii=True, default=str)
         elif language in {"javascript", "js"}:
             node = shutil.which("node")
             if not node:
@@ -58,7 +63,7 @@ def run_workflow_script(language: str, code: str, params: Dict[str, Any], timeou
             wrapper = Path(temp) / "runner.js"
             wrapper.write_text(_JS_WRAPPER, encoding="utf-8")
             command = [node, "--no-addons", str(wrapper)]
-            payload = json.dumps({"code": code, "params": params}, ensure_ascii=False, default=str)
+            payload = json.dumps({"code": code, "params": params}, ensure_ascii=True, default=str)
         else:
             raise ValueError("脚本语言仅支持 python 或 javascript")
         try:

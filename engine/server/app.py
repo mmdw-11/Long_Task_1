@@ -858,9 +858,10 @@ def create_app(
             check(app_record.model, "工作流默认模型")
             for item in graph.get("agents", []):
                 kind = str((item.get("config") or {}).get("node_kind") or "agent")
-                if kind not in {"agent", "llm"}:
+                config = item.get("config") or {}
+                selection = str(config.get("model") or item.get("model") or "") if kind in {"task_planner", "result_aggregator", "quality_gate", "intent"} else str(item.get("model") or "")
+                if kind not in {"agent", "llm", "task_planner", "result_aggregator", "quality_gate", "intent"}:
                     continue
-                selection = str(item.get("model") or "")
                 if selection:
                     check(selection, f"节点“{item.get('name')}”")
         return list(dict.fromkeys(errors))
@@ -1041,10 +1042,23 @@ def create_app(
             config = item.get("config") or {}
             if kind == "tool" and not config.get("tool_id"):
                 errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
-            if kind in {"condition", "intent", "loop", "batch", "goal_gate", "recovery_boundary"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
+            if kind in {"condition", "intent", "loop", "batch", "task_planner", "quality_gate", "goal_gate", "recovery_boundary"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
                 errors.append(f"逻辑节点“{item.get('name')}”尚未配置分支连线")
+            if kind in {"task_planner", "quality_gate"}:
+                conditional = next((edge for edge in connections if edge.get("source") == item.get("id") and edge.get("conditional")), {})
+                path_map = conditional.get("path_map") or {}
+                required_routes = (
+                    [str(config.get("execute_route") or "execute"), str(config.get("done_route") or "done"), str(config.get("failed_route") or "failed")]
+                    if kind == "task_planner"
+                    else [str(config.get("continue_route") or "continue"), str(config.get("escalate_route") or "escalate")]
+                )
+                missing_routes = [route for route in required_routes if route not in path_map]
+                if missing_routes:
+                    errors.append(f"动态控制节点“{item.get('name')}”缺少出口：{'、'.join(missing_routes)}")
             if kind == "intent" and not (config.get("model") or item.get("model")):
                 errors.append(f"意图分类节点“{item.get('name')}”尚未选择模型")
+            if kind == "task_planner" and not (config.get("model") or item.get("model")):
+                errors.append(f"任务规划器“{item.get('name')}”尚未选择模型")
             if kind == "script" and config.get("code") and not config.get("output_field"):
                 errors.append(f"脚本节点“{item.get('name')}”尚未配置输出字段")
             if kind in {"loop", "batch"}:
@@ -1178,6 +1192,11 @@ def create_app(
         ]
 
     def _seed_todo_events(record: RunRecord, target: Orchestrator) -> None:
+        if any(str((item.get("config") or {}).get("node_kind")) == "task_planner" for item in target.to_dict().get("agents", [])):
+            record.input = {**record.input, "original_goal": _task_text(record.input)}
+            record.metadata = {**record.metadata, "todos": [], "plan_status": "waiting_for_planner", "runtime_planner": True}
+            _append_event(record, {"type": "plan_waiting", "message": "等待任务规划器生成可执行 TODO"})
+            return
         plan = _initial_plan(record.input, target)
         record.input = {**record.input, "current_plan": plan, "original_goal": _task_text(record.input)}
         record.metadata = {**record.metadata, "todos": []}
@@ -1369,7 +1388,17 @@ def create_app(
                                 ),
                             },
                         )
-                    _advance_todo(record, node=str(event.get("node") or ""), output=str(event.get("output") or ""))
+                    ledger = dict((event.get("update") or {}).get("plan_ledger") or {})
+                    if ledger:
+                        record.metadata["todos"] = list(ledger.get("todos") or [])
+                        record.metadata["plan_status"] = str(ledger.get("status") or "running")
+                        record.metadata["active_todo_id"] = str(ledger.get("current_todo_id") or "")
+                        _append_event(record, {"type": "todo_plan_updated", "node": event.get("node"), "message": f"{event.get('node')} 已更新可执行 TODO 计划", "todos": record.metadata["todos"], "active_todo_id": record.metadata["active_todo_id"], "plan_status": record.metadata["plan_status"]})
+                    elif not record.metadata.get("runtime_planner"):
+                        _advance_todo(record, node=str(event.get("node") or ""), output=str(event.get("output") or ""))
+                    quality_report = dict((event.get("update") or {}).get("quality_report") or {})
+                    if quality_report:
+                        _append_event(record, {"type": "quality_gate_decision", "node": event.get("node"), "message": f"质量门判定：{quality_report.get('decision')}", "decision": quality_report.get("decision"), "score": quality_report.get("overall_score"), "issues": quality_report.get("issues") or [], "todo_id": quality_report.get("todo_id")})
                 if event.get("type") == "final":
                     record.state = dict(event.get("state") or {})
                 runs.save(record)
