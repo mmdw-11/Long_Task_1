@@ -8,6 +8,7 @@ from engine.experiments import (
     SkillExperimentConfig,
     WorkflowExperimentConfig,
     build_long_task_dataset_from_memory,
+    build_skill_reuse_dataset,
     build_workflow_dataset,
     build_long_task_dataset,
     run_memory_experiment,
@@ -354,6 +355,28 @@ def test_long_task_joint_experiment_exercises_all_controls(tmp_path):
     assert full.summary()["avg_pause_correctness"] == 1.0
     assert full.summary()["avg_recovery_success"] == 1.0
     assert plain.summary()["pass_rate"] == 0.0
+    assert plain.summary()["avg_goal_retention"] == 1.0
+    assert plain.summary()["avg_constraint_compliance"] == 1.0
+    assert plain.summary()["avg_pause_correctness"] == 1.0
+    assert all(
+        row.metadata["evaluation_policy"]
+        == "shared_prompt_shared_disturbances_layered_readiness_v5"
+        for row in full.rows + plain.rows
+    )
+
+
+def test_long_task_reports_basic_readiness_separately_from_disturbance_handling(tmp_path):
+    examples = build_long_task_dataset(size=1, seed=7)
+    memory_only = run_long_task_experiment(
+        examples,
+        LongTaskExperimentConfig(method="memory_only", output_root=str(tmp_path)),
+    )
+    row = memory_only.rows[0]
+
+    assert row.metrics["basic_task_readiness"] == 1
+    assert row.metrics["disturbance_handling_score"] == pytest.approx(1 / 3)
+    assert row.metrics["final_task_success"] == 0
+    assert row.metrics["recovery_success"] == 0
 
 
 def test_skill_experiment_generates_retrievable_skill(tmp_path):
@@ -375,6 +398,32 @@ def test_skill_experiment_generates_retrievable_skill(tmp_path):
     assert report.summary()["pass_rate"] == 1.0
     assert report.summary()["total"] == 3
     assert report.summary()["avg_automatic_skill_generation_success"] == 1.0
+
+
+def test_no_skill_uses_shared_base_plan_without_fake_retrieval(tmp_path):
+    examples = build_skill_reuse_dataset(size=30, seed=42)
+
+    report = run_skill_experiment(
+        examples,
+        SkillExperimentConfig(
+            output_root=str(tmp_path / "no-skill"),
+            method="no_skill",
+        ),
+    )
+    summary = report.summary()
+
+    assert summary["total"] == 21
+    assert summary["avg_task_success"] == 0.0
+    assert summary["avg_basic_task_readiness"] == 1.0
+    assert summary["avg_base_plan_coverage"] == 0.5
+    assert summary["avg_step_coverage"] == 0.5
+    assert summary["avg_critical_step_coverage"] == 0.0
+    assert summary["avg_retrieval_hit"] == 0.0
+    assert summary["avg_skill_coverage_gain"] == 0.0
+    assert all(
+        row.metadata["plan_policy"] == "shared_task_native_base_plus_optional_skill"
+        for row in report.rows
+    )
 
 
 @pytest.mark.asyncio

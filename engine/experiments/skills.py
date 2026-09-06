@@ -139,22 +139,38 @@ def _evaluate_held_out(
     corpus: Dict[str, Dict[str, int]],
 ) -> ExperimentRow:
     matches = retriever.retrieve(example.task, node="solver", task_type=example.task_type, top_k=3)
-    combined = "\n".join(match.skill.content for match in matches)
-    coverage = _coverage(example.expected_steps, combined)
+    skill_context = "\n".join(match.skill.content for match in matches)
+    base_steps = _baseline_plan(example)
+    base_plan = "\n".join(base_steps)
+    # Every control receives the same deterministic task-native plan. Skills are
+    # optional augmentations rather than the only source of executable steps;
+    # otherwise No Skill is forced to zero by construction.
+    execution_plan = "\n".join(part for part in [base_plan, skill_context] if part)
+    base_coverage = _coverage(example.expected_steps, base_plan)
+    skill_only_coverage = _coverage(example.expected_steps, skill_context)
+    coverage = _coverage(example.expected_steps, execution_plan)
     critical_steps = [str(item) for item in example.metadata.get("critical_steps") or []]
-    critical_coverage = _coverage(critical_steps, combined) if critical_steps else coverage
+    critical_coverage = _coverage(critical_steps, execution_plan) if critical_steps else coverage
     retrieval_hit = bool(matches)
-    task_success = coverage >= 0.5 and retrieval_hit
+    basic_task_readiness = coverage >= 0.5
+    # A complete procedural plan must cover every required step, including the
+    # environment-specific critical safeguards. Keep the looser 50% threshold
+    # as a separate readiness metric instead of calling it task success.
+    task_success = coverage >= 1.0 and critical_coverage >= 1.0
     corpus_info = corpus.get(example.task_type, {})
     return ExperimentRow(
         id=example.id,
         passed=task_success,
         score=coverage,
-        prediction=combined,
+        prediction=execution_plan,
         expected="; ".join(example.expected_steps),
         metrics={
             "task_success": int(task_success),
+            "basic_task_readiness": int(basic_task_readiness),
             "step_coverage": coverage,
+            "base_plan_coverage": base_coverage,
+            "skill_only_coverage": skill_only_coverage,
+            "skill_coverage_gain": round(coverage - base_coverage, 6),
             "critical_step_coverage": critical_coverage,
             "retrieval_hit": int(retrieval_hit),
             "automatic_skill_generation_success": corpus_info.get("automatic_generation", 0),
@@ -162,11 +178,32 @@ def _evaluate_held_out(
             "training_source_examples": corpus_info.get("source_examples", 0),
             "manual_skill_provided": int(cfg.method == "manual_skill"),
             "retrieved": len(matches),
-            "tokens": rough_token_count(combined),
+            "tokens": rough_token_count(execution_plan),
             "top_score": matches[0].score if matches else 0.0,
         },
-        metadata={"method": cfg.method, "task_type": example.task_type, "split": "test"},
+        metadata={
+            "method": cfg.method,
+            "task_type": example.task_type,
+            "split": "test",
+            "plan_policy": "shared_task_native_base_plus_optional_skill",
+            "base_steps": base_steps,
+        },
     )
+
+
+def _baseline_plan(example: SkillExample) -> List[str]:
+    """Return the shared task-native plan available without reusable skills.
+
+    The plan intentionally covers only obvious steps stated by each task family;
+    environment-specific safeguards remain learnable from trajectories or
+    available in a richer manual skill.
+    """
+    library: Dict[str, List[str]] = {
+        "email": ["读取邮件", "生成并核对回复"],
+        "calendar": ["读取参与人日历", "创建提醒"],
+        "travel_report": ["确认行程约束", "生成最终报告"],
+    }
+    return list(library.get(example.task_type, ["确认任务目标", "核对最终结果"]))
 
 
 def _learned_skill_from_trajectories(examples: List[SkillExample]) -> str:
