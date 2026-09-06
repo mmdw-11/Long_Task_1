@@ -103,6 +103,25 @@ def test_application_name_is_required(tmp_path, monkeypatch):
     assert response.status_code == 400
 
 
+def test_conditional_connection_sentinel_is_valid_on_save(tmp_path, monkeypatch):
+    """The UI serializes conditional edges with a non-node sentinel target."""
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=ToolCatalogStore(tmp_path / "tools"),
+        application_store=ApplicationStore(tmp_path / "apps"),
+    )
+    client = TestClient(app)
+    created = client.post("/api/apps", json={"name": "conditional-save"}).json()
+    start = {"id": "start", "name": "开始", "description": "", "model": "", "sys_prompt": "", "children": [], "config": {"node_kind": "start"}}
+    end = {"id": "end", "name": "结束", "description": "", "model": "", "sys_prompt": "", "children": [], "config": {"node_kind": "end"}}
+    router = {"id": "router", "name": "路由", "description": "", "model": "", "sys_prompt": "", "children": [], "config": {"node_kind": "goal_gate", "route_key": "route", "complete_route": "complete", "continue_route": "continue"}}
+    graph = {"entry": start["id"], "agents": [start, router, end], "connections": [{"source": start["id"], "target": "router", "conditional": False}, {"source": "router", "target": "<conditional>", "conditional": True, "condition_key": "route", "path_map": {"complete": end["id"], "continue": end["id"]}}]}
+    response = client.put(f"/api/workflows/{created['workflow_id']}", json={"graph": graph})
+    assert response.status_code == 200, response.text
+
+
 def test_create_run_from_application_entry(tmp_path, monkeypatch):
     """应用调试接口会自动使用应用绑定的工作流，隐藏内部编排细节。"""
     monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")

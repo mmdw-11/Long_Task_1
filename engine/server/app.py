@@ -678,7 +678,7 @@ def create_app(
         target = _orchestrator_for_run(record.workflow_id, record)
         return next((item for item in target.list_agents() if item.name == node_name), None)
 
-    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces)
+    workflow_runtime_factory = WorkflowNodeRuntimeFactory(tools, model_connections, knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces, skill_repository=skills, run_store=runs)
     admin_api_key = os.environ.get("ADMIN_API_KEY", "").strip()
     system_status = ProductStatusService(
         workflow_root=str(workflows.root_dir),
@@ -888,12 +888,11 @@ def create_app(
         elif graph is not None:
             for item in graph.get("agents", []):
                 kind = str((item.get("config") or {}).get("node_kind") or "agent")
-                if kind not in {"agent", "llm"}:
+                config = item.get("config") or {}
+                selection = str(config.get("model") or item.get("model") or "") if kind in {"task_planner", "result_aggregator", "quality_gate", "intent"} else str(item.get("model") or "")
+                if kind not in {"agent", "llm", "task_planner", "result_aggregator", "quality_gate", "intent"}:
                     continue
-                selection = str(item.get("model") or "")
-                if not selection:
-                    errors.append(f"节点“{item.get('name')}”必须单独选择模型")
-                else:
+                if selection:
                     check(selection, f"节点“{item.get('name')}”")
         return list(dict.fromkeys(errors))
 
@@ -1014,17 +1013,10 @@ def create_app(
             errors.append("工作流入口必须指向开始节点")
         for edge in connections:
             source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
-            if source not in ids:
-                errors.append("工作流包含指向不存在节点的连线")
-            elif edge.get("conditional"):
-                # Conditional connections use ``<conditional>`` as a storage
-                # placeholder; their real destinations live in ``path_map``.
-                # Validate those destinations instead of treating the placeholder
-                # as an agent ID.
-                destinations = (edge.get("path_map") or {}).values()
-                if any(str(destination) != "END" and str(destination) not in ids for destination in destinations):
-                    errors.append("工作流包含指向不存在节点的连线")
-            elif target != "END" and target not in ids:
+            # Conditional connections use ``<conditional>`` as a serialized
+            # sentinel; their real targets are carried by ``path_map`` below.
+            # It is not a node id and must not be reported as a dangling edge.
+            if source not in ids or (target not in {"END", "<conditional>"} and target not in ids):
                 errors.append("工作流包含指向不存在节点的连线")
             if source == target:
                 errors.append("节点不能连接到自身")
@@ -1049,10 +1041,18 @@ def create_app(
                         errors.append(f"节点 {item.get('name') or item.get('id')} 包含未挂载到当前工作流的工具")
         if starts:
             adjacency: Dict[str, set[str]] = {node_id: set() for node_id in ids}
+            contained_by_parent: Dict[str, set[str]] = {node_id: set() for node_id in ids}
             for edge in connections:
                 source = str(edge.get("source") or "")
                 targets = list((edge.get("path_map") or {}).values()) if edge.get("conditional") else [edge.get("target")]
                 adjacency.setdefault(source, set()).update(str(target) for target in targets if target in ids)
+            for item in agents:
+                parent_id = str(item.get("parent_id") or "")
+                if parent_id in ids:
+                    contained_by_parent.setdefault(parent_id, set()).add(str(item.get("id")))
+                for child_id in item.get("children") or []:
+                    if str(child_id) in ids:
+                        contained_by_parent.setdefault(str(item.get("id")), set()).add(str(child_id))
             reached, pending = set(), [str(starts[0].get("id"))]
             while pending:
                 current_id = pending.pop()
@@ -1060,12 +1060,9 @@ def create_app(
                     continue
                 reached.add(current_id)
                 pending.extend(adjacency.get(current_id, set()) - reached)
-                # Loop and batch child canvases are invoked by their container,
-                # not through ordinary top-level edges.
-                for item in agents:
-                    parent_id = str(item.get("parent_id") or (item.get("config") or {}).get("parent_id") or "")
-                    if parent_id == current_id:
-                        pending.append(str(item.get("id")))
+                # Entering a team/container makes its members reachable even
+                # though they intentionally have no static workflow edges.
+                pending.extend(contained_by_parent.get(current_id, set()) - reached)
             if reached != ids:
                 errors.append("所有节点必须能够从开始节点到达")
             if ends and str(ends[0].get("id")) not in reached:
@@ -1076,10 +1073,23 @@ def create_app(
                 errors.append(f"节点“{item.get('name')}”必须单独选择模型")
             if kind == "tool" and not config.get("tool_id"):
                 errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
-            if kind in {"condition", "intent", "loop", "batch"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
+            if kind in {"condition", "intent", "loop", "batch", "task_planner", "quality_gate", "goal_gate", "recovery_boundary"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
                 errors.append(f"逻辑节点“{item.get('name')}”尚未配置分支连线")
+            if kind in {"task_planner", "quality_gate"}:
+                conditional = next((edge for edge in connections if edge.get("source") == item.get("id") and edge.get("conditional")), {})
+                path_map = conditional.get("path_map") or {}
+                required_routes = (
+                    [str(config.get("execute_route") or "execute"), str(config.get("done_route") or "done"), str(config.get("failed_route") or "failed")]
+                    if kind == "task_planner"
+                    else [str(config.get("continue_route") or "continue"), str(config.get("escalate_route") or "escalate")]
+                )
+                missing_routes = [route for route in required_routes if route not in path_map]
+                if missing_routes:
+                    errors.append(f"动态控制节点“{item.get('name')}”缺少出口：{'、'.join(missing_routes)}")
             if kind == "intent" and not (config.get("model") or item.get("model")):
                 errors.append(f"意图分类节点“{item.get('name')}”尚未选择模型")
+            if kind == "task_planner" and not (config.get("model") or item.get("model")):
+                errors.append(f"任务规划器“{item.get('name')}”尚未选择模型")
             if kind == "script" and config.get("code") and not config.get("output_field"):
                 errors.append(f"脚本节点“{item.get('name')}”尚未配置输出字段")
             if kind in {"loop", "batch"}:
@@ -1090,6 +1100,14 @@ def create_app(
                 child_ids = set(item.get("children") or [])
                 if any(str((child.get("config") or {}).get("node_kind")) in {"loop", "batch"} for child in agents if child.get("id") in child_ids):
                     errors.append(f"{item.get('name')}内不能嵌套循环或批处理")
+            if kind == "agent_team":
+                child_ids = {str(value) for value in item.get("children") or []}
+                members = [child for child in agents if str(child.get("id")) in child_ids and str((child.get("config") or {}).get("node_kind") or "agent") not in {"start", "end", "loop_start", "loop_end", "batch_start", "batch_end"}]
+                if not members:
+                    errors.append(f"动态智能体团队“{item.get('name')}”至少需要一个成员")
+                supervisor_id = str(config.get("supervisor_id") or "")
+                if supervisor_id and supervisor_id not in child_ids:
+                    errors.append(f"动态智能体团队“{item.get('name')}”的主管必须是团队成员")
         return list(dict.fromkeys(errors))
 
     def _normalize_workflow_node_names(graph: Dict[str, Any]) -> Dict[str, Any]:
@@ -1114,6 +1132,35 @@ def create_app(
         record.events.append(enriched)
         runs.save(record)
         return enriched
+
+    def _runtime_child_event_message(event: Dict[str, Any]) -> str:
+        """Human-readable trace labels for nested batch and dynamic-team events."""
+        labels = {
+            "team_started": "动态团队开始评估可用成员",
+            "candidate_filtered": "已完成资源硬过滤与多指标候选评分",
+            "topology_reconfigured": "动态团队已重构本轮协作拓扑",
+            "delegation_selected": "主管已动态委派子智能体",
+            "handoff_selected": "主管已批准智能体自主 Handoff",
+            "handoff_rejected": "主管拒绝 Handoff 请求",
+            "team_member_started": "子智能体开始处理委派任务",
+            "team_member_completed": "子智能体已返回委派结果",
+            "goal_checked": "团队已完成本轮目标检查",
+            "team_member_failed": "子智能体执行失败，正在评估替代成员",
+            "fallback_selected": "已选择备用子智能体接管任务",
+            "team_aggregated": "动态团队已汇聚成员结果",
+        }
+        if event.get("type") in labels:
+            parts = [labels[event["type"]]]
+            if event.get("source") and event.get("target"):
+                parts.append(f"：{event['source']} → {event['target']}")
+            elif event.get("node"):
+                parts.append(f"：{event['node']}")
+            return "".join(parts)
+        return (
+            f"{event.get('node')} 已完成批处理项"
+            if event.get("type") == "node_end"
+            else f"进入 {event.get('node')}，开始处理批处理项"
+        )
 
     def _task_text(payload: Dict[str, Any]) -> str:
         for key in ("input", "task", "goal", "query"):
@@ -1189,6 +1236,11 @@ def create_app(
         ]
 
     def _seed_todo_events(record: RunRecord, target: Orchestrator) -> None:
+        if any(str((item.get("config") or {}).get("node_kind")) == "task_planner" for item in target.to_dict().get("agents", [])):
+            record.input = {**record.input, "original_goal": _task_text(record.input)}
+            record.metadata = {**record.metadata, "todos": [], "plan_status": "waiting_for_planner", "runtime_planner": True}
+            _append_event(record, {"type": "plan_waiting", "message": "等待任务规划器生成可执行 TODO"})
+            return
         plan = _initial_plan(record.input, target)
         record.input = {**record.input, "current_plan": plan, "original_goal": _task_text(record.input)}
         record.metadata = {**record.metadata, "todos": []}
@@ -1285,7 +1337,7 @@ def create_app(
                 (item.get("config") or {}).get("node_kind")
                 for item in target.to_dict().get("agents", [])
             )
-            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces) if is_visual_workflow else None
+            visual_runtime = WorkflowNodeRuntimeFactory(tools, model_connections, target.to_dict(), knowledge_store=knowledge, mcp_oauth_store=mcp_oauth, workspace_store=workspaces, skill_repository=skills, run_store=runs) if is_visual_workflow else None
             compiled = target.build_graph(
                 node_factory=visual_runtime if visual_runtime is not None else runtime_factory,
                 recursion_limit=record.recursion_limit,
@@ -1313,7 +1365,10 @@ def create_app(
                     event["message"] = f"进入 {event.get('node')}，开始处理当前步骤"
                 elif event.get("type") == "node_end":
                     update = dict(event.get("update") or {})
-                    child_events = list(update.pop("__runtime_child_events__", []) or [])
+                    child_events = [
+                        *list(update.pop("__runtime_child_events__", []) or []),
+                        *list(update.pop("__runtime_team_events__", []) or []),
+                    ]
                     event["update"] = update
                     messages = list(update.get("messages") or [])
                     latest_message = messages[-1] if messages else {}
@@ -1342,9 +1397,7 @@ def create_app(
                 if event.get("type") == "node_end":
                     for child_event in child_events:
                         child_event["message"] = child_event.get("message") or (
-                            f"{child_event.get('node')} 已完成批处理项"
-                            if child_event.get("type") == "node_end"
-                            else f"进入 {child_event.get('node')}，开始处理批处理项"
+                            _runtime_child_event_message(child_event)
                         )
                         _append_event(record, child_event)
                     for tool_call in event.get("tool_calls") or []:
@@ -1371,7 +1424,17 @@ def create_app(
                                 ),
                             },
                         )
-                    _advance_todo(record, node=str(event.get("node") or ""), output=str(event.get("output") or ""))
+                    ledger = dict((event.get("update") or {}).get("plan_ledger") or {})
+                    if ledger:
+                        record.metadata["todos"] = list(ledger.get("todos") or [])
+                        record.metadata["plan_status"] = str(ledger.get("status") or "running")
+                        record.metadata["active_todo_id"] = str(ledger.get("current_todo_id") or "")
+                        _append_event(record, {"type": "todo_plan_updated", "node": event.get("node"), "message": f"{event.get('node')} 已更新可执行 TODO 计划", "todos": record.metadata["todos"], "active_todo_id": record.metadata["active_todo_id"], "plan_status": record.metadata["plan_status"]})
+                    elif not record.metadata.get("runtime_planner"):
+                        _advance_todo(record, node=str(event.get("node") or ""), output=str(event.get("output") or ""))
+                    quality_report = dict((event.get("update") or {}).get("quality_report") or {})
+                    if quality_report:
+                        _append_event(record, {"type": "quality_gate_decision", "node": event.get("node"), "message": f"质量门判定：{quality_report.get('decision')}", "decision": quality_report.get("decision"), "score": quality_report.get("overall_score"), "issues": quality_report.get("issues") or [], "todo_id": quality_report.get("todo_id")})
                 if event.get("type") == "final":
                     record.state = dict(event.get("state") or {})
                 runs.save(record)

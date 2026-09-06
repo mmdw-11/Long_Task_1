@@ -10,6 +10,11 @@ def test_python_script_returns_object():
     assert run_workflow_script("python", "def main(params):\n    return {'total': params['a'] + params['b']}", {"a": 2, "b": 3}) == {"total": 5}
 
 
+def test_python_script_preserves_cjk_multiline_json_input():
+    task = '总目标：调研事实\n验收标准：["至少两个真实来源"]\n完成当前 TODO。'
+    assert run_workflow_script("python", "def main(params):\n    return {'echo': params['input']}", {"input": task}) == {"echo": task}
+
+
 def test_javascript_script_returns_object():
     assert run_workflow_script("javascript", "function main(params) { return {total: params.a + params.b}; }", {"a": 2, "b": 4}) == {"total": 6}
 
