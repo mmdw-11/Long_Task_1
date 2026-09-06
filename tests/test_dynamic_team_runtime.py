@@ -285,6 +285,15 @@ def test_dynamic_control_graph_can_be_persisted_with_complete_routes(tmp_path, m
         if edge.get("target") == "end": edge["target"] = persisted_end["id"]
         if "path_map" in edge:
             edge["path_map"] = {route: persisted_end["id"] if target == "end" else target for route, target in edge["path_map"].items()}
+    # Simulate an older browser bundle: route labels were visible in the
+    # canvas, but the payload contained only ordinary direct connections.
+    legacy_connections = []
+    for edge in graph["connections"]:
+        if edge.get("conditional") and edge["source"] in {"planner", "gate"}:
+            legacy_connections.extend({"source": edge["source"], "target": target, "conditional": False} for target in edge["path_map"].values())
+        else:
+            legacy_connections.append(edge)
+    graph["connections"] = legacy_connections
     saved = client.put(f"/api/workflows/{created['workflow_id']}", json={"graph": graph})
     assert saved.status_code == 200, saved.text
     stored = saved.json()["graph"]

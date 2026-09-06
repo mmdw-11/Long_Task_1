@@ -497,6 +497,62 @@ def _approval_follow_up(result: Dict[str, Any]) -> str:
     return f"已批准并完成 {name}。工具结果：{rendered[:1800]}"
 
 
+def _normalize_dynamic_control_connections(graph: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade legacy direct canvas edges into dynamic conditional routes.
+
+    Older browser bundles serialized task-planner and quality-gate edges as
+    ordinary connections even when the canvas displayed route labels.  The
+    server can recover their intent from an explicit route label first and,
+    for planners, from the target node kind as a compatibility fallback.
+    """
+    agents = [dict(item) for item in graph.get("agents", []) if isinstance(item, dict)]
+    connections = [dict(item) for item in graph.get("connections", []) if isinstance(item, dict)]
+    kinds = {str(item.get("id")): str((item.get("config") or {}).get("node_kind") or "agent") for item in agents}
+    configs = {str(item.get("id")): dict(item.get("config") or {}) for item in agents}
+
+    for source, kind in kinds.items():
+        if kind not in {"task_planner", "quality_gate"}:
+            continue
+        if any(str(edge.get("source")) == source and edge.get("conditional") for edge in connections):
+            continue
+        direct = [edge for edge in connections if str(edge.get("source")) == source and not edge.get("conditional")]
+        if not direct:
+            continue
+        config = configs[source]
+        required = (
+            [str(config.get("execute_route") or "execute"), str(config.get("done_route") or "done"), str(config.get("failed_route") or "failed")]
+            if kind == "task_planner"
+            else [str(config.get("continue_route") or "continue")]
+        )
+        path_map: Dict[str, str] = {}
+        unused: List[Dict[str, Any]] = []
+        for edge in direct:
+            route = str(edge.get("route") or edge.get("label") or (edge.get("data") or {}).get("route") or "")
+            if route in required and route not in path_map:
+                path_map[route] = str(edge.get("target"))
+            else:
+                unused.append(edge)
+        if kind == "task_planner":
+            target_routes = {"agent_team": required[0], "result_aggregator": required[1], "end": required[2]}
+            remaining = []
+            for edge in unused:
+                route = target_routes.get(kinds.get(str(edge.get("target")), ""), "")
+                if route and route not in path_map:
+                    path_map[route] = str(edge.get("target"))
+                else:
+                    remaining.append(edge)
+            unused = remaining
+        elif unused and required[0] not in path_map:
+            planner_edge = next((edge for edge in unused if kinds.get(str(edge.get("target"))) == "task_planner"), unused[0])
+            path_map[required[0]] = str(planner_edge.get("target"))
+            unused = [edge for edge in unused if edge is not planner_edge]
+        for route, edge in zip((value for value in required if value not in path_map), unused):
+            path_map[route] = str(edge.get("target"))
+        connections = [edge for edge in connections if edge not in direct]
+        connections.append({"source": source, "target": "<conditional>", "conditional": True, "condition_key": str(config.get("route_key") or "route"), "path_map": path_map})
+    return {**graph, "agents": agents, "connections": connections}
+
+
 def create_app(
     orchestrator: Optional[Orchestrator] = None,
     *,
@@ -2623,7 +2679,7 @@ def create_app(
         try:
             app_record = _owned_app_for_workflow(workflow_id, request)
             current = workflows.get(workflow_id)
-            next_graph = req.graph if req.graph is not None else current.graph
+            next_graph = _normalize_dynamic_control_connections(req.graph) if req.graph is not None else current.graph
             if "workflow" in current.tags:
                 errors = _validate_application_workflow(next_graph, app_tool_ids=app_record.tool_ids if app_record else None)
                 if errors:
