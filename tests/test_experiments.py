@@ -16,7 +16,7 @@ from engine.experiments import (
     run_workflow_experiment,
 )
 from engine.experiments.types import MemoryExample, SkillExample
-from engine.experiments.datasets import load_memory_dataset, memory_examples_to_rows
+from engine.experiments.datasets import load_memory_dataset, memory_examples_to_rows, sample_memory_examples
 from engine.experiments.long_task import memory_contains_expected
 from engine.experiments.memory import (
     _disable_mem0_thinking,
@@ -80,6 +80,24 @@ def test_locomo_nested_qa_ids_use_sample_id(tmp_path):
 
     assert [item.id for item in examples] == ["conv-a-q0", "conv-b-q0"]
     assert len({item.id for item in examples}) == 2
+
+
+def test_stratified_memory_sampling_round_robins_question_types():
+    examples = [
+        MemoryExample(
+            id=f"{question_type}-{index}",
+            question="Q",
+            answer="A",
+            memories=["A"],
+            metadata={"question_type": question_type},
+        )
+        for question_type in ("temporal", "update")
+        for index in range(3)
+    ]
+
+    selected = sample_memory_examples(examples, count=4, seed=42, stratified=True)
+
+    assert {item.metadata["question_type"] for item in selected} == {"temporal", "update"}
 
 
 def test_memory_experiment_engine_backend(tmp_path):

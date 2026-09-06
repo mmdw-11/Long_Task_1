@@ -862,6 +862,8 @@ def create_app(
                 selection = str(config.get("model") or item.get("model") or "") if kind in {"task_planner", "result_aggregator", "quality_gate", "intent"} else str(item.get("model") or "")
                 if kind not in {"agent", "llm", "task_planner", "result_aggregator", "quality_gate", "intent"}:
                     continue
+                if kind == "result_aggregator" and str(config.get("mode") or "synthesize") == "ordered":
+                    continue
                 if selection:
                     check(selection, f"节点“{item.get('name')}”")
         return list(dict.fromkeys(errors))
@@ -1050,11 +1052,16 @@ def create_app(
                 required_routes = (
                     [str(config.get("execute_route") or "execute"), str(config.get("done_route") or "done"), str(config.get("failed_route") or "failed")]
                     if kind == "task_planner"
-                    else [str(config.get("continue_route") or "continue"), str(config.get("escalate_route") or "escalate")]
+                    else [str(config.get("continue_route") or "continue")]
                 )
                 missing_routes = [route for route in required_routes if route not in path_map]
                 if missing_routes:
                     errors.append(f"动态控制节点“{item.get('name')}”缺少出口：{'、'.join(missing_routes)}")
+                if kind == "quality_gate":
+                    feedback_target = str(path_map.get(str(config.get("continue_route") or "continue")) or "")
+                    target_kind = next((str((candidate.get("config") or {}).get("node_kind") or "") for candidate in agents if str(candidate.get("id")) == feedback_target), "")
+                    if feedback_target and target_kind != "task_planner":
+                        errors.append(f"质量门“{item.get('name')}”的 TODO 反馈出口必须连接任务规划器")
             if kind == "intent" and not (config.get("model") or item.get("model")):
                 errors.append(f"意图分类节点“{item.get('name')}”尚未选择模型")
             if kind == "task_planner" and not (config.get("model") or item.get("model")):
