@@ -12,6 +12,11 @@ def decode_tool_arguments(raw: Any) -> Dict[str, Any]:
         raw = json.loads(raw)
     if not isinstance(raw, dict):
         raise ValueError("工具参数必须是 JSON 对象")
+    # Some OpenAI-compatible providers wrap the function payload once more as
+    # {"arguments": {...}}. Tool schemas describe the inner object, so unwrap
+    # that transport artefact before validation and execution.
+    if set(raw) == {"arguments"} and isinstance(raw["arguments"], dict):
+        return dict(raw["arguments"])
     return raw
 
 

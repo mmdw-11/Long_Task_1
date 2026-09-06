@@ -7,6 +7,7 @@ from engine.modules.agent_runtime import AgentRuntimeFactory
 from engine.modules.model_connections import ModelConnectionStore
 from engine.modules.product_ops import ToolCatalogStore
 from engine.modules.tool_runtime import ToolRuntime, ensure_builtin_tools
+from engine.modules.tools.contracts import decode_tool_arguments
 from engine.modules.workspace_tools import WorkspaceStore
 from engine.modules.workflows import RunStore, WorkflowStore
 from engine.orchestrator import AgentSpec
@@ -20,6 +21,13 @@ def _tool_call(call_id: str, name: str, arguments: dict):
         id=call_id,
         function=SimpleNamespace(name=name, arguments=json.dumps(arguments, ensure_ascii=False)),
     )
+
+
+def test_decode_tool_arguments_unwraps_provider_argument_envelope():
+    assert decode_tool_arguments('{"arguments":{"path":"data_organizer.py","create":true}}') == {
+        "path": "data_organizer.py",
+        "create": True,
+    }
 
 
 def test_native_tool_loop_serializes_dependent_calls(tmp_path, monkeypatch):
@@ -202,7 +210,9 @@ def test_approval_api_records_engineering_scope_after_local_write(tmp_path):
                 "status": "approval_required",
                 "arguments": {
                     "workspace_id": workspace.id,
-                    "files": [{"path": "src/Main.java", "content": "public class Main {}\n"}],
+                    "arguments": {
+                        "files": [{"path": "src/Main.java", "content": "public class Main {}\n"}],
+                    },
                 },
             },
         }

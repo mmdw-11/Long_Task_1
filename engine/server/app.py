@@ -2039,6 +2039,15 @@ def create_app(
                         raise KeyError(f"tool {tool_id!r} not found")
                     tool = ToolRecord.from_dict(payload)
                 call_arguments = dict(tool_call.get("arguments") or {})
+                # Older pending approvals may retain a provider-specific
+                # {"arguments": {...}} envelope. Preserve injected outer
+                # values (such as workspace_id) and execute the real payload.
+                nested_arguments = call_arguments.get("arguments")
+                if isinstance(nested_arguments, dict):
+                    call_arguments = {
+                        **nested_arguments,
+                        **{key: value for key, value in call_arguments.items() if key != "arguments"},
+                    }
                 task_text = str(call_arguments.get("task") or record.input.get("input") or "")
                 result = ToolRuntime(tools, mcp_oauth, workspaces).execute(
                     tool, task_text, arguments=call_arguments, bypass_approval=True
