@@ -2434,10 +2434,12 @@ def create_app(
             )
             if updated.workflow_id:
                 workflow = workflows.get(updated.workflow_id)
-                if updated.app_type == "workflow":
-                    errors = _validate_application_workflow(workflow.graph, app_tool_ids=updated.tool_ids)
-                    if errors:
-                        raise ValueError("；".join(errors))
+                # A canvas save updates application bindings first and the
+                # graph second.  Validating the *previous* draft graph here
+                # blocks that transaction before the new conditional routes
+                # can be submitted.  Graph validation belongs exclusively to
+                # the workflow save/publish/run paths, which see the intended
+                # graph payload.
                 graph = Orchestrator.from_dict(workflow.graph)
                 if updated.entry_agent_id and updated.app_type == "agent":
                     graph.update_agent(

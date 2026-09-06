@@ -7,7 +7,7 @@ import time
 
 from fastapi.testclient import TestClient
 from engine.modules.product_ops import ApplicationStore
-from engine.modules.workflows import RunStore, WorkflowStore
+from engine.modules.workflows import RunStore, WorkflowStore, WorkflowRecord
 from engine.modules.product_ops import ToolCatalogStore
 from engine.modules.execution import InferenceResult
 from engine.modules.model_connections import ModelConnectionStore
@@ -299,3 +299,22 @@ def test_dynamic_control_graph_can_be_persisted_with_complete_routes(tmp_path, m
     stored = saved.json()["graph"]
     assert next(edge for edge in stored["connections"] if edge["source"] == "planner")["path_map"].keys() == {"execute", "done", "failed"}
     assert next(edge for edge in stored["connections"] if edge["source"] == "gate")["path_map"].keys() == {"continue"}
+
+
+def test_application_update_does_not_block_a_later_canvas_graph_repair(tmp_path, monkeypatch):
+    """Application bindings are saved before canvas graph data in the UI."""
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    workflow_store = WorkflowStore(tmp_path / "workflows")
+    app = create_app(workflow_store=workflow_store, run_store=RunStore(tmp_path / "runs"), application_store=ApplicationStore(tmp_path / "apps"))
+    client = TestClient(app)
+    created = client.post("/api/apps", json={"name": "repair-order", "app_type": "workflow", "model": ""}).json()
+    existing = workflow_store.get(created["workflow_id"])
+    start, end = existing.graph["agents"]
+    legacy_graph = {
+        "entry": start["id"],
+        "agents": [start, {"id": "planner", "name": "old-planner", "children": [], "config": {"node_kind": "task_planner"}}, end],
+        "connections": [{"source": start["id"], "target": "planner"}, {"source": "planner", "target": end["id"]}],
+    }
+    workflow_store.save_draft(WorkflowRecord.from_dict({**existing.to_dict(), "graph": legacy_graph}))
+    updated = client.put(f"/api/apps/{created['id']}", json={"model": "", "tool_ids": []})
+    assert updated.status_code == 200, updated.text
