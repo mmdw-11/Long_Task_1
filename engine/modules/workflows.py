@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -360,6 +363,7 @@ class RunStore:
     def __init__(self, root_dir: str | Path = "runs/executions") -> None:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
+        self._io_lock = threading.RLock()
 
     def create(
         self,
@@ -385,18 +389,37 @@ class RunStore:
         return self.save(record)
 
     def save(self, record: RunRecord) -> RunRecord:
+        with self._io_lock:
+            return self._save_locked(record)
+
+    def _save_locked(self, record: RunRecord) -> RunRecord:
+        if self._path(record.id).exists():
+            previous = self.get(record.id)
+            # A concurrent cancel request must survive a worker's stale copy.
+            if previous.status in {"cancel_requested", "canceled"} and record.status not in {"cancel_requested", "canceled"}:
+                record.status = "canceled" if record.status in {"succeeded", "failed"} else previous.status
+                record.canceled_at = previous.canceled_at
+                record.metadata["cancel_reason"] = previous.metadata.get("cancel_reason", "")
+            if len(previous.events) > len(record.events):
+                record.events = previous.events
         record.updated_at = _utc_now()
-        self._path(record.id).write_text(
-            json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        # Readers must never see a partially written streaming snapshot.
+        fd, temporary = tempfile.mkstemp(dir=self.root_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record.to_dict(), handle, ensure_ascii=False, separators=(",", ":"))
+            os.replace(temporary, self._path(record.id))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         return record
 
     def get(self, run_id: str) -> RunRecord:
-        path = self._path(run_id)
-        if not path.exists():
-            raise KeyError(f"run {run_id!r} not found")
-        return RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        with self._io_lock:
+            path = self._path(run_id)
+            if not path.exists():
+                raise KeyError(f"run {run_id!r} not found")
+            return RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def list(self, *, workflow_id: Optional[str] = None) -> List[RunRecord]:
         records = [self.get(path.stem) for path in sorted(self.root_dir.glob("*.json"))]

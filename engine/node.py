@@ -53,10 +53,15 @@ class Node:
 
     async def invoke(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """执行节点。自动兼容同步 / 异步可调用体。"""
-        result = self.func(state)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
+        from .modules.live_events import node_name
+        token = node_name.set(self.name)
+        try:
+            result = self.func(state)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            node_name.reset(token)
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化为可供前端展示的结构（不含不可序列化的 func 本体）。"""
