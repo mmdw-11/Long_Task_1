@@ -46,6 +46,11 @@ Return exactly yes or no. Do not explain your decision."""
 class MemoryExperimentConfig:
     backend: str = "engine"
     top_k: int = 5
+    candidate_k: int = 20
+    context_token_budget: int = 12000
+    evidence_chunk_chars: int = 1800
+    evidence_chunk_overlap_chars: int = 240
+    max_chunks_per_session: int = 2
     output_root: str = "runs/experiments/memory"
     clean: bool = True
     use_llm_judge: bool = True
@@ -73,6 +78,8 @@ def run_memory_experiment(
         return _run_context_baseline(examples, cfg, full_context=False)
     if cfg.backend == "full_context":
         return _run_context_baseline(examples, cfg, full_context=True)
+    if cfg.backend == "full_context_budgeted":
+        return _run_context_baseline(examples, cfg, full_context=True, budgeted=True)
     if cfg.backend == "mem0":
         return _run_mem0_memory(examples, cfg)
     raise ValueError(f"unsupported memory backend: {cfg.backend}")
@@ -104,12 +111,21 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
             write_seconds = time.perf_counter() - write_started
             retrieval_started = time.perf_counter()
             mode = RetrievalMode(cfg.retrieval_mode)
+            candidate_k = max(cfg.top_k, cfg.candidate_k)
             if cfg.cascade_read:
-                retrieved = store.cascade_read(example.question, context=context, top_k=cfg.top_k, retrieval_mode=mode)
+                retrieved = store.cascade_read(example.question, context=context, top_k=candidate_k, retrieval_mode=mode)
             else:
-                retrieved = store.read(example.question, scope=MemoryScope.PROJECT, context=context, top_k=cfg.top_k, retrieval_mode=mode)
+                retrieved = store.read(example.question, scope=MemoryScope.PROJECT, context=context, top_k=candidate_k, retrieval_mode=mode)
             retrieval_seconds = time.perf_counter() - retrieval_started
-            visible = [_engine_retrieved_text(store, item) for item in retrieved]
+            retrieved_sessions = [_engine_retrieved_text(store, item) for item in retrieved]
+            visible, evidence_stats = _select_evidence_chunks(
+                example.question,
+                retrieved_sessions,
+                token_budget=cfg.context_token_budget,
+                chunk_chars=cfg.evidence_chunk_chars,
+                overlap_chars=cfg.evidence_chunk_overlap_chars,
+                max_chunks_per_session=cfg.max_chunks_per_session,
+            )
             rows.append(_evaluate_example(
                 example, visible, cfg,
                 write_seconds=write_seconds, retrieval_seconds=retrieval_seconds,
@@ -118,7 +134,10 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
                     "backend": cfg.backend,
                     "source": example.source,
                     "expanded_archives": sum(bool(item.raw_ref) for item in retrieved),
+                    "candidate_sessions": len(retrieved_sessions),
+                    "evidence_selection": evidence_stats,
                 },
+                retrieval_evidence_texts=retrieved_sessions,
             ))
     finally:
         action_counts = Counter(store.memory_update_action_counts)
@@ -126,13 +145,14 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
     return ExperimentReport(
         name=f"memory-{cfg.backend}", rows=rows,
         metadata={
-            "backend": cfg.backend, "top_k": cfg.top_k, "scope": MemoryScope.PROJECT.value,
+            "backend": cfg.backend, "top_k": cfg.top_k, "candidate_k": cfg.candidate_k,
+            "context_token_budget": cfg.context_token_budget, "scope": MemoryScope.PROJECT.value,
             "llm_judge_enabled": judge is not None, "retrieval_mode": cfg.retrieval_mode,
             "memory_judge_calls": int(getattr(judge, "call_count", 0)) if judge is not None else 0,
             "memory_judge_parse_errors": int(getattr(judge, "parse_error_count", 0)) if judge is not None else 0,
             "memory_judge_thinking_disabled": bool(getattr(judge, "thinking_disabled", False)) if judge is not None else False,
             "cascade_read": cfg.cascade_read, "enable_memory_update": cfg.enable_memory_update,
-            "archive_expand_policy": "expand_all_retrieved_top_k",
+            "archive_expand_policy": "expand_candidates_then_select_evidence_chunks",
             "qa_solver": cfg.qa_solver, "qa_model": cfg.qa_model or "OPENAI_MODEL",
             "storage_bytes": _directory_size(root), "memory_update_actions": dict(action_counts),
             "seconds": round(time.perf_counter() - started, 4),
@@ -141,23 +161,31 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
 
 
 def _run_context_baseline(
-    examples: List[MemoryExample], cfg: MemoryExperimentConfig, *, full_context: bool
+    examples: List[MemoryExample], cfg: MemoryExperimentConfig, *, full_context: bool, budgeted: bool = False
 ) -> ExperimentReport:
     rows: List[ExperimentRow] = []
     started = time.perf_counter()
     for example in examples:
         retrieval_started = time.perf_counter()
         visible = list(example.memories) if full_context else []
+        if budgeted:
+            visible = _recent_context_within_budget(visible, cfg.context_token_budget)
         retrieval_seconds = time.perf_counter() - retrieval_started
         rows.append(_evaluate_example(
             example, visible, cfg, write_seconds=0.0, retrieval_seconds=retrieval_seconds,
             retrieval_applicable=False,
-            metadata={"backend": cfg.backend, "source": example.source, "retrieval_metrics": "not_applicable_for_context_control"},
+            metadata={
+                "backend": cfg.backend,
+                "source": example.source,
+                "retrieval_metrics": "not_applicable_for_context_control",
+                "context_policy": "recent_history_truncation" if budgeted else "unbounded_full_history",
+            },
         ))
     return ExperimentReport(
         name=f"memory-{cfg.backend}", rows=rows,
         metadata={
-            "backend": cfg.backend, "top_k": cfg.top_k, "qa_solver": cfg.qa_solver,
+            "backend": cfg.backend, "top_k": cfg.top_k, "context_token_budget": cfg.context_token_budget,
+            "qa_solver": cfg.qa_solver,
             "qa_model": cfg.qa_model or "OPENAI_MODEL", "storage_bytes": 0,
             "evaluator_scope": "end-to-end QA; retrieval metrics are N/A for context controls",
             "seconds": round(time.perf_counter() - started, 4),
@@ -379,6 +407,99 @@ def _evidence_metrics(example: MemoryExample, retrieved: List[str]) -> Tuple[int
     ranks = [_text_rank(item, retrieved) for item in evidence if _norm(item)]
     positive = [rank for rank in ranks if rank]
     return (min(positive) if positive else 0, len(positive) / len(ranks) if ranks else 0.0, mode)
+
+
+def _select_evidence_chunks(
+    question: str,
+    sessions: List[str],
+    *,
+    token_budget: int,
+    chunk_chars: int,
+    overlap_chars: int,
+    max_chunks_per_session: int,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Select QA evidence from retrieved sessions under a fixed context budget."""
+    if token_budget <= 0:
+        return list(sessions), {
+            "candidate_sessions": len(sessions),
+            "selected_chunks": len(sessions),
+            "selected_tokens": rough_token_count("\n".join(sessions)),
+        }
+    candidates: List[Tuple[float, int, int, str]] = []
+    for session_rank, session in enumerate(sessions):
+        chunks = _split_evidence_chunks(session, chunk_chars, overlap_chars)
+        scored = [(_chunk_relevance(question, chunk), chunk_index, chunk) for chunk_index, chunk in enumerate(chunks)]
+        for score, chunk_index, chunk in sorted(scored, key=lambda item: (-item[0], item[1]))[:max(1, max_chunks_per_session)]:
+            # Session retrieval provides semantic recall; this score chooses a
+            # compact evidence span inside each retrieved raw session.
+            candidates.append((score + 1.0 / (session_rank + 1), session_rank, chunk_index, chunk))
+    selected: List[str] = []
+    used_tokens = 0
+    for _, session_rank, chunk_index, chunk in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
+        remaining = token_budget - used_tokens
+        if remaining <= 0:
+            break
+        chunk_tokens = rough_token_count(chunk)
+        if chunk_tokens > remaining:
+            chunk = chunk[: max(1, remaining * 4)]
+            chunk_tokens = rough_token_count(chunk)
+        selected.append(f"[session_rank={session_rank + 1}]\n{chunk}")
+        used_tokens += chunk_tokens
+    return selected, {
+        "candidate_sessions": len(sessions),
+        "selected_chunks": len(selected),
+        "selected_tokens": used_tokens,
+    }
+
+
+def _recent_context_within_budget(memories: List[str], token_budget: int) -> List[str]:
+    """Conventional fixed-budget Full-Context baseline using recent history."""
+    if token_budget <= 0:
+        return list(memories)
+    selected: List[str] = []
+    used_tokens = 0
+    for memory in reversed(memories):
+        remaining = token_budget - used_tokens
+        if remaining <= 0:
+            break
+        memory_tokens = rough_token_count(memory)
+        if memory_tokens > remaining:
+            memory = memory[-max(1, remaining * 4):]
+            memory_tokens = rough_token_count(memory)
+        selected.append(memory)
+        used_tokens += memory_tokens
+    return list(reversed(selected))
+
+
+def _split_evidence_chunks(text: str, chunk_chars: int, overlap_chars: int) -> List[str]:
+    if len(text) <= chunk_chars:
+        return [text]
+    chunks: List[str] = []
+    start = 0
+    step = max(1, chunk_chars - max(0, overlap_chars))
+    while start < len(text):
+        end = min(len(text), start + chunk_chars)
+        if end < len(text):
+            boundary = max(text.rfind("\n", start, end), text.rfind(". ", start, end), text.rfind("。", start, end))
+            if boundary > start + chunk_chars // 2:
+                end = boundary + 1
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = max(start + step, end - max(0, overlap_chars))
+    return chunks
+
+
+def _chunk_relevance(question: str, chunk: str) -> float:
+    query_terms = set(_retrieval_terms(question))
+    chunk_terms = set(_retrieval_terms(chunk))
+    if not query_terms or not chunk_terms:
+        return 0.0
+    return len(query_terms & chunk_terms) / len(query_terms)
+
+
+def _retrieval_terms(text: str) -> List[str]:
+    return re.findall(r"[\u4e00-\u9fff]|[a-z0-9]{2,}", str(text).lower())
 
 
 def _text_rank(target: str, texts: List[str]) -> int:

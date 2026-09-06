@@ -73,6 +73,7 @@ class LongTaskExample:
     expected_memory: str
     added_constraint: str
     distractor: str
+    history: List[str] = field(default_factory=list)
     force_budget_pressure: bool = True
     force_interruption: bool = True
     metadata: Dict[str, str] = field(default_factory=dict)
@@ -105,8 +106,8 @@ class LongTaskExperimentConfig:
     output_root: str = "runs/experiments/long_task"
     clean: bool = True
     top_k: int = 3
-    max_context_tokens: int = 320
-    reserved_output_tokens: int = 64
+    max_context_tokens: int = 16384
+    reserved_output_tokens: int = 2048
 
 
 def build_long_task_dataset(*, size: int = 100, seed: int = 42) -> List[LongTaskExample]:
@@ -175,6 +176,8 @@ def _run_one(
 ) -> ExperimentRow:
     started = time.perf_counter()
     visible_memory = ""
+    history_items = list(example.history) or [example.memory_fact]
+    history_text = "\n\n".join(history_items)
     memory_store = None
     if method.memory:
         memory_store = HybridTieredMemoryStore(root / "memory" / example.id)
@@ -183,7 +186,13 @@ def _run_one(
             project_id="long-task-experiment",
             global_id="long-task-experiment",
         )
-        memory_store.append(example.memory_fact, MemoryScope.PROJECT, context=memory_context)
+        for index, history_item in enumerate(history_items):
+            memory_store.append(
+                history_item,
+                MemoryScope.PROJECT,
+                context=memory_context,
+                tags=["long-task-history", f"history-{index}"],
+            )
         items = memory_store.cascade_read(
             example.memory_query,
             context=memory_context,
@@ -192,9 +201,7 @@ def _run_one(
         )
         visible_memory = "\n".join(str(item.content) for item in items)
     elif method.full_context:
-        # Deliberately exceed the configured context budget to represent the
-        # common "concatenate the complete history" control.
-        visible_memory = "\n".join([example.memory_fact, example.distractor] * 24)
+        visible_memory = history_text
 
     goal_retention = False
     constraint_compliance = False
@@ -244,10 +251,14 @@ def _run_one(
                 ledger, current_node="worker"
             ).drifted
 
-        pressure_state = dict(state)
-        pressure_state["history"] = (example.distractor + " ") * 80
+        pressure_state = {
+            "context": context_text,
+            "memory": visible_memory,
+        }
         if method.budget:
-            pause_correct = not policy.build_budget_controller().check(pressure_state).allowed
+            decision = policy.build_budget_controller().check(pressure_state)
+            expected_pause = rough_token_count(pressure_state) > max(0, cfg.max_context_tokens - cfg.reserved_output_tokens)
+            pause_correct = decision.allowed == (not expected_pause)
 
         if method.checkpoint and example.force_interruption:
             checkpoint_store = ContextCheckpointStore(
@@ -273,10 +284,7 @@ def _run_one(
     memory_use_accuracy = memory_contains_expected(example.expected_memory, visible_memory)
     used_tokens = rough_token_count(context_text + "\n" + visible_memory)
     budget_limit = max(0, cfg.max_context_tokens - cfg.reserved_output_tokens)
-    # Every task contains a designated pressure segment. A method without the
-    # controller continues through it, even if its own visible prompt happened
-    # to be compact; this measures missing enforcement rather than text size.
-    budget_violation = bool(example.force_budget_pressure and not method.budget and not pause_correct)
+    budget_violation = bool(used_tokens > budget_limit and not method.budget)
     repeated_step_rate = 0.0 if drift_detected else 1.0
     final_success = all(
         [
@@ -311,6 +319,8 @@ def _run_one(
             "pause_correctness": int(pause_correct),
             "recovery_success": int(recovery_success),
             "tokens": used_tokens,
+            "history_tokens": rough_token_count(history_text),
+            "budget_limit": budget_limit,
             "steps": steps,
             "execution_ms": (time.perf_counter() - started) * 1000,
         },

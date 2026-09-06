@@ -165,7 +165,7 @@ def _sequential_planner_graph():
             {"id": "planner", "name": "planner", "children": [], "config": {"node_kind": "task_planner", "input_field": "input", "max_subtasks": 5, "max_replans": 1, "route_key": "route", "execute_route": "execute", "done_route": "done", "failed_route": "failed"}},
             {"id": "team", "name": "executor-pool", "children": ["worker"], "config": {"node_kind": "agent_team", "delegation": {"mode": "single", "selection_top_k": 1, "max_parallel": 1}, "member_profiles": {"worker": {"capabilities": ["research", "writing"]}}}},
             {"id": "worker", "name": "worker", "description": "research writing", "children": [], "config": {"node_kind": "script", "inputs": [{"name": "input", "path": "input"}], "code": "def main(params):\n    return {'answer': 'DONE: ' + str(params['input'])}", "output_field": "answer"}},
-            {"id": "gate", "name": "quality-gate", "children": [], "config": {"node_kind": "quality_gate", "preset": "general", "route_key": "route", "continue_route": "continue", "escalate_route": "escalate"}},
+            {"id": "gate", "name": "quality-gate", "children": [], "config": {"node_kind": "quality_gate", "preset": "general", "route_key": "route", "continue_route": "continue"}},
             {"id": "aggregator", "name": "aggregator", "children": [], "config": {"node_kind": "result_aggregator", "mode": "ordered", "input_field": "plan_results", "output_field": "final"}},
             {"id": "end", "name": "end", "children": [], "config": {"node_kind": "end", "output_field": "input"}},
         ],
@@ -173,7 +173,7 @@ def _sequential_planner_graph():
             {"source": "start", "target": "planner"},
             {"source": "planner", "target": "<conditional>", "conditional": True, "condition_key": "route", "path_map": {"execute": "team", "done": "aggregator", "failed": "end"}},
             {"source": "team", "target": "gate"},
-            {"source": "gate", "target": "<conditional>", "conditional": True, "condition_key": "route", "path_map": {"continue": "planner", "escalate": "end"}},
+            {"source": "gate", "target": "<conditional>", "conditional": True, "condition_key": "route", "path_map": {"continue": "planner"}},
             {"source": "aggregator", "target": "end"},
         ],
     }
@@ -209,6 +209,18 @@ def test_quality_gate_requires_runtime_evidence_for_factual_work(tmp_path, monke
     assert any(issue["type"] == "missing_evidence" for issue in update["quality_report"]["issues"])
 
 
+def test_quality_gate_rejects_use_outside_a_planned_todo(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    factory = WorkflowNodeRuntimeFactory(ToolCatalogStore(tmp_path / "tools"))
+    gate = factory(AgentSpec(id="gate", name="gate", config={"node_kind": "quality_gate"}))
+    try:
+        asyncio.run(gate.invoke({"input": "orphan output"}))
+    except RuntimeError as exc:
+        assert "当前 TODO" in str(exc)
+    else:
+        raise AssertionError("质量门不应脱离任务规划器运行")
+
+
 def test_planner_replaces_unfinished_todos_after_quality_replan(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     factory = WorkflowNodeRuntimeFactory(ToolCatalogStore(tmp_path / "tools"))
@@ -225,6 +237,28 @@ def test_planner_replaces_unfinished_todos_after_quality_replan(tmp_path, monkey
     assert replanned["current_todo"]["id"] == "planner-replan-1-todo-1"
     assert replanned["current_todo"]["objective"] == "collect authoritative evidence"
     assert replanned["current_todo"]["evidence_requirements"]["minimum_sources"] == 2
+
+
+def test_planner_emits_failed_after_replan_budget_is_exhausted(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    factory = WorkflowNodeRuntimeFactory(ToolCatalogStore(tmp_path / "tools"))
+    planner = factory(AgentSpec(id="planner", name="planner", config={"node_kind": "task_planner", "max_replans": 0, "route_key": "route", "failed_route": "failed"}))
+    first = asyncio.run(planner.invoke({"input": "write report"}))
+    failed = asyncio.run(planner.invoke({**first, "input": "unsupported answer", "quality_report": {"decision": "replan", "revision_instruction": "evidence missing"}}))
+    assert failed["route"] == "failed"
+    assert failed["plan_ledger"]["status"] == "failed"
+    assert failed["plan_ledger"]["todos"][0]["status"] == "failed"
+
+
+def test_quality_feedback_cycle_reaches_planner_failed_route(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    graph = _sequential_planner_graph()
+    next(item for item in graph["agents"] if item["id"] == "planner")["config"].update({"max_retries_per_todo": 1, "max_replans": 0})
+    next(item for item in graph["agents"] if item["id"] == "gate")["config"]["preset"] = "factual"
+    events = _run(graph, "prepare a sourced answer")
+    final = next(event["state"] for event in events if event.get("type") == "final")
+    assert final["plan_ledger"]["status"] == "failed"
+    assert final["plan_ledger"]["todos"][0]["status"] == "failed"
 
 
 def test_dynamic_control_graph_can_be_persisted_with_complete_routes(tmp_path, monkeypatch):
@@ -255,4 +289,4 @@ def test_dynamic_control_graph_can_be_persisted_with_complete_routes(tmp_path, m
     assert saved.status_code == 200, saved.text
     stored = saved.json()["graph"]
     assert next(edge for edge in stored["connections"] if edge["source"] == "planner")["path_map"].keys() == {"execute", "done", "failed"}
-    assert next(edge for edge in stored["connections"] if edge["source"] == "gate")["path_map"].keys() == {"continue", "escalate"}
+    assert next(edge for edge in stored["connections"] if edge["source"] == "gate")["path_map"].keys() == {"continue"}

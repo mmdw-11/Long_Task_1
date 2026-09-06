@@ -25,10 +25,12 @@ def main() -> None:
     parser.add_argument("--source", choices=["longmemeval", "locomo", "custom"], default="longmemeval")
     parser.add_argument(
         "--backend",
-        choices=["no_memory", "full_context", "engine", "mem0"],
+        choices=["no_memory", "full_context", "full_context_budgeted", "engine", "mem0"],
         default="engine",
     )
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--candidate-k", type=int, default=20, help="Ours 检索的候选会话数")
+    parser.add_argument("--context-token-budget", type=int, default=12000, help="Ours 送入 QA 的证据上下文预算")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output-dir", default="runs/experiments/memory")
     parser.add_argument("--run-name", default="", help="结果子目录；不同方法必须使用不同名称")
@@ -61,6 +63,8 @@ def main() -> None:
         MemoryExperimentConfig(
             backend=args.backend,
             top_k=args.top_k,
+            candidate_k=args.candidate_k,
+            context_token_budget=args.context_token_budget,
             output_root=str(final_dir),
             clean=args.fresh or not existing,
             use_llm_judge=not args.no_llm_judge,

@@ -35,6 +35,7 @@ def main() -> None:
     memory.add_argument("--output", required=True)
     memory.add_argument("--count", type=int, required=True)
     memory.add_argument("--seed", type=int, default=42)
+    memory.add_argument("--stratified", action="store_true", help="按 question_type 轮转抽样")
 
     state = subparsers.add_parser("state", help="derive state-governance tasks from normalized LoCoMo")
     state.add_argument("--input", required=True)
@@ -50,7 +51,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "memory":
         examples = sample_memory_examples(
-            load_memory_dataset(args.input, source=args.source), count=args.count, seed=args.seed
+            load_memory_dataset(args.input, source=args.source),
+            count=args.count,
+            seed=args.seed,
+            stratified=args.stratified,
         )
         path = save_jsonl(args.output, memory_examples_to_rows(examples))
         print({"output": str(path), "questions": len(examples), "trajectories": len({item.trajectory_id or item.id for item in examples})})
