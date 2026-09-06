@@ -203,13 +203,21 @@ def _run_one(
     elif method.full_context:
         visible_memory = history_text
 
-    goal_retention = False
-    constraint_compliance = False
+    # Every method receives the same current task prompt.  Earlier versions
+    # replaced the prompt with the distractor for non-ledger baselines, which
+    # made goal/constraint failure true by construction rather than observation.
+    current_prompt = "\n".join(
+        [example.goal, *example.hard_constraints, example.added_constraint, *example.plan, example.distractor]
+    )
+    context_text = current_prompt
+    goal_retention = example.goal in context_text
+    constraint_compliance = all(
+        item in context_text for item in [*example.hard_constraints, example.added_constraint]
+    )
     drift_detected = False
     pause_correct = False
     recovery_success = False
-    context_text = ""
-    steps = 0
+    steps = 3
     if method.ledger:
         policy = ContextPolicy(
             max_context_tokens=cfg.max_context_tokens,
@@ -236,7 +244,7 @@ def _run_one(
         goal_retention = example.goal in context_text
         constraint_compliance = all(item in context_text for item in state["hard_constraints"])
 
-        for step in range(1, 4):
+        for step in range(1, steps + 1):
             ledger_store.on_step_start(run_id=example.id, step=step, frontier=["worker"], state=state)
             ledger = ledger_store.on_node_end(
                 run_id=example.id,
@@ -245,20 +253,10 @@ def _run_one(
                 update={"result": "重复且无新增进展"},
                 state=state,
             )
-            steps += 1
         if method.drift:
             drift_detected = policy.build_drift_detector().detect(
                 ledger, current_node="worker"
             ).drifted
-
-        pressure_state = {
-            "context": context_text,
-            "memory": visible_memory,
-        }
-        if method.budget:
-            decision = policy.build_budget_controller().check(pressure_state)
-            expected_pause = rough_token_count(pressure_state) > max(0, cfg.max_context_tokens - cfg.reserved_output_tokens)
-            pause_correct = decision.allowed == (not expected_pause)
 
         if method.checkpoint and example.force_interruption:
             checkpoint_store = ContextCheckpointStore(
@@ -270,22 +268,28 @@ def _run_one(
             ledger_store.save(damaged)
             checkpoint_store.restore(checkpoint)
             recovery_success = ledger_store.load_or_create(example.id).original_goal == example.goal
-    elif method.full_context:
-        # Full history keeps the goal and constraints visible, but has no
-        # explicit drift detector, budget controller or checkpoint recovery.
-        context_text = "\n".join([example.goal, *example.hard_constraints, example.added_constraint, *example.plan, example.distractor])
-        goal_retention = example.goal in context_text
-        constraint_compliance = all(item in context_text for item in [*example.hard_constraints, example.added_constraint])
-    else:
-        # Without a ledger, only the current prompt survives; the injected disturbance
-        # displaces the original goal/constraints in this deterministic control.
-        context_text = example.distractor
 
     memory_use_accuracy = memory_contains_expected(example.expected_memory, visible_memory)
     used_tokens = rough_token_count(context_text + "\n" + visible_memory)
     budget_limit = max(0, cfg.max_context_tokens - cfg.reserved_output_tokens)
-    budget_violation = bool(used_tokens > budget_limit and not method.budget)
+    pressure_expected = used_tokens > budget_limit
+    if method.budget:
+        pressure_state = {"context": context_text, "memory": visible_memory}
+        decision = policy.build_budget_controller().check(pressure_state)
+        pause_correct = decision.allowed == (not pressure_expected)
+        budget_violation = bool(pressure_expected and decision.allowed)
+    else:
+        # A method without a controller continues.  That is correct when the
+        # visible input fits and a violation only when it exceeds the budget.
+        pause_correct = not pressure_expected
+        budget_violation = pressure_expected
     repeated_step_rate = 0.0 if drift_detected else 1.0
+    basic_task_readiness = all(
+        [goal_retention, constraint_compliance, memory_use_accuracy, not budget_violation]
+    )
+    disturbance_handling_score = sum(
+        [drift_detected, pause_correct, recovery_success]
+    ) / 3.0
     final_success = all(
         [
             goal_retention,
@@ -309,6 +313,8 @@ def _run_one(
         expected=example.expected_memory,
         metrics={
             "final_task_success": int(final_success),
+            "basic_task_readiness": int(basic_task_readiness),
+            "disturbance_handling_score": disturbance_handling_score,
             "goal_retention": int(goal_retention),
             "constraint_compliance": int(constraint_compliance),
             "memory_use_accuracy": int(memory_use_accuracy),
@@ -324,5 +330,10 @@ def _run_one(
             "steps": steps,
             "execution_ms": (time.perf_counter() - started) * 1000,
         },
-        metadata={"method": method.name, **example.metadata},
+        metadata={
+            "method": method.name,
+            "evaluation_policy": "shared_prompt_shared_disturbances_layered_readiness_v5",
+            "final_success_scope": "strict conjunction of task signals and governance controls",
+            **example.metadata,
+        },
     )
