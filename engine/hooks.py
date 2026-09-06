@@ -625,6 +625,10 @@ class HookManager(ExecutionHook):
         if self.skill_retriever is None:
             return
         self.skill_retriever.inject(ctx.state, node=ctx.node, metadata=ctx.metadata)
+        from .modules.live_events import emit
+        for item in ctx.state.get(SKILL_CONTEXT_KEY, []):
+            skill = item.get("skill") or {}
+            emit("skill_applied", node=ctx.node, skill_id=item.get("skill_id"), version=item.get("version"), source_type=skill.get("source_type"), message=f"已应用 Skill：{skill.get('name') or item.get('skill_id')} · v{item.get('version')}")
         self._record_skill_trace(
             ctx,
             "skill_retrieved",

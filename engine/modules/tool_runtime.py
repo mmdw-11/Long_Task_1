@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -165,6 +166,19 @@ class ToolRuntime:
         return selected or tools[:limit]
 
     def execute(
+        self, tool: ToolRecord, task_text: str, *,
+        arguments: Optional[Dict[str, Any]] = None, bypass_approval: bool = False,
+    ) -> ToolRuntimeResult:
+        from .live_events import emit, checkpoint
+        checkpoint()
+        started = time.perf_counter()
+        result = self._execute(tool, task_text, arguments=arguments, bypass_approval=bypass_approval)
+        emit("tool_finished", tool_id=tool.id, tool_name=tool.display_name or tool.name,
+             status=result.status, duration_ms=round((time.perf_counter()-started)*1000),
+             message=f"{tool.display_name or tool.name}：" + {"succeeded":"调用完成", "approval_required":"等待批准，尚未执行"}.get(result.status, "调用未成功"))
+        return result
+
+    def _execute(
         self,
         tool: ToolRecord,
         task_text: str,
@@ -194,6 +208,8 @@ class ToolRuntime:
                 approval_required=True,
                 risk=risk,
             )
+        from .live_events import emit
+        emit("tool_started", tool_id=tool.id, tool_name=tool.display_name or tool.name, message=f"正在调用 {tool.display_name or tool.name}")
         try:
             if adapter in {"current_time", "time", "now"}:
                 result = datetime.now(timezone.utc).isoformat()

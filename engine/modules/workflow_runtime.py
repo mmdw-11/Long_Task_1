@@ -152,7 +152,7 @@ class WorkflowNodeRuntimeFactory:
                 task = _get(state, str(config.get("input_field") or "input"))
                 task_text = task if isinstance(task, str) else json.dumps(task, ensure_ascii=False, default=str)
                 arguments = {"workspace_id": state.get("workspace_id")} if str(tool.metadata.get("adapter") or "").startswith("workspace_") else None
-                result = self.tool_runtime.execute(tool, task_text, arguments=arguments).to_dict()
+                result = (await asyncio.to_thread(self.tool_runtime.execute, tool, task_text, arguments=arguments)).to_dict()
                 if result["status"] != "succeeded":
                     raise RuntimeError(result.get("error") or "工具调用未完成")
                 output_key = str(config.get("output_field") or "tool_output")
@@ -165,7 +165,7 @@ class WorkflowNodeRuntimeFactory:
                     raise RuntimeError("知识库节点未配置可用知识库")
                 query = _get(state, str(config.get("input_field") or "input"))
                 owner = str(state.get("__owner_user_id__") or "local-user")
-                result=self.knowledge_store.retrieve(kb_ids, str(query or ""), owner=owner, mode=str(config.get("mode") or "hybrid"), top_k=int(config.get("top_k") or 5), threshold=float(config.get("threshold") or .15), labels=list(config.get("labels") or []), workflow_id=str(state.get("__workflow_id__") or ""), run_id=str(state.get("__run_id__") or ""))
+                result=await asyncio.to_thread(self.knowledge_store.retrieve, kb_ids, str(query or ""), owner=owner, mode=str(config.get("mode") or "hybrid"), top_k=int(config.get("top_k") or 5), threshold=float(config.get("threshold") or .15), labels=list(config.get("labels") or []), workflow_id=str(state.get("__workflow_id__") or ""), run_id=str(state.get("__run_id__") or ""))
                 output_key = str(config.get("output_field") or "documents")
                 return {
                     output_key: result["documents"], "documents":result["documents"], "context":result["context"], "citations":result["citations"], "retrieval_metadata":result["retrieval_metadata"], "input": result["context"],
@@ -187,7 +187,7 @@ class WorkflowNodeRuntimeFactory:
                 text = str(_get(state, str(config.get("input_field") or config.get("field") or "input")) or "")
                 names = [str(item.get("name") or item.get("route")) for item in categories]
                 prompt = f"输入：{text}\n候选意图：{json.dumps(categories, ensure_ascii=False)}\n{config.get('prompt') or ''}\n只返回 JSON：{{\"categories\":[\"意图名\"]}}"
-                result = self.agent_runtime._run_pinned_model(model, prompt, "你是严格的意图分类器。只能从候选意图中选择。")
+                result = await asyncio.to_thread(self.agent_runtime._run_pinned_model, model, prompt, "你是严格的意图分类器。只能从候选意图中选择。")
                 if not result.success: raise RuntimeError(result.error or "意图分类失败")
                 try: selected = json.loads(result.text).get("categories") or []
                 except (json.JSONDecodeError, AttributeError): selected = []
@@ -217,7 +217,7 @@ class WorkflowNodeRuntimeFactory:
                 return {str(config.get("output_field") or "drift_report"): report, route_key: str(route)}
             if kind == "script":
                 if config.get("code"):
-                    params = {str(item.get("name")): _get(state, str(item.get("path") or item.get("name"))) for item in config.get("inputs") or []}
+                    params = {str(item.get("name") or "").strip(): _get(state, str(item.get("path") or item.get("name") or "").strip()) for item in config.get("inputs") or []}
                     if not params: params = {"input": state.get("input")}
                     attempts, last = max(1, min(5, int(config.get("retry_count") or 0) + 1)), None
                     for attempt in range(attempts):
@@ -243,6 +243,31 @@ class WorkflowNodeRuntimeFactory:
                     updates[target] = _assign(current, value, operation)
                 return updates
             if kind == "loop":
+                # A loop owns its child canvas.  Unlike a regular graph edge,
+                # loop_start/loop_end are structural markers and are invoked by
+                # this controller for every iteration.
+                if spec.children and self.graph:
+                    limit = max(1, min(100, int(config.get("max_iterations") or 3)))
+                    current_state, results, events = dict(state), [], []
+                    input_arrays = config.get("input_arrays") or [{"path": config.get("items_path") or "input.items", "item_field": config.get("item_field") or "loop_item"}]
+                    arrays = [value if isinstance(value := _get(current_state, str(item.get("path") or "")), list) else [] for item in input_arrays]
+                    array_mode = str(config.get("loop_type") or "count") == "array"
+                    iterations = min(limit, min((len(values) for values in arrays), default=0)) if array_mode else limit
+                    for index in range(iterations):
+                        termination_field = str(config.get("termination_field") or "").strip()
+                        if termination_field and _compare(_get(current_state, termination_field), config.get("termination_value"), str(config.get("termination_operator") or "equals")):
+                            break
+                        iteration_state = dict(current_state)
+                        iteration_state[str(config.get("index_field") or "loop_index")] = index
+                        if array_mode:
+                            for item, values in zip(input_arrays, arrays):
+                                iteration_state[str(item.get("item_field") or "loop_item")] = values[index]
+                        output, child_events = await self._run_child_graph(spec, iteration_state)
+                        current_state.update(output)
+                        results.append(output.get("input", output))
+                        events.extend(child_events)
+                    key = str(config.get("output_field") or "loop_output")
+                    return {key: results, "input": results, str(config.get("route_key") or f"route_{spec.id}"): str(config.get("done_route") or "done"), "__runtime_child_events__": events}
                 counter_key = f"__loop_{spec.id}"
                 count = int(state.get(counter_key) or 0)
                 limit = max(1, min(100, int(config.get("max_iterations") or 3)))
@@ -293,7 +318,11 @@ class WorkflowNodeRuntimeFactory:
                     results = await asyncio.gather(*(execute(index) for index in range(limit)))
                     results.sort(key=lambda item: item["index"])
                     key = str(config.get("output_field") or "batch_output")
-                    return {key: results, "input": results, str(config.get("route_key") or f"route_{spec.id}"): str(config.get("done_route") or "done"), "__runtime_child_events__": [event for item in results for event in item["events"]]}
+                    child_events = [event for item in results for event in item["events"]]
+                    # Keep detailed child events for observability, but never
+                    # expose complete child states in the business result.
+                    public_results = [{key: value for key, value in item.items() if key != "events"} for item in results]
+                    return {key: public_results, "input": public_results, str(config.get("route_key") or f"route_{spec.id}"): str(config.get("done_route") or "done"), "__runtime_child_events__": child_events}
                 counter_key, count = f"__batch_{spec.id}", int(state.get(f"__batch_{spec.id}") or 0)
                 route_key, continue_route, done_route = str(config.get("route_key") or f"route_{spec.id}"), str(config.get("continue_route") or "continue"), str(config.get("done_route") or "done")
                 key = str(config.get("output_field") or "batch_output")
@@ -678,8 +707,10 @@ class WorkflowNodeRuntimeFactory:
         child_ids = set(parent.children)
         agents = [item for item in self.graph.get("agents", []) if item.get("id") in child_ids]
         connections = [item for item in self.graph.get("connections", []) if item.get("source") in child_ids and (item.get("target") in child_ids or item.get("target") == "END")]
-        start = next((item for item in agents if str((item.get("config") or {}).get("node_kind")) == "batch_start"), None)
-        if not start: raise RuntimeError("批处理子流程缺少批处理开始节点")
+        parent_kind = str(parent.config.get("node_kind") or "batch")
+        start_kind = "loop_start" if parent_kind == "loop" else "batch_start"
+        start = next((item for item in agents if str((item.get("config") or {}).get("node_kind")) == start_kind), None)
+        if not start: raise RuntimeError(f"{'循环' if parent_kind == 'loop' else '批处理'}子流程缺少开始节点")
         child_graph = {"entry": start["id"], "agents": agents, "connections": connections}
         orchestrator = Orchestrator.from_dict(child_graph)
         factory = WorkflowNodeRuntimeFactory(self.tools, self.models, graph=child_graph, knowledge_store=self.knowledge_store, mcp_oauth_store=self.mcp_oauth_store, workspace_store=self.workspace_store, skill_repository=self.skills, run_store=self.run_store)

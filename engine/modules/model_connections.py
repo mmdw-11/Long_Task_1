@@ -45,7 +45,10 @@ class ModelConnection:
     # from every API response. It is accepted only on create/update requests.
     api_key: str = ""
     api_key_env: str = ""
-    tier: str = "cloud"
+    # Connections are ordinary reusable resources. AUTO routing assignments are
+    # stored separately in auto_tiers; tier remains only for old-record compatibility.
+    tier: str = "general"
+    auto_tiers: List[str] = field(default_factory=list)
     auto_default: bool = False
     enabled: bool = True
     test_status: str = "untested"
@@ -55,7 +58,7 @@ class ModelConnection:
 
     def to_dict(self) -> Dict[str, Any]:
         """Public representation; API keys must never be returned to the browser."""
-        return {"id":self.id,"name":self.name,"provider":self.provider,"model_id":self.model_id,"base_url":self.base_url,"api_key_env":self.api_key_env,"has_api_key":bool(self.api_key),"tier":self.tier,"auto_default":self.auto_default,"enabled":self.enabled,"test_status":self.test_status,"configured":self.configured,"capabilities":list(self.capabilities),"created_at":self.created_at,"updated_at":self.updated_at}
+        return {"id":self.id,"name":self.name,"provider":self.provider,"model_id":self.model_id,"base_url":self.base_url,"api_key_env":self.api_key_env,"has_api_key":bool(self.api_key),"tier":self.tier,"auto_tiers":list(self.auto_tiers),"auto_default":bool(self.auto_tiers) or self.auto_default,"enabled":self.enabled,"test_status":self.test_status,"configured":self.configured,"capabilities":list(self.capabilities),"created_at":self.created_at,"updated_at":self.updated_at}
 
     def to_storage_dict(self) -> Dict[str, Any]:
         return {**self.to_dict(), "api_key": self.api_key}
@@ -73,10 +76,14 @@ class ModelConnection:
         name, model_id = str(data.get("name") or "").strip(), str(data.get("model_id") or "").strip()
         if not name or not model_id:
             raise ValueError("model connection name and model_id are required")
-        tier = str(data.get("tier") or "cloud")
-        if tier not in {"device","edge","cloud"}:
-            raise ValueError("model connection tier must be device, edge or cloud")
-        return cls(id=str(data.get("id") or f"model-{uuid.uuid4().hex[:12]}"),name=name,provider=str(data.get("provider") or "openai-compatible"),model_id=model_id,base_url=_normalise_base_url(data.get("base_url")),api_key=str(data.get("api_key") or ""),api_key_env=str(data.get("api_key_env") or ""),tier=tier,auto_default=bool(data.get("auto_default",False)),enabled=bool(data.get("enabled",True)),test_status=str(data.get("test_status") or "untested"),capabilities=[str(x) for x in data.get("capabilities") or ["chat"]],created_at=str(data.get("created_at") or _now()),updated_at=str(data.get("updated_at") or _now()))
+        tier = str(data.get("tier") or "general")
+        if tier not in {"general","device","edge","cloud"}:
+            raise ValueError("model connection tier is invalid")
+        auto_tiers = [str(value) for value in data.get("auto_tiers") or [] if str(value) in {"device", "edge", "cloud"}]
+        # Migrate legacy rows lazily: their tier + auto_default represented one AUTO slot.
+        if not auto_tiers and bool(data.get("auto_default", False)):
+            auto_tiers = [tier if tier in {"device", "edge", "cloud"} else "cloud"]
+        return cls(id=str(data.get("id") or f"model-{uuid.uuid4().hex[:12]}"),name=name,provider=str(data.get("provider") or "openai-compatible"),model_id=model_id,base_url=_normalise_base_url(data.get("base_url")),api_key=str(data.get("api_key") or ""),api_key_env=str(data.get("api_key_env") or ""),tier=tier,auto_tiers=auto_tiers,auto_default=bool(auto_tiers),enabled=bool(data.get("enabled",True)),test_status=str(data.get("test_status") or "untested"),capabilities=[str(x) for x in data.get("capabilities") or ["chat"]],created_at=str(data.get("created_at") or _now()),updated_at=str(data.get("updated_at") or _now()))
 
 
 class ModelConnectionStore:
@@ -84,11 +91,14 @@ class ModelConnectionStore:
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
     def save(self, item: ModelConnection) -> ModelConnection:
         if self.exists(item.id): item.created_at=self.get(item.id).created_at
-        if item.auto_default:
+        if item.auto_tiers:
             for other in self.list():
-                if other.id != item.id and other.tier == item.tier and other.auto_default:
-                    other.auto_default = False
+                overlap = set(other.auto_tiers) & set(item.auto_tiers)
+                if other.id != item.id and overlap:
+                    other.auto_tiers = [tier for tier in other.auto_tiers if tier not in overlap]
+                    other.auto_default = bool(other.auto_tiers)
                     self._write(other)
+        item.auto_default = bool(item.auto_tiers)
         # Changing a tested connection invalidates its previous health result.
         if self.exists(item.id):
             previous = self.get(item.id)
@@ -108,10 +118,28 @@ class ModelConnectionStore:
             raise KeyError(f"model connection {item_id!r} not found")
         path.unlink()
     def default_for_tier(self, tier: str, *, runnable: bool = True) -> Optional[ModelConnection]:
-        matches = [item for item in self.list() if item.tier == tier and item.auto_default]
+        matches = [item for item in self.list() if tier in item.auto_tiers]
         if runnable:
             matches = [item for item in matches if item.runnable]
         return matches[0] if matches else None
+    def assign_auto_tier(self, tier: str, connection_id: Optional[str]) -> Optional[ModelConnection]:
+        if tier not in {"device", "edge", "cloud"}:
+            raise ValueError("AUTO routing tier must be device, edge or cloud")
+        selected = self.get(connection_id) if connection_id else None
+        if selected is not None and not selected.runnable:
+            raise ValueError("只能为 AUTO 选择已启用、已配置且测试成功的模型")
+        for item in self.list():
+            changed = False
+            if tier in item.auto_tiers and (selected is None or item.id != selected.id):
+                item.auto_tiers = [value for value in item.auto_tiers if value != tier]
+                changed = True
+            if selected is not None and item.id == selected.id and tier not in item.auto_tiers:
+                item.auto_tiers.append(tier)
+                changed = True
+            if changed:
+                item.auto_default = bool(item.auto_tiers)
+                self._write(item)
+        return self.get(selected.id) if selected is not None else None
     def auto_status(self) -> Dict[str, Any]:
         tiers: Dict[str, Any] = {}
         for tier in ("device", "edge", "cloud"):
