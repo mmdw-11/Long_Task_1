@@ -27,7 +27,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--method", choices=[*LONG_TASK_METHODS, "all"], default="all")
     parser.add_argument("--output-dir", default="runs/experiments/long_task")
-    parser.add_argument("--max-context-tokens", type=int, default=320)
+    parser.add_argument("--max-context-tokens", type=int, default=16384)
+    parser.add_argument("--reserved-output-tokens", type=int, default=2048)
     args = parser.parse_args()
 
     examples = load_long_task_dataset(args.dataset) if args.dataset else build_long_task_dataset(size=args.size, seed=args.seed)
@@ -39,6 +40,7 @@ def main() -> None:
                 method=method,
                 output_root=args.output_dir,
                 max_context_tokens=args.max_context_tokens,
+                reserved_output_tokens=args.reserved_output_tokens,
             ),
         )
         paths = save_report(report, Path(args.output_dir) / method)

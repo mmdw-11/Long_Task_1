@@ -24,6 +24,7 @@ from engine.experiments.memory import (
     _engine_retrieved_text,
     _mem0_source_text,
     _qa_judge_prompt,
+    _select_evidence_chunks,
     _yes_verdict,
 )
 from engine.modules.memory.judge import OpenAIMemoryJudge
@@ -99,6 +100,25 @@ def test_memory_experiment_engine_backend(tmp_path):
 
     assert report.summary()["pass_rate"] == 1.0
 
+
+def test_evidence_selection_respects_budget_and_keeps_multiple_sessions():
+    sessions = [
+        "irrelevant opening. The first evidence says alpha is the correct value. " * 30,
+        "another history. The second evidence confirms alpha with a timestamp. " * 30,
+    ]
+    selected, stats = _select_evidence_chunks(
+        "What is the alpha value?",
+        sessions,
+        token_budget=300,
+        chunk_chars=300,
+        overlap_chars=40,
+        max_chunks_per_session=1,
+    )
+
+    assert stats["candidate_sessions"] == 2
+    assert stats["selected_tokens"] <= 300
+    assert selected
+
 def test_memory_control_baselines_report_tokens(tmp_path):
     examples = [
         MemoryExample(
@@ -117,10 +137,20 @@ def test_memory_control_baselines_report_tokens(tmp_path):
         examples,
         MemoryExperimentConfig(backend="full_context", output_root=str(tmp_path), qa_solver="extractive"),
     )
+    budgeted = run_memory_experiment(
+        examples,
+        MemoryExperimentConfig(
+            backend="full_context_budgeted",
+            output_root=str(tmp_path),
+            context_token_budget=2,
+            qa_solver="extractive",
+        ),
+    )
 
     assert no_memory.summary()["pass_rate"] == 0.0
     assert full_context.summary()["pass_rate"] == 1.0
     assert full_context.summary()["avg_context_tokens"] > no_memory.summary()["avg_context_tokens"]
+    assert budgeted.summary()["avg_context_tokens"] <= 2
 
 
 def test_longmemeval_judge_accepts_only_explicit_yes_verdict():
@@ -311,18 +341,22 @@ def test_long_task_joint_experiment_exercises_all_controls(tmp_path):
 def test_skill_experiment_generates_retrievable_skill(tmp_path):
     examples = [
         SkillExample(
-            id="s1",
+            id=f"s{index}",
             task="安排会议并检查冲突",
-            trajectory="先读取日历，再检查冲突，最后创建提醒。",
-            expected_steps=["读取日历", "检查冲突", "创建提醒"],
+            trajectory="先读取日历，再检查冲突，确认时区，最后创建提醒。",
+            expected_steps=["读取日历", "检查冲突", "确认时区", "创建提醒"],
             task_type="calendar",
             source="unit",
+            metadata={"split": "train" if index == 0 else "test", "critical_steps": ["确认时区"]},
         )
+        for index in range(4)
     ]
 
     report = run_skill_experiment(examples, SkillExperimentConfig(output_root=str(tmp_path)))
 
     assert report.summary()["pass_rate"] == 1.0
+    assert report.summary()["total"] == 3
+    assert report.summary()["avg_automatic_skill_generation_success"] == 1.0
 
 
 @pytest.mark.asyncio

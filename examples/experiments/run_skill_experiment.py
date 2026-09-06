@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--output-dir", default="runs/experiments/skills")
     parser.add_argument("--method", choices=[*SKILL_METHODS, "all"], default="all")
+    parser.add_argument("--train-per-type", type=int, default=3)
     parser.add_argument("--fresh", action="store_true", help="忽略已有 rows.jsonl，完整重跑")
     args = parser.parse_args()
 
@@ -38,7 +39,12 @@ def main() -> None:
             continue
         report = run_skill_experiment(
             remaining,
-            SkillExperimentConfig(output_root=str(final_dir), method=method, clean=args.fresh or not existing),
+            SkillExperimentConfig(
+                output_root=str(final_dir),
+                method=method,
+                train_per_type=args.train_per_type,
+                clean=args.fresh or not existing,
+            ),
         )
         report = merge_reports(report.name, existing, report)
         print(method, save_report(report, final_dir))
