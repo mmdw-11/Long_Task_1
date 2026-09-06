@@ -196,6 +196,7 @@ def test_workflow_application_mounts_and_runs_tool_node(tmp_path, monkeypatch):
     }
     saved = client.put(f"/api/workflows/{created['workflow_id']}", json={"graph": graph})
     assert saved.status_code == 200
+    assert [node["name"] for node in saved.json()["graph"]["agents"]] == ["开始1", "工具1", "结束1"]
 
     run = client.post(f"/api/apps/{created['id']}/runs", json={"input": {"input": "3+5"}}).json()
     for _ in range(30):
@@ -206,6 +207,98 @@ def test_workflow_application_mounts_and_runs_tool_node(tmp_path, monkeypatch):
 
     assert run["status"] == "succeeded"
     assert run["state"]["workflow_output"] == 8.0
+
+
+def test_workflow_application_accepts_conditional_connection_targets_in_path_map(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=ToolCatalogStore(tmp_path / "tools"),
+        application_store=ApplicationStore(tmp_path / "apps"),
+    )
+    client = TestClient(app)
+    created = client.post("/api/apps", json={"name": "条件判断工作流", "app_type": "workflow", "model": ""}).json()
+    workflow = client.get(f"/api/workflows/{created['workflow_id']}").json()
+    start, end = workflow["graph"]["agents"]
+    condition = {
+        "id": "node-condition",
+        "name": "条件判断",
+        "description": "按输入路由",
+        "model": "",
+        "sys_prompt": "",
+        "children": [],
+        "config": {
+            "node_kind": "condition",
+            "route_key": "route",
+            "branches": [{"route": "matched", "groups": [{"conditions": [{"field": "input", "operator": "contains", "value": "退款"}]}]}],
+            "default_route": "default",
+        },
+    }
+    graph = {
+        "entry": start["id"],
+        "agents": [start, condition, end],
+        "connections": [
+            {"source": start["id"], "target": condition["id"], "conditional": False},
+            {"source": condition["id"], "target": "<conditional>", "conditional": True, "condition_key": "route", "path_map": {"matched": end["id"], "default": "END"}},
+        ],
+    }
+
+    saved = client.put(f"/api/workflows/{created['workflow_id']}", json={"graph": graph})
+
+    assert saved.status_code == 200
+
+
+def test_workflow_has_no_application_default_model_and_requires_node_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    app = create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=ToolCatalogStore(tmp_path / "tools"),
+        application_store=ApplicationStore(tmp_path / "apps"),
+    )
+    client = TestClient(app)
+    created = client.post("/api/apps", json={"name": "独立模型工作流", "app_type": "workflow", "model": "auto"})
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["model"] == ""
+
+    workflow = client.get(f"/api/workflows/{payload['workflow_id']}").json()
+    start, end = workflow["graph"]["agents"]
+    llm = {
+        "id": "node-llm",
+        "name": "大模型节点",
+        "description": "生成内容",
+        "model": "",
+        "sys_prompt": "请回答",
+        "children": [],
+        "config": {"node_kind": "llm", "output_field": "answer"},
+    }
+    graph = {
+        "entry": start["id"],
+        "agents": [start, llm, end],
+        "connections": [
+            {"source": start["id"], "target": llm["id"], "conditional": False},
+            {"source": llm["id"], "target": end["id"], "conditional": False},
+        ],
+    }
+    response = client.put(f"/api/workflows/{payload['workflow_id']}", json={"graph": graph})
+    assert response.status_code == 400
+    assert "必须单独选择模型" in response.text
+
+
+def test_workspace_directory_picker_returns_selected_folder(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_GRAPH_LOAD_DOTENV", "0")
+    monkeypatch.setattr("engine.server.app._choose_local_directory", lambda: str(tmp_path))
+    client = TestClient(create_app(
+        workflow_store=WorkflowStore(tmp_path / "workflows"),
+        run_store=RunStore(tmp_path / "runs"),
+        tool_catalog_store=ToolCatalogStore(tmp_path / "tools"),
+        application_store=ApplicationStore(tmp_path / "apps"),
+    ))
+    response = client.post("/api/workspaces/pick-directory")
+    assert response.status_code == 200
+    assert response.json() == {"canceled": False, "path": str(tmp_path.resolve()), "name": tmp_path.name}
 
 
 def test_workflow_application_rejects_unmounted_tool_node(tmp_path, monkeypatch):

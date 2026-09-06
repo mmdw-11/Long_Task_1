@@ -71,6 +71,25 @@ def test_each_tier_has_only_one_auto_default(tmp_path):
     assert store.get(second.id).auto_default is True
 
 
+def test_general_connection_can_be_assigned_to_multiple_auto_slots(tmp_path):
+    store = ModelConnectionStore(tmp_path / "models")
+    item = store.create({
+        "name": "shared model",
+        "model_id": "shared",
+        "base_url": "https://shared.example/v1",
+        "test_status": "succeeded",
+    })
+
+    assert item.tier == "general"
+    store.assign_auto_tier("device", item.id)
+    store.assign_auto_tier("cloud", item.id)
+
+    stored = store.get(item.id)
+    assert stored.auto_tiers == ["device", "cloud"]
+    assert store.default_for_tier("device").id == item.id
+    assert store.default_for_tier("cloud").id == item.id
+
+
 def test_openapi_operations_are_split_into_tools():
     document = {
         "openapi": "3.0.0",

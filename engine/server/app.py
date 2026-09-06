@@ -93,7 +93,24 @@ from ..modules.tools import GMAIL_STATIC_OAUTH_SCHEMA, MCPAuthorizationRequired,
 from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
 from ..modules.knowledge import KnowledgeStore
 from ..modules.workspace_tools import WorkspaceStore
+from ..modules.file_preview import preview_run_file
 from ..orchestrator import NodeFactory, Orchestrator, _load_dotenv_for_context_policy
+
+
+def _choose_local_directory() -> str:
+    """Open the host OS directory picker; the browser cannot expose absolute paths."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise RuntimeError("当前 Python 环境不支持系统文件夹选择器") from exc
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+        return str(filedialog.askdirectory(parent=root, title="选择本地代码工作区", mustexist=True) or "")
+    finally:
+        root.destroy()
 
 
 BUILTIN_SKILLS = [
@@ -681,6 +698,20 @@ def create_app(
     orch.set_skill_retriever(skill_retriever)
     orch.set_skill_trace_store(skill_traces)
     app = FastAPI(title="Agent 编排服务", version="0.1.0")
+    # Protocol marker distinguishes an alive but stale backend from this build.
+    runtime_info = {"run_stream_protocol": 2, "instance_id": __import__("uuid").uuid4().hex, "started_at": _utc_now(), "features": ["answer_delta", "tool_progress", "approval_resume"]}
+    original_openapi = app.openapi
+
+    def runtime_openapi():
+        schema = original_openapi()
+        schema["info"]["x-run-stream-protocol"] = runtime_info["run_stream_protocol"]
+        return schema
+
+    app.openapi = runtime_openapi
+
+    @app.get("/api/system/runtime")
+    def get_runtime_info() -> Dict[str, Any]:
+        return dict(runtime_info)
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\]):\d+",
@@ -855,13 +886,14 @@ def create_app(
         if app_record.app_type == "agent":
             check(app_record.model, "智能体应用")
         elif graph is not None:
-            check(app_record.model, "工作流默认模型")
             for item in graph.get("agents", []):
                 kind = str((item.get("config") or {}).get("node_kind") or "agent")
                 if kind not in {"agent", "llm"}:
                     continue
                 selection = str(item.get("model") or "")
-                if selection:
+                if not selection:
+                    errors.append(f"节点“{item.get('name')}”必须单独选择模型")
+                else:
                     check(selection, f"节点“{item.get('name')}”")
         return list(dict.fromkeys(errors))
 
@@ -943,7 +975,6 @@ def create_app(
         if application_id:
             app_record = applications.get(application_id)
             if app_record.app_type == "workflow":
-                inherited_model = "auto" if app_record.model in {"", "auto", "device", "edge", "cloud"} else app_record.model
                 workflow_tool_ids = [tool_id for tool_id in app_record.tool_ids if tools.exists(tool_id)]
                 workflow_tool_set = set(workflow_tool_ids)
                 for spec in target.list_agents():
@@ -953,7 +984,7 @@ def create_app(
                         node_tool_ids = [str(tool_id) for tool_id in (config.get("tool_ids") or [])]
                         inherited_tools = node_tool_ids or workflow_tool_ids
                         config["tool_ids"] = [tool_id for tool_id in inherited_tools if tool_id in workflow_tool_set]
-                        target.update_agent(spec.id, model=spec.model or inherited_model, config=config)
+                        target.update_agent(spec.id, config=config)
             bound = [bank_id for bank_id in app_record.memory_bank_ids if memory_banks.exists(bank_id)]
             primary = app_record.primary_memory_bank_id or (bound[0] if bound else None)
             if primary and primary in bound and normalize_memory_config(app_record.memory_config)["long_term_enabled"]:
@@ -983,7 +1014,17 @@ def create_app(
             errors.append("工作流入口必须指向开始节点")
         for edge in connections:
             source, target = str(edge.get("source") or ""), str(edge.get("target") or "")
-            if source not in ids or (target != "END" and target not in ids):
+            if source not in ids:
+                errors.append("工作流包含指向不存在节点的连线")
+            elif edge.get("conditional"):
+                # Conditional connections use ``<conditional>`` as a storage
+                # placeholder; their real destinations live in ``path_map``.
+                # Validate those destinations instead of treating the placeholder
+                # as an agent ID.
+                destinations = (edge.get("path_map") or {}).values()
+                if any(str(destination) != "END" and str(destination) not in ids for destination in destinations):
+                    errors.append("工作流包含指向不存在节点的连线")
+            elif target != "END" and target not in ids:
                 errors.append("工作流包含指向不存在节点的连线")
             if source == target:
                 errors.append("节点不能连接到自身")
@@ -1019,12 +1060,20 @@ def create_app(
                     continue
                 reached.add(current_id)
                 pending.extend(adjacency.get(current_id, set()) - reached)
+                # Loop and batch child canvases are invoked by their container,
+                # not through ordinary top-level edges.
+                for item in agents:
+                    parent_id = str(item.get("parent_id") or (item.get("config") or {}).get("parent_id") or "")
+                    if parent_id == current_id:
+                        pending.append(str(item.get("id")))
             if reached != ids:
                 errors.append("所有节点必须能够从开始节点到达")
             if ends and str(ends[0].get("id")) not in reached:
                 errors.append("结束节点必须能够从开始节点到达")
         for item, kind in zip(agents, kinds):
             config = item.get("config") or {}
+            if kind in {"agent", "llm"} and not str(item.get("model") or "").strip():
+                errors.append(f"节点“{item.get('name')}”必须单独选择模型")
             if kind == "tool" and not config.get("tool_id"):
                 errors.append(f"工具节点“{item.get('name')}”尚未选择工具")
             if kind in {"condition", "intent", "loop", "batch"} and not any(edge.get("source") == item.get("id") and edge.get("conditional") for edge in connections):
@@ -1043,9 +1092,22 @@ def create_app(
                     errors.append(f"{item.get('name')}内不能嵌套循环或批处理")
         return list(dict.fromkeys(errors))
 
+    def _normalize_workflow_node_names(graph: Dict[str, Any]) -> Dict[str, Any]:
+        labels = {"start":"开始","end":"结束","loop_start":"循环开始","loop_end":"迭代结束","batch_start":"批处理开始","batch_end":"批处理结束","llm":"大模型","knowledge":"知识库","tool":"工具","agent":"智能体","condition":"条件判断","intent":"意图分类","drift_guard":"防漂移检查","script":"脚本","assign":"变量赋值","loop":"循环","batch":"批处理"}
+        counts: Dict[str, int] = {}
+        agents = []
+        for source in graph.get("agents", []):
+            item = dict(source)
+            kind = str((item.get("config") or {}).get("node_kind") or "agent")
+            counts[kind] = counts.get(kind, 0) + 1
+            item["name"] = f"{labels.get(kind, kind)}{counts[kind]}"
+            agents.append(item)
+        return {**graph, "agents": agents}
+
     def _append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
         enriched = {
             **event,
+            "run_id": record.id,
             "sequence": len(record.events) + 1,
             "timestamp": _utc_now(),
         }
@@ -1239,11 +1301,12 @@ def create_app(
                 "project_id": str(record.metadata.get("application_id") or record.workflow_id or "default-project"),
                 "global_id": str(record.metadata.get("owner_user_id") or "default"),
             }
-            async for event in compiled.astream(
+            from ..modules.live_events import live_events
+            async for event in live_events(compiled.astream(
                 run_input,
                 record.recursion_limit,
                 run_id=record.id,
-            ):
+            ), cancel_check=lambda: runs.get(record.id).status == "cancel_requested"):
                 child_events: List[Dict[str, Any]] = []
                 if event.get("type") == "node_start":
                     record.metadata["active_agent"] = event.get("node")
@@ -1265,6 +1328,8 @@ def create_app(
                 # 长任务取消采用协作式检查，避免强杀执行线程导致状态文件损坏。
                 latest = runs.get(record.id)
                 if latest.status == "cancel_requested":
+                    if event.get("type") == "tool_finished":
+                        _append_event(record, event)
                     record.status = "canceled"
                     record.canceled_at = latest.canceled_at or _utc_now()
                     record.finished_at = record.canceled_at
@@ -1272,20 +1337,9 @@ def create_app(
                     runs.save(record)
                     return
                 _append_event(record, event)
-                if event.get("type") == "node_start":
-                    node_config=next((dict(item.get("config") or {}) for item in target.to_dict().get("agents",[]) if item.get("name")==event.get("node")),{})
-                    kb_ids=list(node_config.get("knowledge_base_ids") or [])
-                    if node_config.get("knowledge_base_id"): kb_ids.append(str(node_config["knowledge_base_id"]))
-                    if kb_ids:
-                        names=[]
-                        for kb_id in dict.fromkeys(kb_ids):
-                            try:names.append(knowledge.get_base(kb_id,str(record.metadata.get("owner_user_id") or "local-user")).name)
-                            except KeyError:names.append(kb_id)
-                        _append_event(record,{"type":"knowledge_retrieval_start","node":event.get("node"),"knowledge_base_ids":list(dict.fromkeys(kb_ids)),"knowledge_base_names":names,"message":f"{event.get('node')} 正在查询知识库：{'、'.join(names)}"})
+                if event.get("type") in {"model_started", "model_finished", "model_failed", "answer_delta", "answer_mode", "tool_started", "tool_finished", "skill_applied", "knowledge_retrieval_start", "knowledge_retrieval_end", "progress_summary"}:
+                    continue
                 if event.get("type") == "node_end":
-                    retrieval_metadata=dict((event.get("update") or {}).get("retrieval_metadata") or {})
-                    if retrieval_metadata:
-                        _append_event(record,{"type":"knowledge_retrieval_end","node":event.get("node"),"retrieval_metadata":retrieval_metadata,"citations":list((event.get("update") or {}).get("citations") or []),"message":f"{event.get('node')} 已完成知识库检索，命中 {retrieval_metadata.get('result_count',0)} 条，耗时 {retrieval_metadata.get('latency_ms','—')} ms"})
                     for child_event in child_events:
                         child_event["message"] = child_event.get("message") or (
                             f"{child_event.get('node')} 已完成批处理项"
@@ -1402,8 +1456,9 @@ def create_app(
                 record.metadata["memory_actions"] = actions
             runs.save(record)
         except Exception as e:  # noqa: BLE001 - API persists failures for polling
-            record.status = "failed"
-            record.error = str(e)
+            canceled = runs.get(record.id).status in {"cancel_requested", "canceled"}
+            record.status = "canceled" if canceled else "failed"
+            record.error = None if canceled else str(e)
             record.finished_at = _utc_now()
             record.metadata = {
                 **record.metadata,
@@ -1738,6 +1793,24 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
+    @app.get("/api/runs/{run_id}/files/preview")
+    def get_run_file_preview(run_id: str, request: Request, response: Response, workspace_id: str, path: str) -> Dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            record = _owned_run(run_id, request)
+            # Legacy ownerless runs must not grant access to current local files.
+            if not record.metadata.get("owner_user_id"):
+                raise HTTPException(status_code=403, detail="旧运行缺少归属信息，不能读取当前工作区文件")
+            return preview_run_file(record.events, workspaces, workspace_id, path)
+        except (KeyError, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="运行、工作区或文件不存在；文件可能已删除或移动")
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except OSError:
+            raise HTTPException(status_code=400, detail="无法读取文件，请检查文件权限或占用情况")
+
     @app.get("/api/runs/{run_id}/events")
     async def stream_run_events(run_id: str, request: Request, after: int = 0):
         """用 SSE 推送持久化运行事件；断线后可通过 after 继续。"""
@@ -1747,9 +1820,14 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(e))
 
         async def _event_stream():
-            cursor = max(0, after)
+            try:
+                cursor = max(0, after, int(request.headers.get("last-event-id") or 0))
+            except ValueError:
+                cursor = max(0, after)
             idle_ticks = 0
             while True:
+                if await request.is_disconnected():
+                    break
                 record = runs.get(run_id)
                 while cursor < len(record.events):
                     event = record.events[cursor]
@@ -1769,7 +1847,7 @@ def create_app(
                 idle_ticks += 1
                 if idle_ticks % 15 == 0:
                     yield ": keep-alive\n\n"
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.15)
 
         return StreamingResponse(
             _event_stream(),
@@ -1795,11 +1873,34 @@ def create_app(
         _owned_run(run_id, request)
         return _record_approval_decision(run_id, sequence, approved=False, reason=req.reason)
 
+    approval_locks = {}
+
     def _record_approval_decision(run_id: str, sequence: int, *, approved: bool, reason: str = "") -> Dict[str, Any]:
+        import threading
+        from ..modules.live_events import sink, node_name, cancel_signal
+        lock = approval_locks.setdefault(run_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="该运行正在处理审批，请勿重复提交")
         try:
             record = runs.get(run_id)
-        except KeyError as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            if record.status in {"running", "cancel_requested", "canceled"}:
+                raise HTTPException(status_code=409, detail="该运行正在执行或已取消，不能重复审批")
+            token = sink.set(lambda event: _append_event(record, event))
+            node_token = node_name.set(str(next((e.get("node") for e in record.events if e.get("sequence") == sequence), "")))
+            class ApprovalCancellation:
+                def is_set(self):
+                    return runs.get(run_id).status in {"cancel_requested", "canceled"}
+            cancel_token = cancel_signal.set(ApprovalCancellation())
+            try:
+                return _apply_approval_decision(record, sequence, approved=approved, reason=reason)
+            finally:
+                sink.reset(token)
+                node_name.reset(node_token)
+                cancel_signal.reset(cancel_token)
+        finally:
+            lock.release()
+
+    def _apply_approval_decision(record: RunRecord, sequence: int, *, approved: bool, reason: str = "") -> Dict[str, Any]:
         target = next(
             (
                 event
@@ -1848,6 +1949,12 @@ def create_app(
                     "message": "用户已批准工具请求" if approved else "用户已拒绝工具请求",
                 },
             )
+        record.status = "running"
+        record.finished_at = None
+        record.state = {**dict(record.state or {}), "approval_follow_up": "审批已处理，正在继续执行…"}
+        record.metadata["pending_approval_sequences"] = [int(item.get("sequence") or 0) for item in _unresolved_approvals(record)]
+        runs.save(record)
+        _append_event(record, {"type": "approval_resumed", "node": target.get("node"), "approval_sequence": sequence, "message": "已批准，正在执行工具并继续任务" if approved else "已拒绝该工具，正在整理结果"})
         tool_call = dict(target.get("tool_call") or {})
         if not replay_completed_decision and approved:
             try:
@@ -2096,6 +2203,17 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @app.put("/api/model-connections/auto-routing/{tier}")
+    def update_model_auto_routing(tier: str, req: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            connection_id = str(req.get("connection_id") or "").strip() or None
+            model_connections.assign_auto_tier(tier, connection_id)
+            return model_connections.auto_status()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.put("/api/model-connections/{connection_id}")
     def update_model_connection(connection_id: str, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -2174,7 +2292,7 @@ def create_app(
                 name=req.name,
                 app_type=req.app_type,
                 description=req.description,
-                model=req.model,
+                model="" if req.app_type == "workflow" else req.model,
                 system_prompt=req.system_prompt,
                 avatar_url=req.avatar_url,
                 tool_ids=req.tool_ids,
@@ -2191,10 +2309,10 @@ def create_app(
             draft = Orchestrator()
             if req.app_type == "workflow":
                 entry_id = draft.create_agent(
-                    name="开始", description="接收工作流输入", config={"node_kind": "start", "input_fields": ["input"]}
+                    name="开始1", description="接收工作流输入", config={"node_kind": "start", "input_fields": ["input"]}
                 )
                 end_id = draft.create_agent(
-                    name="结束", description="返回工作流最终输出", config={"node_kind": "end", "output_field": "input"}
+                    name="结束1", description="返回工作流最终输出", config={"node_kind": "end", "output_field": "input"}
                 )
                 draft.connect(entry_id, end_id)
             else:
@@ -2274,7 +2392,7 @@ def create_app(
                     "name": req.name if req.name is not None else current.name,
                     "description": req.description if req.description is not None else current.description,
                     "status": req.status if req.status is not None else current.status,
-                    "model": req.model if req.model is not None else current.model,
+                    "model": "" if current.app_type == "workflow" else (req.model if req.model is not None else current.model),
                     "system_prompt": req.system_prompt if req.system_prompt is not None else current.system_prompt,
                     "avatar_url": req.avatar_url if req.avatar_url is not None else current.avatar_url,
                     "tool_ids": req.tool_ids if req.tool_ids is not None else current.tool_ids,
@@ -2537,6 +2655,7 @@ def create_app(
             current = workflows.get(workflow_id)
             next_graph = req.graph if req.graph is not None else current.graph
             if "workflow" in current.tags:
+                next_graph = _normalize_workflow_node_names(next_graph)
                 errors = _validate_application_workflow(next_graph, app_tool_ids=app_record.tool_ids if app_record else None)
                 if errors:
                     raise ValueError("；".join(errors))
@@ -3484,6 +3603,19 @@ def create_app(
     @app.get("/api/workspaces")
     def list_workspaces() -> List[Dict[str, Any]]:
         return [item.to_dict() for item in workspaces.list()]
+
+    @app.post("/api/workspaces/pick-directory")
+    def pick_workspace_directory() -> Dict[str, Any]:
+        try:
+            selected = _choose_local_directory()
+            if not selected:
+                return {"canceled": True, "path": "", "name": ""}
+            path = Path(selected).resolve()
+            if not path.is_dir():
+                raise ValueError("选择的路径不是可用文件夹")
+            return {"canceled": False, "path": str(path), "name": path.name or str(path)}
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     @app.post("/api/workspaces")
     def create_workspace(req: CreateWorkspaceReq) -> Dict[str, Any]:

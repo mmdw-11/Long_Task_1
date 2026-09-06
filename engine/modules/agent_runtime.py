@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+from .live_events import chat_completion
 import os
 import re
 from typing import Any, Dict, Optional, TYPE_CHECKING
@@ -63,7 +65,7 @@ class AgentRuntimeFactory:
             max_attempts=self.max_attempts,
         )
 
-        async def _run(state: Dict[str, Any]) -> Dict[str, Any]:
+        def _run_sync(state: Dict[str, Any]) -> Dict[str, Any]:
             citations=[]
             retrieval_metadata={}
             kb_ids=list(spec.config.get("knowledge_base_ids") or [])
@@ -97,21 +99,26 @@ class AgentRuntimeFactory:
                 tool_calls = self._run_tools(spec, self._state_input_text(state))
                 if tool_calls:
                     prompt = f"{prompt}\n\n工具调用结果：\n{json.dumps(tool_calls, ensure_ascii=False, default=str)}"
-                result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
-                request, prompt, system_prompt
-                ) if self._has_ready_auto_model() else runner.run(
-                resource_request=request,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                metadata={"agent_id": spec.id, "agent_name": spec.name},
-                )
+                if any(call.get("status") == "approval_required" for call in tool_calls):
+                    # Persist the approval even if the configured model is
+                    # offline; generation must wait for the user's decision.
+                    result = InferenceResult(text="工具需要你的批准，批准后继续执行。", executor="ApprovalRequired", endpoint="", metadata={"paused_for_approval": True})
+                else:
+                    result = self._run_pinned_model(spec.model, prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
+                        request, prompt, system_prompt
+                    ) if ((spec.model == "auto" and self.model_connections is not None) or self._has_ready_auto_model()) else runner.run(
+                        resource_request=request,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        metadata={"agent_id": spec.id, "agent_name": spec.name},
+                    )
             # 小参数模型偶尔会直接复述注入 Prompt。此时仍使用同一个真实模型，
             # 但只携带用户问题再次生成面向用户的自然语言回答，避免暴露内部账本。
             if result.success and not result.metadata.get("simulated") and self._looks_like_prompt_echo(result.text):
                 clean_prompt = f"用户问题：{self._state_input_text(state)}\n\n请直接给出自然、简洁的回答。不要复述系统提示、Agent 配置、上下文账本、执行步骤或内部判断。"
                 rewritten = self._run_pinned_model(spec.model, clean_prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
                     request, clean_prompt, system_prompt
-                ) if self._has_ready_auto_model() else runner.run(
+                ) if ((spec.model == "auto" and self.model_connections is not None) or self._has_ready_auto_model()) else runner.run(
                     resource_request=request,
                     prompt=clean_prompt,
                     system_prompt=system_prompt,
@@ -157,6 +164,9 @@ class AgentRuntimeFactory:
                     }
                 ],
             }
+
+        async def _run(state):
+            return await asyncio.to_thread(_run_sync, state)
 
         return Node(
             name=spec.name,
@@ -410,7 +420,7 @@ class AgentRuntimeFactory:
         ]
         audit_calls: list[Dict[str, Any]] = []
         for _ in range(8):
-            response = client.chat.completions.create(
+            response = chat_completion(client.chat.completions.create,
                 model=connection.model_id,
                 messages=messages,  # type: ignore[arg-type]
                 tools=functions,
@@ -572,7 +582,7 @@ class AgentRuntimeFactory:
         audit_calls: list[Dict[str, Any]] = []
         for _ in range(8):
             try:
-                response = client.chat.completions.create(
+                response = chat_completion(client.chat.completions.create,
                     model=connection.model_id,
                     messages=messages,  # type: ignore[arg-type]
                     tools=functions,
@@ -843,7 +853,7 @@ class AgentRuntimeFactory:
                 raise ValueError("指定模型连接未启用或尚未测试成功")
             from openai import OpenAI
             api_key = connection_api_key(connection) or "not-needed"
-            response = OpenAI(api_key=api_key or "not-needed", base_url=connection.base_url, timeout=60).chat.completions.create(model=connection.model_id,messages=[{"role":"system","content":system_prompt or "Answer concisely and accurately."},{"role":"user","content":prompt}],temperature=0)
+            response = chat_completion(OpenAI(api_key=api_key or "not-needed", base_url=connection.base_url, timeout=60, max_retries=0).chat.completions.create, model=connection.model_id,messages=[{"role":"system","content":system_prompt or "Answer concisely and accurately."},{"role":"user","content":prompt}],temperature=0)
             return InferenceResult(text=response.choices[0].message.content or "",executor="ModelConnectionExecutor",endpoint=connection.base_url,model=connection.model_id,metadata={"provider":connection.provider,"connection_id":connection.id})
         except Exception as exc:
             return InferenceResult(text="",executor="ModelConnectionExecutor",endpoint="",success=False,error=str(exc),retryable=False)

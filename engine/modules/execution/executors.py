@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from ..live_events import chat_completion
 import os
 from typing import Any, Dict, Optional
 
@@ -87,7 +88,7 @@ class OpenAICompatibleExecutor(InferenceExecutor):
 
             client = OpenAI(api_key=api_key or "not-needed", base_url=endpoint, timeout=self.timeout_seconds)
             system = request.system_prompt or "Answer concisely and accurately."
-            response = client.chat.completions.create(
+            response = chat_completion(client.chat.completions.create,
                 model=model,
                 messages=[
                     {"role": "system", "content": system},
@@ -107,6 +108,9 @@ class OpenAICompatibleExecutor(InferenceExecutor):
                 metadata={"usage": usage_data, "backend": self.label},
             )
         except Exception as exc:  # noqa: BLE001 - 在线产品链路优先降级而不是中断
+            from ..live_events import sink
+            if sink.get() is not None:
+                return InferenceResult(text="", executor=type(self).__name__, endpoint=endpoint, model=model, success=False, error=str(exc), retryable=False)
             if self.fallback is not None:
                 result = self.fallback.run(request)
                 result.metadata = {
@@ -168,6 +172,8 @@ class EdgeHttpExecutor(InferenceExecutor):
 
         try:
             import requests
+            from ..live_events import emit
+            emit("answer_mode", message="当前边侧服务使用整段响应协议，完成后显示正文")
 
             response = requests.post(
                 endpoint,
@@ -219,7 +225,7 @@ class OpenAICompatibleCloudExecutor(InferenceExecutor):
             "You are the cloud executor for complex tasks. "
             "Answer concisely and structurally."
         )
-        response = client.chat.completions.create(
+        response = chat_completion(client.chat.completions.create,
             model=self.model or settings.model,
             messages=[
                 {"role": "system", "content": system},

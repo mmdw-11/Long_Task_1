@@ -39,9 +39,22 @@ process.stdout.write(JSON.stringify(sandbox.result));
 '''
 
 
+def _sanitize_unicode(value: Any) -> Any:
+    """Replace isolated UTF-16 surrogate code units left by clipboard input."""
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, list):
+        return [_sanitize_unicode(item) for item in value]
+    if isinstance(value, dict):
+        return {str(_sanitize_unicode(key)): _sanitize_unicode(item) for key, item in value.items()}
+    return value
+
+
 def run_workflow_script(language: str, code: str, params: Dict[str, Any], timeout_seconds: float = 5) -> Dict[str, Any]:
     """Execute user transformation code with no inherited secrets or working directory access."""
     language = language.lower().strip()
+    code = str(_sanitize_unicode(code))
+    params = _sanitize_unicode(params)
     timeout = max(0.2, min(float(timeout_seconds), 30.0))
     if len(code.encode("utf-8")) > 100_000:
         raise ValueError("脚本不能超过 100 KB")

@@ -154,6 +154,9 @@ class KnowledgeStore:
         with self.conn:self.conn.execute("DELETE FROM knowledge_chunks WHERE id=? AND kb_id=?",(chunk_id,kb_id))
         self._counts(kb_id)
     def retrieve(self,kb_ids:list[str],query:str,*,owner:str,mode:str="hybrid",top_k:int=5,threshold:float=0.15,labels:list[str]|None=None,document_ids:list[str]|None=None,bindings:dict[str,dict]|None=None,application_id:str="",workflow_id:str="",run_id:str="")->dict[str,Any]:
+        from ..live_events import emit
+        names = [self.get_base(kb_id, owner).name for kb_id in kb_ids]
+        emit("knowledge_retrieval_start", knowledge_base_ids=kb_ids, knowledge_base_names=names, message="正在检索知识库：" + "、".join(names))
         started=time.perf_counter();query=" ".join(str(query).split())
         if not query:raise ValueError("query 不能为空")
         allowed=[]
@@ -168,6 +171,7 @@ class KnowledgeStore:
         results.sort(key=lambda x:x["score"],reverse=True);results=results[:max(1,min(50,top_k))];latency=round((time.perf_counter()-started)*1000,2)
         log={"id":ident("kr"),"knowledge_base_ids":kb_ids,"application_id":application_id,"workflow_id":workflow_id,"run_id":run_id,"query":query,"rewritten_query":query,"retrieval_mode":mode,"top_k":top_k,"threshold":threshold,"result_count":len(results),"latency_ms":latency,"results":results,"created_at":now()}
         with self.conn:self.conn.execute("INSERT INTO knowledge_logs VALUES(?,?,?)",(log["id"],",".join(kb_ids),json.dumps(log,ensure_ascii=False)))
+        emit("knowledge_retrieval_end", knowledge_base_ids=kb_ids, result_count=len(results), duration_ms=latency, message=f"知识库检索完成，命中 {len(results)} 条，耗时 {latency} ms")
         return {"documents":results,"citations":[{k:r[k] for k in ("chunk_id","document_id","knowledge_base_id","filename","title","page_number","score")} for r in results],"context":"\n\n".join(f"[来源 {i+1}: {r['filename']}]\n{r['content']}" for i,r in enumerate(results)),"retrieval_metadata":{"query":query,"mode":mode,"latency_ms":latency,"result_count":len(results),"log_id":log["id"]}}
     def logs(self,kb_id:str)->list[dict[str,Any]]:return [json.loads(r["data"]) for r in self.conn.execute("SELECT data FROM knowledge_logs WHERE kb_id LIKE ? ORDER BY rowid DESC",(f"%{kb_id}%",))]
     def statistics(self,kb_id:str)->dict[str,Any]:
