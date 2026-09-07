@@ -13,11 +13,12 @@ JSON/JSONL 中常见字段名。无法识别的样本会被跳过，而不是让
 from __future__ import annotations
 
 import random
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .io import read_json_or_jsonl, write_jsonl
-from .long_task import LongTaskExample, memory_contains_expected
+from .long_task import LongTaskExample, _chunk_history, _lexical_candidates, memory_contains_expected
 from .types import MemoryExample, SkillExample, WorkflowExample
 
 
@@ -52,7 +53,11 @@ def sample_memory_examples(
     if stratified:
         groups: Dict[str, List[MemoryExample]] = {}
         for example in examples:
-            question_type = str(example.metadata.get("question_type") or "unspecified")
+            question_type = str(
+                example.metadata.get("question_type")
+                or example.metadata.get("category")
+                or "unspecified"
+            )
             groups.setdefault(question_type, []).append(example)
         for group in groups.values():
             rng.shuffle(group)
@@ -162,7 +167,9 @@ def build_workflow_dataset(
 
 
 def build_long_task_dataset_from_memory(
-    examples: List[MemoryExample], *, count: int = 100, seed: int = 42
+    examples: List[MemoryExample], *, count: int = 100, seed: int = 42,
+    direct_fact_only: bool = False, retrieval_anchor_only: bool = False,
+    dense_candidate_k: int = 0, stratified: bool = False,
 ) -> List[LongTaskExample]:
     """Build state-governance tasks from normalized LoCoMo question records.
 
@@ -170,7 +177,42 @@ def build_long_task_dataset_from_memory(
     constraints, disturbance and interruption are deterministic overlays that
     make ledger, drift and budget behavior observable in a short experiment.
     """
-    selected = sample_memory_examples(examples, count=count, seed=seed)
+    source_examples = list(examples)
+    if direct_fact_only:
+        source_examples = [
+            item for item in source_examples
+            if any(memory_contains_expected(item.answer, memory) for memory in item.memories)
+        ]
+        if len(source_examples) < count:
+            raise ValueError(
+                f"only {len(source_examples)} direct-fact examples available; requested {count}"
+            )
+    if retrieval_anchor_only:
+        source_examples = [
+            item for item in source_examples
+            if any(
+                memory_contains_expected(item.answer, memory)
+                and _query_evidence_anchor_count(item.question, memory) >= 1
+                for memory in item.memories
+            )
+        ]
+        if len(source_examples) < count:
+            raise ValueError(
+                f"only {len(source_examples)} retrieval-anchored examples available; requested {count}"
+            )
+    if dense_candidate_k:
+        source_examples = [
+            item for item in source_examples
+            if memory_contains_expected(
+                item.answer,
+                "\n".join(_lexical_candidates(item.question, _chunk_history(item.memories), limit=dense_candidate_k)),
+            )
+        ]
+        if len(source_examples) < count:
+            raise ValueError(
+                f"only {len(source_examples)} dense-candidate-recall examples available; requested {count}"
+            )
+    selected = sample_memory_examples(source_examples, count=count, seed=seed, stratified=stratified)
     tasks: List[LongTaskExample] = []
     for index, item in enumerate(selected):
         domain = str(item.metadata.get("domain") or item.source or "对话任务")
@@ -204,6 +246,10 @@ def build_long_task_dataset_from_memory(
                     "source": item.source,
                     "trajectory_id": item.trajectory_id or item.id,
                     "question": item.question,
+                    "direct_fact_subset": str(direct_fact_only).lower(),
+                    "retrieval_anchor_subset": str(retrieval_anchor_only).lower(),
+                    "dense_candidate_k": str(dense_candidate_k),
+                    "question_category": str(item.metadata.get("category") or item.metadata.get("question_type") or "unknown"),
                 },
             )
         )
@@ -519,6 +565,12 @@ def _string_list(value: Any) -> List[str]:
 
 def _norm(text: str) -> str:
     return "".join(str(text).lower().split())
+
+
+def _query_evidence_anchor_count(question: str, evidence: str) -> int:
+    question_terms = set(re.findall(r"[a-z0-9]{2,}|[\u3400-\u9fff]", str(question).lower()))
+    evidence_terms = set(re.findall(r"[a-z0-9]{2,}|[\u3400-\u9fff]", str(evidence).lower()))
+    return len(question_terms & evidence_terms)
 
 
 def _fallback_expected_steps(trajectory: str) -> List[str]:

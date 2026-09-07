@@ -362,7 +362,7 @@ def test_long_task_joint_experiment_exercises_all_controls(tmp_path):
     assert plain.summary()["avg_pause_correctness"] == 1.0
     assert all(
         row.metadata["evaluation_policy"]
-        == "shared_prompt_shared_disturbances_layered_readiness_v5"
+        == "shared_direct_fact_qa_plus_separate_governance_v7"
         for row in full.rows + plain.rows
     )
 
@@ -377,7 +377,7 @@ def test_long_task_reports_basic_readiness_separately_from_disturbance_handling(
 
     assert row.metrics["basic_task_readiness"] == 1
     assert row.metrics["disturbance_handling_score"] == pytest.approx(1 / 3)
-    assert row.metrics["final_task_success"] == 0
+    assert row.metrics["final_task_success"] == 1
     assert row.metrics["recovery_success"] == 0
 
 

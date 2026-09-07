@@ -29,6 +29,14 @@ def main() -> None:
     parser.add_argument("--output-dir", default="runs/experiments/long_task")
     parser.add_argument("--max-context-tokens", type=int, default=16384)
     parser.add_argument("--reserved-output-tokens", type=int, default=2048)
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--candidate-k", type=int, default=20)
+    parser.add_argument("--evidence-token-budget", type=int, default=12000)
+    parser.add_argument("--qa-solver", choices=["llm", "extractive"], default="llm")
+    parser.add_argument("--qa-model", default="")
+    parser.add_argument("--qa-judge-model", default="")
+    parser.add_argument("--embedding-backend", choices=["hashing", "bge_m3"], default="bge_m3")
+    parser.add_argument("--bge-batch-size", type=int, default=32)
     args = parser.parse_args()
 
     examples = load_long_task_dataset(args.dataset) if args.dataset else build_long_task_dataset(size=args.size, seed=args.seed)
@@ -41,6 +49,14 @@ def main() -> None:
                 output_root=args.output_dir,
                 max_context_tokens=args.max_context_tokens,
                 reserved_output_tokens=args.reserved_output_tokens,
+                top_k=args.top_k,
+                candidate_k=args.candidate_k,
+                evidence_token_budget=args.evidence_token_budget,
+                qa_solver=args.qa_solver,
+                qa_model=args.qa_model,
+                qa_judge_model=args.qa_judge_model,
+                embedding_backend=args.embedding_backend,
+                bge_batch_size=args.bge_batch_size,
             ),
         )
         paths = save_report(report, Path(args.output_dir) / method)

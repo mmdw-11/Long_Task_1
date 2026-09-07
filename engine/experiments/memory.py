@@ -307,6 +307,8 @@ def _answer_question(question: str, context: str, cfg: MemoryExperimentConfig) -
             model=cfg.qa_model or settings.model,
             messages=[{"role": "system", "content": QA_SYSTEM_PROMPT}, {"role": "user", "content": _qa_prompt(question, context)}],
             temperature=0,
+            # Keep generation and judging in the same non-thinking evaluation mode.
+            extra_body={"thinking": {"type": "disabled"}},
         )
         usage = getattr(response, "usage", None)
         usage_data = json.loads(usage.model_dump_json()) if usage is not None else {}

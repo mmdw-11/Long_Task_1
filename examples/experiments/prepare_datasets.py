@@ -42,6 +42,10 @@ def main() -> None:
     state.add_argument("--output", required=True)
     state.add_argument("--count", type=int, default=100)
     state.add_argument("--seed", type=int, default=42)
+    state.add_argument("--direct-fact-only", action="store_true", help="只保留答案可在原始历史中直接定位的 QA")
+    state.add_argument("--retrieval-anchor-only", action="store_true", help="只保留问题与答案证据至少共享一个词项的检索诊断题")
+    state.add_argument("--dense-candidate-k", type=int, default=0, help="只保留可被混合检索第一阶段候选召回的直接事实题")
+    state.add_argument("--stratified", action="store_true", help="按 question_type/category 轮转抽样")
 
     skills = subparsers.add_parser("skills", help="create the balanced 30-item repeated-task dataset")
     skills.add_argument("--output", required=True)
@@ -60,7 +64,15 @@ def main() -> None:
         print({"output": str(path), "questions": len(examples), "trajectories": len({item.trajectory_id or item.id for item in examples})})
     elif args.command == "state":
         source = load_memory_dataset(args.input, source="locomo")
-        examples = build_long_task_dataset_from_memory(source, count=args.count, seed=args.seed)
+        examples = build_long_task_dataset_from_memory(
+            source,
+            count=args.count,
+            seed=args.seed,
+            direct_fact_only=args.direct_fact_only,
+            retrieval_anchor_only=args.retrieval_anchor_only,
+            dense_candidate_k=args.dense_candidate_k,
+            stratified=args.stratified,
+        )
         path = save_jsonl(args.output, long_task_examples_to_rows(examples))
         print({"output": str(path), "tasks": len(examples)})
     else:

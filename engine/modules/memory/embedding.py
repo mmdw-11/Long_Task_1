@@ -90,7 +90,7 @@ class BGEM3EmbeddingModel:
             return_sparse=False,
             return_colbert_vecs=False,
         )
-        dense = output["dense_embeds"][0].tolist()
+        dense = _dense_output(output)[0].tolist()
         return dense
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
@@ -103,4 +103,14 @@ class BGEM3EmbeddingModel:
             return_sparse=False,
             return_colbert_vecs=False,
         )
-        return [vec.tolist() for vec in output["dense_embeds"]]
+        return [vec.tolist() for vec in _dense_output(output)]
+
+
+def _dense_output(output):
+    """Support both legacy and current FlagEmbedding BGE-M3 result keys."""
+    dense = output.get("dense_embeds")
+    if dense is None:
+        dense = output.get("dense_vecs")
+    if dense is None:
+        raise KeyError(f"BGE-M3 response has no dense vectors; keys={sorted(output)}")
+    return dense
