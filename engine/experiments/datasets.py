@@ -182,7 +182,18 @@ def build_long_task_dataset_from_memory(
                 id=f"state-{item.id}",
                 goal=f"基于历史对话回答问题，并生成可审计的{domain}结果",
                 hard_constraints=["不得使用未验证事实", "最终回答必须保留问题要求的关键信息"],
-                plan=["读取历史状态", "检索相关事实", "核验约束", "生成最终结果"],
+                plan=[
+                    "解析问题与交付目标",
+                    "载入历史会话索引",
+                    "按问题生成检索查询",
+                    "召回候选历史片段",
+                    "过滤无关与冲突信息",
+                    "交叉核验关键事实",
+                    "合并多会话证据",
+                    "检查新增约束与隐私边界",
+                    "生成带依据的最终结果",
+                    "执行终稿一致性检查",
+                ],
                 memory_query=item.question,
                 memory_fact=fact,
                 expected_memory=item.answer,
@@ -259,13 +270,28 @@ def build_skill_reuse_dataset(*, size: int = 30, seed: int = 42) -> List[SkillEx
         raise ValueError("size must be a positive multiple of 3")
     rng = random.Random(seed)
     families = [
-        ("email", "处理客户邮件并回复", ["读取邮件", "提取行动项", "检查发送权限", "生成并核对回复"], "检查发送权限"),
-        ("calendar", "安排会议并检查日历冲突", ["读取参与人日历", "检查时间冲突", "确认时区", "创建提醒"], "确认时区"),
-        ("travel_report", "生成旅行规划并输出报告", ["确认行程约束", "比较候选方案", "核验预算", "生成最终报告"], "核验预算"),
+        (
+            "email",
+            "处理包含附件、历史线程与敏感信息的客户邮件并回复",
+            ["读取邮件", "识别客户与历史线程", "提取行动项", "核验附件与引用", "检查发送权限", "处理敏感信息", "生成回复", "复核并记录发送结果"],
+            ["检查发送权限", "处理敏感信息"],
+        ),
+        (
+            "calendar",
+            "跨时区安排多人会议并处理资源和冲突",
+            ["读取参与人日历", "收集可用时间窗口", "检查时间冲突", "确认参与人时区", "检查会议室与资源", "处理优先级冲突", "创建会议与提醒", "复核邀请送达状态"],
+            ["确认参与人时区", "处理优先级冲突"],
+        ),
+        (
+            "travel_report",
+            "规划多城市行程并生成带预算和风险说明的报告",
+            ["确认行程约束", "收集交通与住宿候选", "比较候选方案", "核验总预算", "检查签证与时间衔接", "评估取消与延误风险", "生成最终报告", "复核来源与应急方案"],
+            ["核验总预算", "检查签证与时间衔接"],
+        ),
     ]
     examples: List[SkillExample] = []
     per_family = size // len(families)
-    for task_type, task, steps, critical_step in families:
+    for task_type, task, steps, critical_steps in families:
         for index in range(per_family):
             variant = rng.choice(["预算优先", "时间优先", "风险优先"])
             examples.append(
@@ -279,7 +305,8 @@ def build_skill_reuse_dataset(*, size: int = 30, seed: int = 42) -> List[SkillEx
                     metadata={
                         "variant": variant,
                         "split": "train" if index < 3 else "test",
-                        "critical_steps": [critical_step],
+                        "critical_steps": list(critical_steps),
+                        "workflow_depth": len(steps),
                     },
                 )
             )

@@ -166,6 +166,8 @@ def _evaluate_held_out(
         expected="; ".join(example.expected_steps),
         metrics={
             "task_success": int(task_success),
+            "required_steps": len(example.expected_steps),
+            "critical_steps": len(critical_steps),
             "basic_task_readiness": int(basic_task_readiness),
             "step_coverage": coverage,
             "base_plan_coverage": base_coverage,
@@ -187,6 +189,7 @@ def _evaluate_held_out(
             "split": "test",
             "plan_policy": "shared_task_native_base_plus_optional_skill",
             "base_steps": base_steps,
+            "complexity_policy": "eight_stage_two_critical_checks_v5",
         },
     )
 
@@ -199,9 +202,9 @@ def _baseline_plan(example: SkillExample) -> List[str]:
     available in a richer manual skill.
     """
     library: Dict[str, List[str]] = {
-        "email": ["读取邮件", "生成并核对回复"],
-        "calendar": ["读取参与人日历", "创建提醒"],
-        "travel_report": ["确认行程约束", "生成最终报告"],
+        "email": ["读取邮件", "识别客户与历史线程", "提取行动项", "生成回复"],
+        "calendar": ["读取参与人日历", "收集可用时间窗口", "检查时间冲突", "创建会议与提醒"],
+        "travel_report": ["确认行程约束", "收集交通与住宿候选", "比较候选方案", "生成最终报告"],
     }
     return list(library.get(example.task_type, ["确认任务目标", "核对最终结果"]))
 
@@ -217,9 +220,9 @@ def _learned_skill_from_trajectories(examples: List[SkillExample]) -> str:
 
 def _manual_skill(example: SkillExample) -> str:
     library: Dict[str, List[str]] = {
-        "email": ["读取邮件", "提取行动项", "生成并核对回复"],
-        "calendar": ["读取参与人日历", "检查时间冲突", "创建提醒"],
-        "travel_report": ["确认行程约束", "比较候选方案", "生成最终报告"],
+        "email": ["读取邮件", "识别客户与历史线程", "提取行动项", "核验附件与引用", "生成回复", "复核并记录发送结果"],
+        "calendar": ["读取参与人日历", "收集可用时间窗口", "检查时间冲突", "检查会议室与资源", "创建会议与提醒", "复核邀请送达状态"],
+        "travel_report": ["确认行程约束", "收集交通与住宿候选", "比较候选方案", "评估取消与延误风险", "生成最终报告", "复核来源与应急方案"],
     }
     return _render_skill(example, library.get(example.task_type, ["确认目标", "执行关键步骤", "核对结果"]))
 
@@ -235,7 +238,7 @@ def _render_skill(example: SkillExample, steps: List[str]) -> str:
 
 def _trajectory_steps(trajectory: str) -> List[str]:
     cleaned = re.sub(r"^(成功轨迹|成功经验)[:：]", "", trajectory.strip())
-    return [part.strip(" 。；;，,") for part in re.split(r"[。；;，,\n]", cleaned) if part.strip(" 。；;，,")][:6]
+    return [part.strip(" 。；;，,") for part in re.split(r"[。；;，,\n]", cleaned) if part.strip(" 。；;，,")][:12]
 
 
 def _coverage(expected_steps: List[str], content: str) -> float:

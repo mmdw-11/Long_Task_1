@@ -125,7 +125,11 @@ def build_long_task_dataset(*, size: int = 100, seed: int = 42) -> List[LongTask
                 id=f"long-task-{index:03d}",
                 goal=f"完成{domain}并给出可审计的最终结果",
                 hard_constraints=["不得使用未验证事实", "输出必须保留来源标识"],
-                plan=["读取历史状态", "执行核心任务", "验证约束", "生成最终结果"],
+                plan=[
+                    "解析目标与交付要求", "载入历史状态", "建立候选事实集合", "检索相关事实",
+                    "过滤干扰信息", "交叉核验来源", "整合中间结论", "检查新增约束",
+                    "生成最终结果", "执行终稿一致性检查",
+                ],
                 memory_query=f"{domain}的历史确认码是什么？",
                 memory_fact=f"{domain}的历史确认码是 {code}。",
                 expected_memory=code,
@@ -217,7 +221,9 @@ def _run_one(
     drift_detected = False
     pause_correct = False
     recovery_success = False
-    steps = 3
+    planned_steps = len(example.plan)
+    repeated_stall_steps = 3
+    steps = planned_steps + repeated_stall_steps
     if method.ledger:
         policy = ContextPolicy(
             max_context_tokens=cfg.max_context_tokens,
@@ -244,7 +250,18 @@ def _run_one(
         goal_retention = example.goal in context_text
         constraint_compliance = all(item in context_text for item in state["hard_constraints"])
 
-        for step in range(1, steps + 1):
+        # Execute the complete multi-stage plan, then inject three identical
+        # stalled worker events so drift handling is tested after real progress.
+        for step, plan_step in enumerate(example.plan, 1):
+            ledger_store.on_step_start(run_id=example.id, step=step, frontier=["worker"], state=state)
+            ledger = ledger_store.on_node_end(
+                run_id=example.id,
+                node="worker",
+                step=step,
+                update={"result": f"已完成：{plan_step}"},
+                state=state,
+            )
+        for step in range(planned_steps + 1, steps + 1):
             ledger_store.on_step_start(run_id=example.id, step=step, frontier=["worker"], state=state)
             ledger = ledger_store.on_node_end(
                 run_id=example.id,
@@ -328,12 +345,15 @@ def _run_one(
             "history_tokens": rough_token_count(history_text),
             "budget_limit": budget_limit,
             "steps": steps,
+            "planned_steps": planned_steps,
+            "repeated_stall_steps": repeated_stall_steps,
             "execution_ms": (time.perf_counter() - started) * 1000,
         },
         metadata={
             "method": method.name,
             "evaluation_policy": "shared_prompt_shared_disturbances_layered_readiness_v5",
             "final_success_scope": "strict conjunction of task signals and governance controls",
+            "complexity_policy": "ten_stage_plan_plus_three_post_progress_stalls_v6",
             **example.metadata,
         },
     )

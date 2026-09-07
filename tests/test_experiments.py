@@ -354,6 +354,8 @@ def test_long_task_joint_experiment_exercises_all_controls(tmp_path):
     assert full.summary()["avg_memory_use_accuracy"] == 1.0
     assert full.summary()["avg_pause_correctness"] == 1.0
     assert full.summary()["avg_recovery_success"] == 1.0
+    assert full.summary()["avg_planned_steps"] == 10.0
+    assert full.summary()["avg_steps"] == 13.0
     assert plain.summary()["pass_rate"] == 0.0
     assert plain.summary()["avg_goal_retention"] == 1.0
     assert plain.summary()["avg_constraint_compliance"] == 1.0
@@ -420,6 +422,14 @@ def test_no_skill_uses_shared_base_plan_without_fake_retrieval(tmp_path):
     assert summary["avg_critical_step_coverage"] == 0.0
     assert summary["avg_retrieval_hit"] == 0.0
     assert summary["avg_skill_coverage_gain"] == 0.0
+    assert all(len(row.expected.split("; ")) == 8 for row in report.rows)
+    assert all(len(row.metadata["base_steps"]) == 4 for row in report.rows)
+    assert summary["avg_required_steps"] == 8.0
+    assert summary["avg_critical_steps"] == 2.0
+    assert all(
+        row.metadata["complexity_policy"] == "eight_stage_two_critical_checks_v5"
+        for row in report.rows
+    )
     assert all(
         row.metadata["plan_policy"] == "shared_task_native_base_plus_optional_skill"
         for row in report.rows
