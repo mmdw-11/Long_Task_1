@@ -22,6 +22,7 @@ from engine.experiments.types import MemoryExample, SkillExample
 from engine.experiments.datasets import load_memory_dataset, memory_examples_to_rows, sample_memory_examples
 from engine.experiments.long_task import memory_contains_expected
 from engine.experiments.memory import (
+    _answer_f1,
     _disable_mem0_thinking,
     _engine_memory_context,
     _engine_retrieved_text,
@@ -30,6 +31,16 @@ from engine.experiments.memory import (
     _select_evidence_chunks,
     _yes_verdict,
 )
+
+
+def test_answer_f1_accepts_semantically_equivalent_llm_judged_answers():
+    assert _answer_f1("2", "twice", semantic_equivalent=True) == 1.0
+    assert _answer_f1(
+        "Nate taught people vegan ice cream recipes on his cooking show.",
+        "teaching others, cooking show",
+        semantic_equivalent=True,
+    ) == 1.0
+    assert _answer_f1("2", "twice") == 0.0
 from engine.modules.memory.judge import OpenAIMemoryJudge
 
 

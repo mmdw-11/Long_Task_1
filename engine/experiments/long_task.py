@@ -29,7 +29,7 @@ from engine.modules.context import (
 from engine.modules.context.budget import rough_token_count
 from engine.modules.memory import BGEM3EmbeddingModel, HybridTieredMemoryStore, MemoryContext, MemoryScope, RetrievalMode
 
-from .memory import MemoryExperimentConfig, _answer_question, _judge_qa_answer
+from .memory import MemoryExperimentConfig, _answer_f1, _answer_question, _judge_qa_answer
 from .reports import ExperimentReport
 from .types import ExperimentRow, MemoryExample
 
@@ -424,7 +424,11 @@ def _run_one(
     qa_correct, judge_usage, judge_response, judge_error = _judge_qa_answer(
         qa_example, prediction, qa_cfg, qa_error=qa_error
     )
-    answer_f1 = _answer_f1(prediction, example.expected_memory)
+    answer_f1 = _answer_f1(
+        prediction,
+        example.expected_memory,
+        semantic_equivalent=qa_correct and qa_cfg.qa_solver == "llm",
+    )
     evidence_sufficient, evidence_judge_error = _judge_evidence_sufficiency(
         example, retrieval.evidence, cfg
     )
@@ -1064,14 +1068,3 @@ def _default_plan() -> List[str]:
         "生成带依据的最终结果", "执行终稿一致性检查",
     ]
 
-
-def _answer_f1(prediction: str, answer: str) -> float:
-    predicted = _normalized_fact_tokens(prediction)
-    expected = _normalized_fact_tokens(answer)
-    if not predicted or not expected:
-        return float(predicted == expected)
-    hits = sum(min(predicted.count(token), expected.count(token)) for token in set(predicted))
-    if not hits:
-        return 0.0
-    precision, recall = hits / len(predicted), hits / len(expected)
-    return round(2 * precision * recall / (precision + recall), 6)
