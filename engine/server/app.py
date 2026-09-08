@@ -83,6 +83,8 @@ from ..modules.memory import HybridTieredMemoryStore, MemoryBankRuntime, MemoryC
 from ..modules.security_ops import ApiAuditRecord, ApiAuditStore, utc_now
 from ..modules.skills import (
     SkillEvolutionService,
+    SkillInstallationStore,
+    SkillSemanticIndex,
     SkillRepository,
     SkillRetriever,
     SkillStatus,
@@ -113,14 +115,18 @@ def _choose_local_directory() -> str:
         root.destroy()
 
 
+def _builtin_content(name: str, scene: str, inputs: str, steps: str, constraints: str, output: str, example: str) -> str:
+    return f"# {name}\n\n## 目标\n{scene}\n\n## 适用场景\n{scene}\n\n## 输入要求\n{inputs}\n\n## 执行步骤\n{steps}\n\n## 约束\n{constraints}\n\n## 输出格式\n{output}\n\n## 示例\n{example}\n\n## 校验方式\n检查输出是否覆盖输入要求、关键结论和待确认信息。"
+
+
 BUILTIN_SKILLS = [
-    {"slug":"email-writer","name":"商务邮件撰写","category":"通用办公","description":"根据收件人、目的和语气起草清晰、可发送的商务邮件。","content":"# 商务邮件撰写\n\n先确认收件人、主题、目的和语气；给出结构化邮件草稿。发送前必须请求用户确认。"},
-    {"slug":"research-report","name":"研究报告","category":"内容创意","description":"把研究主题拆解为目标、证据、结论与待验证项，避免虚构来源。","content":"# 研究报告\n\n先列出研究问题和证据需求，输出结论时标识事实、推断和待核验项。"},
-    {"slug":"travel-planner","name":"旅行计划","category":"通用办公","description":"生成兼顾时间、预算、天气与交通的行程方案。","content":"# 旅行计划\n\n确认目的地、日期、预算、同行人和偏好；涉及实时信息时建议调用已授权工具。"},
-    {"slug":"meeting-summary","name":"会议纪要","category":"通用办公","description":"将会议材料整理为结论、行动项、负责人和截止时间。","content":"# 会议纪要\n\n以结论、行动项、负责人、截止时间四部分输出；缺失信息明确标记待补充。"},
-    {"slug":"web-design","name":"网页设计","category":"代码开发","description":"把用户需求转为信息架构、界面层级和可实施的前端建议。","content":"# 网页设计\n\n先给出页面目标、用户路径和组件清单，再输出可实施的视觉与交互建议。"},
-    {"slug":"software-engineer","name":"本地软件工程","category":"代码开发","description":"在已选工作区内规划、修改、测试和审查代码，并坚持验收标准与最小修改范围。","content":"# 本地软件工程\n\n先读取工作区和相关代码，再给出简洁计划。需要修改时只调用已挂载的工作区工具；每次写入或测试均等待审批。修改后必须读取 diff 并运行适当测试。出现错误时依据真实日志定位原因，避免猜测。不得访问工作区外路径，不得声称未执行的测试已经通过。"},
-    {"slug":"data-analysis","name":"数据分析","category":"金融","description":"帮助解释指标、识别异常并给出可复现的分析路径。","content":"# 数据分析\n\n明确数据范围与口径，区分计算结果和业务推断，给出复核步骤。"},
+    {"slug":"email-writer","name":"商务邮件撰写","category":"通用办公","scenarios":["写作","沟通"],"description":"根据收件人、目的和语气起草清晰、可发送的商务邮件。","content":_builtin_content("商务邮件撰写","生成准确、得体且可直接审阅的商务邮件。","收件人、主题、沟通目的、语气及必要背景。","1. 补齐缺失信息。\n2. 提炼核心诉求。\n3. 起草主题和正文。\n4. 检查行动项。","不得虚构事实；实际发送前必须获得用户确认。","主题、称呼、正文、结尾及待确认项。","输入：向客户确认周五交付。输出：简洁正式的确认邮件。")},
+    {"slug":"research-report","name":"研究报告","category":"研究分析","scenarios":["研究","写作"],"description":"把研究主题拆解为目标、证据、结论与待验证项，避免虚构来源。","content":_builtin_content("研究报告","形成证据边界清晰、可复核的研究报告。","研究主题、范围、受众、时间边界和可用材料。","1. 拆解问题。\n2. 区分事实与推断。\n3. 汇总证据。\n4. 输出结论与局限。","不得编造来源；时效性信息必须标记核验时间。","摘要、方法、发现、结论、局限和来源。","输入：比较两种方案。输出：带证据和风险说明的对比报告。")},
+    {"slug":"travel-planner","name":"旅行计划","category":"通用办公","scenarios":["规划","旅行"],"description":"生成兼顾时间、预算、天气与交通的行程方案。","content":_builtin_content("旅行计划","生成现实可行并保留机动时间的行程。","目的地、日期、预算、同行人、兴趣和限制。","1. 确认约束。\n2. 按地理位置编排行程。\n3. 估算交通和费用。\n4. 给出备选方案。","价格、天气和营业时间等实时信息需核验。","逐日行程、预算、交通、预订提醒和备选项。","输入：上海三日亲子游。输出：按上午、下午、晚上排列的计划。")},
+    {"slug":"meeting-summary","name":"会议纪要","category":"通用办公","scenarios":["会议","总结"],"description":"将会议材料整理为结论、行动项、负责人和截止时间。","content":_builtin_content("会议纪要","把会议内容整理为可追踪的决定和行动。","会议记录、参会人、议题及日期。","1. 提取议题。\n2. 识别决定。\n3. 整理行动项。\n4. 标记待确认信息。","未明确的负责人和日期必须标记待补充。","摘要、关键决定、行动项表格、风险和待确认项。","输入：原始会议文本。输出：包含负责人和截止时间的纪要。")},
+    {"slug":"web-design","name":"网页设计","category":"代码开发","scenarios":["设计","前端"],"description":"把用户需求转为信息架构、界面层级和可实施的前端建议。","content":_builtin_content("网页设计","把业务目标转化为清晰、可访问、可实现的网页方案。","页面目标、目标用户、品牌约束、内容和设备范围。","1. 建立信息架构。\n2. 设计用户路径。\n3. 定义组件与状态。\n4. 给出响应式规则。","遵循可访问性和既有设计系统，不伪造品牌资产。","页面结构、组件清单、交互状态和验收标准。","输入：SaaS 落地页。输出：分区、组件和响应式说明。")},
+    {"slug":"software-engineer","name":"本地软件工程","category":"代码开发","scenarios":["开发","调试"],"description":"在已选工作区内规划、修改、测试和审查代码。","content":_builtin_content("本地软件工程","在明确范围内完成可验证的软件修改。","代码工作区、目标、约束和验收条件。","1. 阅读相关代码。\n2. 定位影响范围。\n3. 最小化修改。\n4. 运行测试并检查差异。","不得越过工作区或声称未执行的测试已通过；危险操作必须确认。","变更摘要、文件、测试结果及剩余风险。","输入：修复筛选失效。输出：实现、测试和验证说明。")},
+    {"slug":"data-analysis","name":"数据分析","category":"数据分析","scenarios":["分析","报表"],"description":"帮助解释指标、识别异常并给出可复现的分析路径。","content":_builtin_content("数据分析","产出可复核的数据结论和业务解释。","数据范围、字段口径、时间范围和业务问题。","1. 校验数据质量。\n2. 计算指标。\n3. 识别异常。\n4. 区分结果与推断。","不得把相关性描述为因果；缺失值和口径变化必须披露。","口径、方法、结果、图表建议、结论和复核步骤。","输入：月度转化数据。输出：趋势、异常点及计算口径。")},
 ]
 
 
@@ -240,6 +246,13 @@ class SkillSearchReq(BaseModel):
     node: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
     top_k: int = 3
+    mode: str = "hybrid"
+    rerank: bool = False
+    model_connection_id: str = ""
+    application_id: str = ""
+    workflow_id: str = ""
+    node_id: str = ""
+    debug: bool = False
 
 
 class CreateToolReq(BaseModel):
@@ -607,6 +620,13 @@ def create_app(
     skills = skill_repository or SkillRepository(
         os.environ.get("SKILL_STORE_ROOT") or "runs/skills"
     )
+    skill_installations = SkillInstallationStore(
+        os.environ.get("SKILL_INSTALLATION_ROOT") or str(skills.root_dir / "installations")
+    )
+    skill_semantic_index = SkillSemanticIndex(
+        os.environ.get("SKILL_INDEX_PATH") or str(skills.root_dir / "skill_index.sqlite3"),
+        embedding_model=os.environ.get("SKILL_EMBEDDING_MODEL") or "bge-m3",
+    )
     owns_tool_catalog = tool_catalog_store is None
     tools = tool_catalog_store or ToolCatalogStore(
         os.environ.get("TOOL_CATALOG_ROOT") or "runs/tool_catalog"
@@ -643,8 +663,8 @@ def create_app(
         existing = next((item for item in skills.list() if item.metadata.get("market_slug") == template["slug"]), None)
         if existing is None:
             skills.create(name=template["name"],content=template["content"],description=template["description"],tags=[template["category"],"market","builtin"],status=SkillStatus.PUBLISHED,visibility="builtin",source_type="builtin",validation_status="passed",metadata={"market_slug":template["slug"],"source":"builtin","category":template["category"],"migration_version":1})
-        elif existing.visibility != "builtin" or existing.status != SkillStatus.PUBLISHED:
-            existing.status=SkillStatus.PUBLISHED;existing.owner_user_id=None;existing.visibility="builtin";existing.source_type="builtin";existing.validation_status="passed";existing.metadata={**existing.metadata,"source":"builtin","category":template["category"],"migration_version":1};skills.save(existing)
+        elif existing.visibility != "builtin" or existing.status != SkillStatus.PUBLISHED or existing.metadata.get("migration_version") != 2:
+            existing.name=template["name"];existing.description=template["description"];existing.content=template["content"];existing.tags=[template["category"],*template.get("scenarios",[]),"market","builtin"];existing.status=SkillStatus.PUBLISHED;existing.owner_user_id=None;existing.visibility="builtin";existing.source_type="builtin";existing.validation_status="passed";existing.metadata={**existing.metadata,"source":"builtin","category":template["category"],"scenarios":template.get("scenarios",[]),"migration_version":2};skills.save(existing, versioned=False)
     # 旧资源没有所有者；在存在账号时一次性归属最早注册用户。
     legacy_owner = auth.first_user()
     legacy_owner_id = (legacy_owner.id if legacy_owner is not None else "") if auth_required else "local-user"
@@ -660,7 +680,7 @@ def create_app(
     skill_traces = skill_trace_store or SkillTraceStore(
         os.environ.get("SKILL_TRACE_ROOT") or "runs/skill_traces"
     )
-    skill_retriever = SkillRetriever(skills)
+    skill_retriever = SkillRetriever(skills,semantic_index=skill_semantic_index)
     skill_evolution = SkillEvolutionService(
         repository=skills,
         run_store=runs,
@@ -960,11 +980,59 @@ def create_app(
             if mutable:
                 raise HTTPException(status_code=403, detail="平台内置 Skill 为只读资源")
             return record
-        if record.owner_user_id != _request_user_id(request):
+        if record.owner_user_id != _request_user_id(request) and not (not auth_required and not record.owner_user_id):
             raise HTTPException(status_code=404, detail="skill not found")
         return record
 
+    def _skill_usage(skill_id: str, user_id: str) -> List[Dict[str, str]]:
+        result: List[Dict[str, str]] = []
+        for application in applications.list():
+            if application.owner_user_id and application.owner_user_id != user_id:
+                continue
+            try:
+                graph = workflows.get(application.workflow_id).graph if application.workflow_id else {}
+            except KeyError:
+                graph = {}
+            if any(skill_id in list((node.get("config") or {}).get("skill_ids") or []) for node in graph.get("agents", [])):
+                result.append({"id": application.id, "name": application.name, "type": application.app_type})
+        return result
+
+    def _skill_payload(record: Any, user_id: str) -> Dict[str, Any]:
+        installed = record.id in skill_installations.installed_ids(user_id)
+        category = str(record.metadata.get("category") or (record.tags[0] if record.tags else "其他"))
+        scenarios = [str(x) for x in record.metadata.get("scenarios") or []]
+        keywords = [str(x) for x in record.metadata.get("keywords") or []]
+        usage = _skill_usage(record.id, user_id)
+        builtin = record.visibility == "builtin"
+        return {**record.to_dict(), "origin": record.source_type, "editable": not builtin,
+                "deletable": not builtin and not usage, "installed": installed,
+                "category": category, "scenarios": scenarios, "keywords": keywords,
+                "published_version": record.version if record.status == SkillStatus.PUBLISHED else record.metadata.get("published_version"),
+                "draft_version": record.version if record.status != SkillStatus.PUBLISHED else None,
+                "usage_count": len(usage), "usages": usage}
+
+    def _rerank_skills(query: str, candidates: List[Dict[str, Any]], connection_id: str = "") -> List[Dict[str, Any]]:
+        connection = model_connections.get(connection_id) if connection_id else model_connections.default_for_tier("cloud")
+        if connection is None or not connection.runnable:
+            raise ValueError("没有可用于 Skill 重排的已测试模型连接")
+        compact=[{"skill_id":x["match"].skill.id,"name":x["match"].skill.name,"description":x["match"].skill.description,"scenarios":x["match"].skill.metadata.get("scenarios") or []} for x in candidates[:5]]
+        prompt="判断候选 Skill 是否适合用户任务。只输出 JSON 对象，格式为 {\"matches\":[{\"skill_id\":\"...\",\"relevance\":0到1,\"selected\":true或false,\"reason\":\"简短理由\"}]}。不得输出思考过程。\n任务："+query+"\n候选："+json.dumps(compact,ensure_ascii=False)
+        body=json.dumps({"model":connection.model_id,"messages":[{"role":"user","content":prompt}],"temperature":0,"response_format":{"type":"json_object"}},ensure_ascii=False).encode("utf-8")
+        headers={"Content-Type":"application/json"};key=connection_api_key(connection)
+        if key:headers["Authorization"]=f"Bearer {key}"
+        req=urllib.request.Request(f"{connection.base_url}/chat/completions",data=body,headers=headers,method="POST")
+        with urllib.request.urlopen(req,timeout=30) as response:payload=json.loads(response.read().decode("utf-8"))
+        raw=str(payload.get("choices",[{}])[0].get("message",{}).get("content") or "").strip();parsed=json.loads(raw)
+        decisions={str(x.get("skill_id")):x for x in parsed.get("matches") or [] if isinstance(x,dict)}
+        for item in candidates:
+            decision=decisions.get(item["match"].skill.id,{})
+            item["rerank_score"]=max(0.0,min(1.0,float(decision.get("relevance",0))))
+            item["selected"]=bool(decision.get("selected",False));item["rerank_reason"]=str(decision.get("reason") or "")[:300]
+            if item["selected"]:item["match"].score=round(.7*item["match"].score+.3*item["rerank_score"],6);item["match"].reason=item["rerank_reason"] or item["match"].reason
+        return sorted([x for x in candidates if x["selected"]],key=lambda x:x["match"].score,reverse=True)
+
     def _validate_skill_selection(skill_ids: List[str], request: Request) -> None:
+        user_id=_request_user_id(request);installed=skill_installations.installed_ids(user_id)
         for skill_id in skill_ids:
             try:
                 record = _visible_skill(skill_id, request)
@@ -972,6 +1040,8 @@ def create_app(
                 raise ValueError(f"Skill {skill_id} 不存在或当前用户无权使用") from exc
             if record.status != SkillStatus.PUBLISHED:
                 raise ValueError(f"Skill {record.name} 尚未发布，不能绑定到应用")
+            if record.visibility == "builtin" and record.id not in installed:
+                raise ValueError(f"Skill {record.name} 尚未安装到个人库")
 
     def _owned_app_for_workflow(workflow_id: str, request: Request) -> Optional[ApplicationRecord]:
         record = next((item for item in applications.list() if item.workflow_id == workflow_id), None)
@@ -2875,18 +2945,22 @@ def create_app(
     @app.post("/api/skills")
     def create_skill(req: CreateSkillReq, request: Request) -> Dict[str, Any]:
         try:
-            return skills.create(
+            user_id = _request_user_id(request)
+            if any(item.owner_user_id == user_id and item.name.casefold() == req.name.strip().casefold() for item in skills.list()):
+                raise ValueError("已存在同名 Skill")
+            record = skills.create(
                 name=req.name,
                 content=req.content,
                 description=req.description,
                 tags=req.tags,
-                metadata={**req.metadata,"source":"manual","validation":{"passed":True,"mode":"automatic"}},
-                status=SkillStatus.PUBLISHED,
-                owner_user_id=_request_user_id(request),
+                metadata={**req.metadata,"source":"manual"},
+                status=SkillStatus.DRAFT,
+                owner_user_id=user_id,
                 visibility="private",
                 source_type="manual",
-                validation_status="passed",
-            ).to_dict()
+                validation_status="pending",
+            )
+            return _skill_payload(record, user_id)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -2895,8 +2969,10 @@ def create_app(
         try:
             url = str(req.get("url") or "")
             package = read_skill_git(url)
-            record = skills.create(name=package["name"],content=package["content"],description=str(req.get("description") or "从 Git 仓库导入"),status=SkillStatus.PUBLISHED,tags=["imported","git"],metadata={"source":"git","source_url":url,"revision":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},owner_user_id=_request_user_id(request),visibility="private",source_type="git",validation_status="passed",package_sha256=package["sha256"])
-            return record.to_dict()
+            user_id=_request_user_id(request)
+            if any(item.owner_user_id==user_id and item.package_sha256==package["sha256"] for item in skills.list()): raise ValueError("该 Git 内容已导入")
+            record = skills.create(name=package["name"],content=package["content"],description=str(req.get("description") or "从 Git 仓库导入"),status=SkillStatus.DRAFT,tags=["imported","git"],metadata={"source":"git","source_url":url,"revision":package["sha256"],"references":package["references"],"scripts_ignored":True},owner_user_id=user_id,visibility="private",source_type="git",validation_status="pending",package_sha256=package["sha256"])
+            return _skill_payload(record,user_id)
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -2904,8 +2980,9 @@ def create_app(
     async def import_skill_zip(request: Request) -> Dict[str, Any]:
         try:
             package = read_skill_zip(await request.body())
-            record = skills.create(name=package["name"],content=package["content"],description=request.headers.get("x-skill-description","从 ZIP 包导入"),status=SkillStatus.PUBLISHED,tags=["imported","zip"],metadata={"source":"zip","sha256":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},owner_user_id=_request_user_id(request),visibility="private",source_type="zip",validation_status="passed",package_sha256=package["sha256"])
-            return record.to_dict()
+            user_id=_request_user_id(request)
+            record = skills.create(name=package["name"],content=package["content"],description=request.headers.get("x-skill-description","从 ZIP 包导入"),status=SkillStatus.DRAFT,tags=["imported","zip"],metadata={"source":"zip","sha256":package["sha256"],"references":package["references"],"scripts_ignored":True},owner_user_id=user_id,visibility="private",source_type="zip",validation_status="pending",package_sha256=package["sha256"])
+            return _skill_payload(record,user_id)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -2921,40 +2998,104 @@ def create_app(
             record = skills.create(
                 name=package["name"], content=package["content"],
                 description=request.headers.get("x-skill-description", "从文件导入"),
-                status=SkillStatus.PUBLISHED, tags=["imported", "file"],
-                metadata={"source":"file","filename":filename,"sha256":package["sha256"],"references":package["references"],"scripts_ignored":True,"validation":{"passed":True,"mode":"automatic"}},
+                status=SkillStatus.DRAFT, tags=["imported", "file"],
+                metadata={"source":"file","filename":filename,"sha256":package["sha256"],"references":package["references"],"scripts_ignored":True},
                 owner_user_id=user_id, visibility="private",
-                source_type=source_type, validation_status="passed", package_sha256=package["sha256"],
+                source_type=source_type, validation_status="pending", package_sha256=package["sha256"],
             )
-            return record.to_dict()
+            return _skill_payload(record,user_id)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.get("/api/skills")
-    def list_skills(request: Request, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_skills(request: Request, status: Optional[str] = None, scope: str = "all", query: str = "", category: str = "") -> List[Dict[str, Any]]:
         try:
             user_id=_request_user_id(request)
-            return [item.to_dict() for item in skills.list(status=status) if item.visibility=="builtin" or item.owner_user_id==user_id]
+            installed_ids=skill_installations.installed_ids(user_id)
+            records=[item for item in skills.list(status=status) if item.visibility=="builtin" or item.owner_user_id==user_id or (not auth_required and not item.owner_user_id)]
+            if scope == "mine": records=[item for item in records if item.owner_user_id==user_id]
+            elif scope == "installed": records=[item for item in records if item.id in installed_ids or (item.owner_user_id==user_id and item.status==SkillStatus.PUBLISHED)]
+            needle=query.strip().casefold()
+            if needle: records=[item for item in records if needle in f"{item.name} {item.description} {' '.join(item.tags)} {' '.join(str(x) for x in item.metadata.get('keywords') or [])}".casefold()]
+            if category: records=[item for item in records if str(item.metadata.get("category") or (item.tags[0] if item.tags else "其他"))==category]
+            return [_skill_payload(item,user_id) for item in records]
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/api/skills/search")
     def search_skills(req: SkillSearchReq, request: Request) -> Dict[str, Any]:
-        matches = skill_retriever.retrieve(
-            req.query,
-            node=req.node,
-            metadata=req.metadata,
-            top_k=req.top_k,
-        )
-        visible={item["id"] for item in list_skills(request)}
-        return {"matches": [item.to_dict() for item in matches if item.skill.id in visible]}
+        available_skills=list_skills(request, scope="installed")
+        visible={item["id"] for item in available_skills}
+        installed_builtin_count=sum(1 for item in available_skills if item.get("visibility")=="builtin" and item.get("installed"))
+        published_personal_count=sum(1 for item in available_skills if item.get("visibility")!="builtin" and item.get("status")==SkillStatus.PUBLISHED.value)
+        retrieval_metadata=dict(req.metadata or {})
+        # When the test is launched from an application/workflow/node, bound
+        # Skills are a useful relevance signal.  Keep the candidate scope at
+        # the user's installed library; the binding only contributes context.
+        context_skill_ids:set[str]=set(str(x) for x in retrieval_metadata.get("skill_ids") or [])
+        try:
+            application=None
+            if req.application_id:
+                application=_owned_application(req.application_id,request)
+            elif req.workflow_id:
+                application=_owned_app_for_workflow(req.workflow_id,request)
+            workflow_id=req.workflow_id or (application.workflow_id if application else "")
+            if application:
+                context_skill_ids.update(str(x) for x in application.skill_ids or [])
+            if workflow_id:
+                graph=workflows.get(workflow_id).graph
+                nodes=list(graph.get("agents") or [])
+                if req.node_id:
+                    nodes=[node for node in nodes if str(node.get("id") or "")==req.node_id]
+                for node in nodes:
+                    context_skill_ids.update(str(x) for x in (node.get("config") or {}).get("skill_ids") or [])
+        except KeyError as exc:
+            raise HTTPException(status_code=404,detail="应用、工作流或节点不存在") from exc
+        if context_skill_ids:
+            retrieval_metadata["skill_ids"]=sorted(context_skill_ids & visible)
+        for skill_id in visible:
+            record=skills.get(skill_id);indexed=skill_semantic_index.get(skill_id)
+            if req.mode in {"semantic","hybrid"} and (not indexed or indexed.get("version")!=record.version or indexed.get("status")!="ready"):
+                skill_semantic_index.upsert(record)
+        details=skill_retriever.retrieve_detailed(req.query,node=req.node_id or req.node,metadata=retrieval_metadata,top_k=max(req.top_k,5 if req.rerank else req.top_k),mode=req.mode,candidate_pool=req.rerank)
+        rows=[item for item in details["results"] if item["match"].skill.id in visible]
+        rerank_error=""
+        if req.rerank and rows:
+            try:rows=_rerank_skills(req.query,rows,req.model_connection_id)[:req.top_k]
+            except Exception as exc:rerank_error=str(exc)[:500]
+        matches=[]
+        for item in rows[:req.top_k]:
+            matches.append({**item["match"].to_dict(),"semantic_score":item["semantic_score"],"rule_score":item["rule_score"],"context_score":item["context_score"],"rerank_score":item.get("rerank_score"),"rerank_reason":item.get("rerank_reason",""),"selected":item.get("selected",True),"will_inject":item["match"].score>=.5})
+        return {"matches":matches,"retrieval":{"mode":details["mode"],"requested_mode":details["requested_mode"],"embedding_model":details["embedding_model"],"degraded":details["degraded"],"degraded_reason":details["degraded_reason"],"rerank_requested":req.rerank,"rerank_error":rerank_error,"latency_ms":details["latency_ms"],"threshold":.5,"candidate_count":len(visible),"installed_builtin_count":installed_builtin_count,"published_personal_count":published_personal_count}}
+
+    @app.get("/api/skills/index/status")
+    def skill_index_status(request: Request) -> Dict[str, Any]:
+        _request_user_id(request);return skill_semantic_index.health()
+
+    @app.post("/api/skills/index/rebuild")
+    def rebuild_skill_index(request: Request) -> Dict[str, Any]:
+        user_id=_request_user_id(request);visible=[x for x in skills.list() if x.visibility=="builtin" or x.owner_user_id==user_id]
+        return {**skill_semantic_index.rebuild(visible),**skill_semantic_index.health()}
+
+    @app.post("/api/skills/{skill_id}/index")
+    def rebuild_one_skill_index(skill_id: str, request: Request) -> Dict[str, Any]:
+        return skill_semantic_index.upsert(_visible_skill(skill_id,request))
 
     @app.put("/api/skills/{skill_id}")
     def update_private_skill(skill_id: str, req: CreateSkillReq, request: Request) -> Dict[str, Any]:
         try:
             record=_visible_skill(skill_id,request,mutable=True)
-            record.name=req.name;record.content=req.content;record.description=req.description;record.tags=req.tags;record.metadata={**record.metadata,**req.metadata,"validation":{"passed":True,"mode":"automatic"}};record.status=SkillStatus.PUBLISHED;record.validation_status="passed"
-            return skills.save(record).to_dict()
+            user_id=_request_user_id(request)
+            if record.status == SkillStatus.PUBLISHED:
+                revisions=[item for item in skills.list() if item.owner_user_id==user_id and str(item.metadata.get("revises_skill_id") or "")==record.id and item.status!=SkillStatus.PUBLISHED]
+                draft=max(revisions,key=lambda item:item.updated_at) if revisions else None
+                if draft is None:
+                    draft=skills.create(name=req.name,content=req.content,description=req.description,tags=req.tags,metadata={**record.metadata,**req.metadata,"revises_skill_id":record.id,"published_version":record.version},status=SkillStatus.DRAFT,owner_user_id=user_id,visibility="private",source_type=record.source_type,validation_status="pending")
+                else:
+                    draft.name=req.name;draft.content=req.content;draft.description=req.description;draft.tags=req.tags;draft.metadata={**record.metadata,**req.metadata,"revises_skill_id":record.id,"published_version":record.version};draft.status=SkillStatus.DRAFT;draft.validation_status="pending";draft=skills.save(draft,versioned=False)
+                return _skill_payload(draft,user_id)
+            record.name=req.name;record.content=req.content;record.description=req.description;record.tags=req.tags;record.metadata={**record.metadata,**req.metadata};record.status=SkillStatus.DRAFT;record.validation_status="pending"
+            return _skill_payload(skills.save(record,versioned=False),user_id)
         except KeyError as exc:
             raise HTTPException(status_code=404,detail=str(exc))
         except ValueError as exc:
@@ -2963,21 +3104,27 @@ def create_app(
     @app.delete("/api/skills/{skill_id}")
     def delete_private_skill(skill_id: str, request: Request) -> Dict[str, Any]:
         try:
-            _visible_skill(skill_id,request,mutable=True);skills.delete(skill_id);return {"ok":True}
+            _visible_skill(skill_id,request,mutable=True)
+            if _skill_usage(skill_id,_request_user_id(request)): raise ValueError("该 Skill 正被应用使用，请先解除绑定或停用")
+            skills.delete(skill_id);skill_semantic_index.remove(skill_id);return {"ok":True}
         except KeyError as exc:
             raise HTTPException(status_code=404,detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=409,detail=str(exc))
 
     @app.get("/api/skills/{skill_id}")
     def get_skill(skill_id: str, request: Request) -> Dict[str, Any]:
         try:
-            return _visible_skill(skill_id, request).to_dict()
+            return _skill_payload(_visible_skill(skill_id, request),_request_user_id(request))
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
     @app.get("/api/skills/{skill_id}/versions")
     def list_skill_versions(skill_id: str, request: Request) -> List[Dict[str, Any]]:
         try:
-            _visible_skill(skill_id, request)
+            record=_visible_skill(skill_id, request)
+            if record.visibility == "builtin":
+                return [_skill_payload(record,_request_user_id(request))]
             return [item.to_dict() for item in skills.list_versions(skill_id)]
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -2985,7 +3132,9 @@ def create_app(
     @app.get("/api/skills/{skill_id}/versions/{version}")
     def get_skill_version(skill_id: str, version: int, request: Request) -> Dict[str, Any]:
         try:
-            _visible_skill(skill_id, request)
+            record=_visible_skill(skill_id, request)
+            if record.visibility == "builtin" and record.version != version:
+                raise HTTPException(status_code=404,detail="平台内置 Skill 不公开内部历史")
             return skills.get_version(skill_id, version).to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -3003,12 +3152,7 @@ def create_app(
                 metadata=req.metadata,
             )
             record.owner_user_id=_request_user_id(request);record.visibility="private";record.source_type="run";skills.save(record)
-            report=skill_evolution.validate(record.id)
-            if not report.passed:
-                raise ValueError("Skill 自动验证失败："+"；".join(report.findings))
-            published=skill_evolution.publish(record.id,approved_by=_request_user_id(request))
-            published.validation_status="passed";published.metadata={**published.metadata,"validation_mode":"automatic"}
-            return skills.save(published).to_dict()
+            return _skill_payload(record,_request_user_id(request))
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -3017,8 +3161,12 @@ def create_app(
     @app.post("/api/skills/{skill_id}/validate")
     def validate_skill(skill_id: str, request: Request) -> Dict[str, Any]:
         try:
-            _visible_skill(skill_id, request, mutable=True)
-            return skill_evolution.validate(skill_id).to_dict()
+            record=_visible_skill(skill_id, request, mutable=True)
+            if record.status in {SkillStatus.DRAFT,SkillStatus.REJECTED}:
+                record.status=SkillStatus.CANDIDATE;skills.save(record,versioned=False)
+            report=skill_evolution.validate(skill_id)
+            record=skills.get(skill_id);record.validation_status="passed" if report.passed else "failed";skills.save(record,versioned=False)
+            return report.to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -3027,11 +3175,19 @@ def create_app(
     @app.post("/api/skills/{skill_id}/publish")
     def publish_skill(skill_id: str, req: SkillDecisionReq, request: Request) -> Dict[str, Any]:
         try:
-            _visible_skill(skill_id, request, mutable=True)
-            return skill_evolution.publish(
+            record=_visible_skill(skill_id, request, mutable=True)
+            published=skill_evolution.publish(
                 skill_id,
-                approved_by=req.approved_by or "",
-            ).to_dict()
+                approved_by=req.approved_by or _request_user_id(request),
+            )
+            revised_id=str(record.metadata.get("revises_skill_id") or "")
+            if revised_id:
+                original=_visible_skill(revised_id,request,mutable=True)
+                original.name=published.name;original.content=published.content;original.description=published.description;original.tags=published.tags;original.metadata={k:v for k,v in published.metadata.items() if k not in {"revises_skill_id","published_version"}};original.status=SkillStatus.PUBLISHED;original.validation_status="passed";original.approved_by=published.approved_by
+                original=skills.save(original,versioned=True);skills.delete(skill_id);skill_semantic_index.remove(skill_id);skill_semantic_index.upsert(original)
+                return _skill_payload(original,_request_user_id(request))
+            skill_semantic_index.upsert(published)
+            return _skill_payload(published,_request_user_id(request))
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -3051,7 +3207,7 @@ def create_app(
     def retire_skill(skill_id: str, req: SkillDecisionReq, request: Request) -> Dict[str, Any]:
         try:
             _visible_skill(skill_id, request, mutable=True)
-            return skill_evolution.retire(skill_id, reason=req.reason).to_dict()
+            result=skill_evolution.retire(skill_id, reason=req.reason);skill_semantic_index.remove(skill_id);return result.to_dict()
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -3088,7 +3244,10 @@ def create_app(
 
     @app.get("/api/runs/{run_id}/skill-traces")
     def get_skill_traces(run_id: str, request: Request) -> Dict[str, Any]:
-        _owned_run(run_id, request)
+        try:
+            _owned_run(run_id, request)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="run not found")
         return {"events": [item.to_dict() for item in skill_traces.list(run_id)]}
 
     # ------------------------- 百炼式资源市场 ------------------------- #
@@ -3240,20 +3399,41 @@ def create_app(
         return {"installed":True,"connection":payload,"tool":payload["tools"][0] if payload["tools"] else None,"message":message}
 
     @app.get("/api/marketplace/skills")
-    def list_skill_marketplace() -> List[Dict[str, Any]]:
+    def list_skill_marketplace(request: Request, query: str = "", category: str = "") -> List[Dict[str, Any]]:
+        user_id=_request_user_id(request);installed=skill_installations.installed_ids(user_id)
         records={item.metadata.get("market_slug"):item for item in skills.list() if item.visibility=="builtin"}
-        return [{**{k:v for k,v in item.items() if k!="content"},"skill_id":records[item["slug"]].id if item["slug"] in records else "","status":"published","version":records[item["slug"]].version if item["slug"] in records else 1,"source_type":"builtin"} for item in skill_market]
+        result=[{**{k:v for k,v in item.items() if k!="content"},"skill_id":records[item["slug"]].id if item["slug"] in records else "","status":"published","version":records[item["slug"]].version if item["slug"] in records else 1,"source_type":"builtin","updated_at":records[item["slug"]].updated_at if item["slug"] in records else "","installed":records[item["slug"]].id in installed if item["slug"] in records else False} for item in skill_market]
+        needle=query.strip().casefold()
+        if needle: result=[item for item in result if needle in f"{item['name']} {item['description']} {item['category']} {' '.join(item.get('scenarios') or [])}".casefold()]
+        if category: result=[item for item in result if item["category"]==category]
+        return result
 
     @app.post("/api/marketplace/skills/{slug}/install")
-    def install_skill_template(slug: str) -> Dict[str, Any]:
+    def install_skill_template(slug: str, request: Request) -> Dict[str, Any]:
         item = next((x for x in skill_market if x["slug"] == slug), None)
         if item is None:
             raise HTTPException(status_code=404, detail="未找到 Skill 市场模板")
         existing = next((x for x in skills.list() if x.metadata.get("market_slug") == slug), None)
-        if existing is not None:
-            return {"installed": False, "skill": existing.to_dict(), "message": "平台内置 Skill 已可直接使用"}
-        record = skills.create(name=item["name"],content=item["content"],description=item["description"],tags=[item["category"],"market","builtin"],status=SkillStatus.PUBLISHED,visibility="builtin",source_type="builtin",validation_status="passed",metadata={"market_slug":slug,"source":"builtin","category":item["category"]})
-        return {"installed": True, "skill": record.to_dict(), "message": "平台内置 Skill 已可直接使用"}
+        if existing is None:
+            existing = skills.create(name=item["name"],content=item["content"],description=item["description"],tags=[item["category"],"market","builtin"],status=SkillStatus.PUBLISHED,visibility="builtin",source_type="builtin",validation_status="passed",metadata={"market_slug":slug,"source":"builtin","category":item["category"],"scenarios":item.get("scenarios",[])})
+        _,changed=skill_installations.install(_request_user_id(request),existing.id)
+        return {"installed": changed, "skill": _skill_payload(existing,_request_user_id(request)), "message": "Skill 已加入个人库" if changed else "Skill 已安装"}
+
+    @app.delete("/api/marketplace/skills/{slug}/install")
+    def uninstall_skill_template(slug: str, request: Request) -> Dict[str, Any]:
+        record=next((x for x in skills.list() if x.metadata.get("market_slug")==slug),None)
+        if record is None: raise HTTPException(status_code=404,detail="未找到 Skill")
+        usages=_skill_usage(record.id,_request_user_id(request))
+        if usages: raise HTTPException(status_code=409,detail="该 Skill 正被应用使用，请先解除绑定")
+        return {"removed":skill_installations.uninstall(_request_user_id(request),record.id)}
+
+    @app.post("/api/skills/{skill_id}/copy")
+    def copy_skill(skill_id: str, request: Request) -> Dict[str, Any]:
+        source=_visible_skill(skill_id,request)
+        user_id=_request_user_id(request)
+        name=f"{source.name} 副本"
+        record=skills.create(name=name,content=source.content,description=source.description,tags=list(source.tags),metadata={**source.metadata,"source":"manual","copied_from":source.id},status=SkillStatus.DRAFT,owner_user_id=user_id,visibility="private",source_type="manual",validation_status="pending")
+        return _skill_payload(record,user_id)
 
     @app.get("/api/marketplace/apps")
     def list_application_templates() -> List[Dict[str, Any]]:

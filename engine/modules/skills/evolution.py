@@ -77,7 +77,7 @@ class SkillEvolutionService:
         missing = [section for section in required_sections if section not in skill.content]
         if missing:
             findings.append("missing sections: " + ", ".join(missing))
-        if not skill.source_run_ids:
+        if skill.source_type == "run" and not skill.source_run_ids:
             findings.append("source_run_ids is required for traceability")
         passed = not findings
         score = 1.0 if passed else max(0.0, 1.0 - 0.25 * len(findings))
@@ -96,7 +96,7 @@ class SkillEvolutionService:
             )
         else:
             skill.metadata = {**skill.metadata, "last_validation": report.to_dict()}
-            self.repository.save(skill)
+            self.repository.save(skill, versioned=False)
         return report
 
     def publish(

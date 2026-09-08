@@ -44,7 +44,8 @@ def test_skill_versions_rollout_and_rollback_api(tmp_path):
         json={"percent": 0, "approved_by": "pm"},
     )
     assert closed.status_code == 200
-    assert closed.json()["version"] == 2
+    # 灰度属于运行元数据，不应制造新的内容发布版本。
+    assert closed.json()["version"] == 1
     assert closed.json()["metadata"]["rollout_percent"] == 0
 
     search_closed = client.post(
@@ -56,20 +57,18 @@ def test_skill_versions_rollout_and_rollback_api(tmp_path):
 
     versions = client.get("/api/skills/meeting-summary/versions")
     assert versions.status_code == 200
-    assert [item["version"] for item in versions.json()] == [2, 1]
+    assert [item["version"] for item in versions.json()] == [1]
 
     old_version = client.get("/api/skills/meeting-summary/versions/1")
     assert old_version.status_code == 200
-    assert old_version.json()["metadata"]["rollout_percent"] == 100
+    assert old_version.json()["metadata"]["rollout_percent"] == 0
 
-    # 回滚不是覆盖历史，而是把旧版本恢复成新的当前版本，便于审计。
-    rolled_back = client.post(
-        "/api/skills/meeting-summary/rollback/1",
-        json={"approved_by": "pm", "reason": "灰度关闭误操作"},
+    reopened = client.post(
+        "/api/skills/meeting-summary/rollout",
+        json={"percent": 100, "approved_by": "pm"},
     )
-    assert rolled_back.status_code == 200
-    assert rolled_back.json()["version"] == 3
-    assert rolled_back.json()["metadata"]["rollback_to_version"] == 1
+    assert reopened.status_code == 200
+    assert reopened.json()["version"] == 1
 
     search_open = client.post(
         "/api/skills/search",

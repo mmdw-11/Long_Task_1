@@ -624,15 +624,20 @@ class HookManager(ExecutionHook):
     def _inject_skill_context(self, ctx: NodeContext) -> None:
         if self.skill_retriever is None:
             return
-        self.skill_retriever.inject(ctx.state, node=ctx.node, metadata=ctx.metadata)
         from .modules.live_events import emit
+        emit("skill_retrieval_started", node=ctx.node, message="正在匹配可用 Skill")
+        self.skill_retriever.inject(ctx.state, node=ctx.node, metadata=ctx.metadata)
+        diagnostics=dict(getattr(self.skill_retriever,"last_diagnostics",{}) or {})
+        if diagnostics.get("degraded"):
+            emit("skill_retrieval_degraded",node=ctx.node,reason=diagnostics.get("degraded_reason"),message="语义检索不可用，已降级到规则匹配")
         for item in ctx.state.get(SKILL_CONTEXT_KEY, []):
             skill = item.get("skill") or {}
+            emit("skill_selected", node=ctx.node, skill_id=item.get("skill_id"), version=item.get("version"), score=item.get("score"), source_type=skill.get("source_type"), message=f"已选择 Skill：{skill.get('name') or item.get('skill_id')} · v{item.get('version')}")
             emit("skill_applied", node=ctx.node, skill_id=item.get("skill_id"), version=item.get("version"), source_type=skill.get("source_type"), message=f"已应用 Skill：{skill.get('name') or item.get('skill_id')} · v{item.get('version')}")
         self._record_skill_trace(
             ctx,
             "skill_retrieved",
-            {"skills": [{"skill_id":item.get("skill_id"),"version":item.get("version"),"source_type":(item.get("skill") or {}).get("source_type")} for item in ctx.state.get(SKILL_CONTEXT_KEY, [])]},
+            {"skills": [{"skill_id":item.get("skill_id"),"version":item.get("version"),"score":item.get("score"),"source_type":(item.get("skill") or {}).get("source_type")} for item in ctx.state.get(SKILL_CONTEXT_KEY, [])],"retrieval":{k:v for k,v in diagnostics.items() if k!="results"}},
         )
 
     def _record_skill_trace(
