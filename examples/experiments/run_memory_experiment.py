@@ -45,6 +45,10 @@ def main() -> None:
     parser.add_argument("--append-only", action="store_true", help="关闭 UPDATE/DELETE 合并策略")
     parser.add_argument("--qa-solver", choices=["llm", "extractive"], default="llm")
     parser.add_argument("--qa-model", default="", help="默认使用 .env 中的 OPENAI_MODEL")
+    parser.add_argument("--qa-judge-model", default="", help="固定语义 QA Judge 模型；建议与生成模型分离")
+    parser.add_argument("--embedding-backend", choices=["bge_m3", "hashing"], default="bge_m3")
+    parser.add_argument("--bge-batch-size", type=int, default=32)
+    parser.add_argument("--history-chunk-chars", type=int, default=0, help="将 utterance 历史合并为可审计检索片段；0 保持原始单元")
     parser.add_argument("--fresh", action="store_true", help="忽略已有 rows.jsonl，完整重跑")
     args = parser.parse_args()
 
@@ -74,6 +78,10 @@ def main() -> None:
             enable_memory_update=not args.append_only,
             qa_solver=args.qa_solver,
             qa_model=args.qa_model,
+            qa_judge_model=args.qa_judge_model,
+            embedding_backend=args.embedding_backend,
+            bge_batch_size=args.bge_batch_size,
+            history_chunk_chars=args.history_chunk_chars,
         ),
     )
     report = merge_reports(report.name, existing, report)

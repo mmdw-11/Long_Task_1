@@ -427,7 +427,6 @@ def _run_one(
     answer_f1 = _answer_f1(
         prediction,
         example.expected_memory,
-        semantic_equivalent=qa_correct and qa_cfg.qa_solver == "llm",
     )
     evidence_sufficient, evidence_judge_error = _judge_evidence_sufficiency(
         example, retrieval.evidence, cfg
@@ -1067,4 +1066,3 @@ def _default_plan() -> List[str]:
         "过滤无关与冲突信息", "交叉核验关键事实", "合并多会话证据", "检查新增约束与隐私边界",
         "生成带依据的最终结果", "执行终稿一致性检查",
     ]
-
