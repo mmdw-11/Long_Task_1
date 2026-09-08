@@ -23,8 +23,11 @@ from engine.config import load_settings
 from engine.modules.bge_local import resolve_bge_m3_cache_dir, resolve_bge_m3_model_path
 from engine.modules.context.budget import rough_token_count
 from engine.modules.memory import (
+    BGEM3EmbeddingModel,
     HybridTieredMemoryStore,
+    HashingEmbeddingModel,
     MemoryContext,
+    MemoryItem,
     MemoryScope,
     RetrievalMode,
     build_default_memory_judge,
@@ -34,9 +37,14 @@ from .reports import ExperimentReport
 from .types import ExperimentRow, MemoryExample
 
 
-QA_SYSTEM_PROMPT = """You answer a question using only the supplied memory context.
-If the context does not contain enough information, reply exactly: INSUFFICIENT_INFORMATION.
-Do not use outside knowledge. Return only the shortest answer, with no explanation."""
+QA_SYSTEM_PROMPT = """Answer the question using only the supplied memory context.
+First identify the relevant facts internally, reconcile repeated or conflicting
+facts by preferring the latest explicitly supported information, and combine
+all required facts for multi-part questions. Do not expose that reasoning.
+Return the shortest direct answer only. Reply exactly INSUFFICIENT_INFORMATION
+only when the supplied evidence truly cannot determine the answer; do not use
+it merely because the answer requires a simple inference, date calculation, or
+combination of multiple supplied facts."""
 
 QA_JUDGE_SYSTEM_PROMPT = """You are an impartial judge for a long-term memory QA benchmark.
 Return exactly yes or no. Do not explain your decision."""
@@ -64,6 +72,9 @@ class MemoryExperimentConfig:
     qa_model: str = ""
     qa_judge_model: str = ""
     qa_timeout_seconds: float = 90.0
+    embedding_backend: str = "bge_m3"
+    bge_batch_size: int = 32
+    history_chunk_chars: int = 0
 
 
 def run_memory_experiment(
@@ -90,8 +101,16 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
     if cfg.clean and root.exists():
         shutil.rmtree(root)
     judge = build_default_memory_judge() if cfg.use_llm_judge else None
+    embedding_model = _build_embedding_model(cfg)
+    # Full-corpus BGE encoding is prohibitively expensive for utterance-heavy
+    # dialogue histories.  In the no-Judge retrieval ablation, use the cheap
+    # hybrid index for candidate recall and BGE-M3 only to rerank candidates.
+    # This is explicit in output metadata, rather than a hidden fallback.
+    bge_reranker = embedding_model if cfg.embedding_backend == "bge_m3" else None
+    index_embedding_model = HashingEmbeddingModel() if bge_reranker is not None else embedding_model
     store = HybridTieredMemoryStore(
         root,
+        embedding_model=index_embedding_model,
         memory_llm_judge=judge,
         enable_memory_update=cfg.enable_memory_update,
         long_text_threshold=cfg.long_text_threshold,
@@ -100,10 +119,11 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
     started = time.perf_counter()
     try:
         for example in examples:
+            indexed_example = _with_chunked_memories(example, cfg.history_chunk_chars)
             context = _engine_memory_context(example)
             write_started = time.perf_counter()
-            for index, memory in enumerate(example.memories):
-                store.append(memory, MemoryScope.PROJECT, context=context, tags=[example.source or "memory", f"memory-{index}"])
+            _write_example_memories(store, indexed_example, context, cfg)
+            if cfg.use_llm_judge:
                 if judge is not None and getattr(judge, "parse_error_count", 0):
                     raise RuntimeError(
                         "memory update judge returned malformed JSON; stopped to avoid further API spend"
@@ -118,9 +138,17 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
                 retrieved = store.read(example.question, scope=MemoryScope.PROJECT, context=context, top_k=candidate_k, retrieval_mode=mode)
             retrieval_seconds = time.perf_counter() - retrieval_started
             retrieved_sessions = [_engine_retrieved_text(store, item) for item in retrieved]
+            if bge_reranker is not None:
+                rerank_started = time.perf_counter()
+                retrieved_sessions = _rerank_sessions_with_bge(
+                    example.question, retrieved_sessions, bge_reranker
+                )
+                retrieval_seconds += time.perf_counter() - rerank_started
+            # Candidate@K is only a recall stage. The answer generator must
+            # never see evidence beyond the declared final Top-K.
             visible, evidence_stats = _select_evidence_chunks(
                 example.question,
-                retrieved_sessions,
+                retrieved_sessions[:cfg.top_k],
                 token_budget=cfg.context_token_budget,
                 chunk_chars=cfg.evidence_chunk_chars,
                 overlap_chars=cfg.evidence_chunk_overlap_chars,
@@ -135,6 +163,11 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
                     "source": example.source,
                     "expanded_archives": sum(bool(item.raw_ref) for item in retrieved),
                     "candidate_sessions": len(retrieved_sessions),
+                    "final_evidence_sessions": min(len(retrieved_sessions), cfg.top_k),
+                    "history_units_original": len(example.memories),
+                    "history_units_indexed": len(indexed_example.memories),
+                    "candidate_retriever": "hashing_hybrid" if bge_reranker is not None else cfg.embedding_backend,
+                    "reranker": "bge_m3" if bge_reranker is not None else "none",
                     "evidence_selection": evidence_stats,
                 },
                 retrieval_evidence_texts=retrieved_sessions,
@@ -146,6 +179,11 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
         name=f"memory-{cfg.backend}", rows=rows,
         metadata={
             "backend": cfg.backend, "top_k": cfg.top_k, "candidate_k": cfg.candidate_k,
+            "embedding_backend": cfg.embedding_backend,
+            "embedding_model": type(embedding_model).__name__,
+            "candidate_retriever": "hashing_hybrid" if bge_reranker is not None else cfg.embedding_backend,
+            "reranker": "bge_m3" if bge_reranker is not None else "none",
+            "history_chunk_chars": cfg.history_chunk_chars,
             "context_token_budget": cfg.context_token_budget, "scope": MemoryScope.PROJECT.value,
             "llm_judge_enabled": judge is not None, "retrieval_mode": cfg.retrieval_mode,
             "memory_judge_calls": int(getattr(judge, "call_count", 0)) if judge is not None else 0,
@@ -153,8 +191,9 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
             "memory_judge_thinking_disabled": bool(getattr(judge, "thinking_disabled", False)) if judge is not None else False,
             "cascade_read": cfg.cascade_read, "enable_memory_update": cfg.enable_memory_update,
             "archive_expand_policy": "expand_candidates_then_select_evidence_chunks",
-            "qa_solver": cfg.qa_solver, "qa_model": cfg.qa_model or "OPENAI_MODEL",
+            "qa_solver": cfg.qa_solver, "qa_model": _reported_model(cfg.qa_model),
             "storage_bytes": _directory_size(root), "memory_update_actions": dict(action_counts),
+            "memory_update_effective_actions": int(action_counts.get("UPDATE", 0) + action_counts.get("DELETE", 0)),
             "seconds": round(time.perf_counter() - started, 4),
         },
     )
@@ -186,7 +225,7 @@ def _run_context_baseline(
         metadata={
             "backend": cfg.backend, "top_k": cfg.top_k, "context_token_budget": cfg.context_token_budget,
             "qa_solver": cfg.qa_solver,
-            "qa_model": cfg.qa_model or "OPENAI_MODEL", "storage_bytes": 0,
+            "qa_model": _reported_model(cfg.qa_model), "storage_bytes": 0,
             "evaluator_scope": "end-to-end QA; retrieval metrics are N/A for context controls",
             "seconds": round(time.perf_counter() - started, 4),
         },
@@ -207,33 +246,38 @@ def _run_mem0_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfig)
     rows: List[ExperimentRow] = []
     started = time.perf_counter()
     for example in examples:
-        user_id = _mem0_user_id(example)
+        indexed_example = _with_chunked_memories(example, cfg.history_chunk_chars)
+        user_id = _mem0_user_id(indexed_example)
         write_started = time.perf_counter()
-        for index, text in enumerate(example.memories):
+        for index, text in enumerate(indexed_example.memories):
             memory.add([{"role": "user", "content": text}], user_id=user_id,
                        metadata={"source": example.source, "example_id": example.id, "index": index}, infer=cfg.mem0_infer)
         write_seconds = time.perf_counter() - write_started
         retrieval_started = time.perf_counter()
-        result = memory.search(example.question, top_k=cfg.top_k, filters={"user_id": user_id}, threshold=cfg.mem0_threshold)
+        result = memory.search(indexed_example.question, top_k=cfg.top_k, filters={"user_id": user_id}, threshold=cfg.mem0_threshold)
         retrieval_seconds = time.perf_counter() - retrieval_started
         result_items = _mem0_results(result)
         rows.append(_evaluate_example(
-            example, [_mem0_memory_text(item) for item in result_items], cfg,
+            indexed_example, [_mem0_memory_text(item) for item in result_items], cfg,
             write_seconds=write_seconds, retrieval_seconds=retrieval_seconds, retrieval_applicable=True,
             metadata={
                 "backend": "mem0",
                 "source": example.source,
                 "retrieval_provenance": "mem0_metadata_index_to_source_session",
+                "history_units_original": len(example.memories),
+                "history_units_indexed": len(indexed_example.memories),
             },
-            retrieval_evidence_texts=[_mem0_source_text(item, example) for item in result_items],
+            retrieval_evidence_texts=_deduplicated_mem0_source_sessions(result_items, indexed_example),
         ))
     return ExperimentReport(
         name="memory-mem0", rows=rows,
         metadata={
             "backend": "mem0", "top_k": cfg.top_k, "infer": cfg.mem0_infer,
+            "embedding_backend": "bge_m3", "embedding_model": "BGEM3EmbeddingModel",
+            "history_chunk_chars": cfg.history_chunk_chars,
             "thinking_disabled": True,
             "threshold": cfg.mem0_threshold, "qa_solver": cfg.qa_solver,
-            "qa_model": cfg.qa_model or "OPENAI_MODEL", "storage_bytes": _directory_size(root),
+            "qa_model": _reported_model(cfg.qa_model), "storage_bytes": _directory_size(root),
             "seconds": round(time.perf_counter() - started, 4),
         },
     )
@@ -254,16 +298,17 @@ def _evaluate_example(
         example, prediction, cfg, qa_error=qa_error
     )
     judge_seconds = time.perf_counter() - judge_started
-    answer_f1 = _answer_f1(
-        prediction,
-        example.answer,
-        semantic_equivalent=qa_correct and cfg.qa_solver == "llm",
-    )
+    # Keep lexical overlap independent of the semantic judge. QA accuracy is
+    # the semantic outcome; turning every judge-accepted answer into F1=1.0
+    # makes the two metrics redundant and hides partial-answer behavior.
+    answer_f1 = _answer_f1(prediction, example.answer)
     metrics: Dict[str, Any] = {
         "qa_acc": int(qa_correct), "qa_exact_match": int(qa_exact),
         "answer_f1": answer_f1, "retrieved": len(retrieved),
         "write_ms": write_seconds * 1000, "retrieval_ms": retrieval_seconds * 1000,
-        "qa_ms": qa_seconds * 1000, "time_ms": (write_seconds + retrieval_seconds + qa_seconds) * 1000,
+        "qa_ms": qa_seconds * 1000,
+        "time_ms": (write_seconds + retrieval_seconds + qa_seconds) * 1000,
+        "end_to_end_ms": (write_seconds + retrieval_seconds + qa_seconds + judge_seconds) * 1000,
         "qa_judge_ms": judge_seconds * 1000,
         "qa_judge_input_tokens": int(judge_usage.get("prompt_tokens") or 0),
         "qa_judge_output_tokens": int(judge_usage.get("completion_tokens") or 0),
@@ -281,6 +326,12 @@ def _evaluate_example(
             "rank": rank, "mrr": 1.0 / rank if rank else 0.0,
             "hit_at_1": int(rank == 1), "hit_at_3": int(0 < rank <= 3),
             "hit_at_5": int(0 < rank <= 5), "evidence_recall": evidence_recall,
+            # These diagnostics separate retrieval-caused QA failures from
+            # generator/judge failures. They are especially important for
+            # multi-evidence questions where Hit@5 alone is insufficient.
+            "gold_evidence_complete": int(evidence_recall >= 1.0),
+            "qa_failure_with_complete_evidence": int(not qa_correct and evidence_recall >= 1.0),
+            "qa_failure_with_incomplete_evidence": int(not qa_correct and evidence_recall < 1.0),
         })
         metadata = {**metadata, "evidence_metric": mode}
     if qa_error:
@@ -289,7 +340,7 @@ def _evaluate_example(
         metadata = {
             **metadata,
             "qa_evaluator": "longmemeval_llm_judge",
-            "qa_judge_model": cfg.qa_judge_model or os.environ.get("OPENAI_JUDGE_MODEL") or "OPENAI_MODEL",
+            "qa_judge_model": _reported_model(cfg.qa_judge_model or os.environ.get("OPENAI_JUDGE_MODEL", "")),
             "qa_judge_response": judge_response,
         }
     if judge_error:
@@ -323,6 +374,16 @@ def _answer_question(question: str, context: str, cfg: MemoryExperimentConfig) -
 
 def _qa_prompt(question: str, context: str) -> str:
     return f"Memory context:\n{context or '[empty]'}\n\nQuestion: {question}\nAnswer:"
+
+
+def _reported_model(requested_model: str) -> str:
+    """Persist the actual configured model name without exposing credentials."""
+    if requested_model:
+        return requested_model
+    try:
+        return load_settings().model
+    except Exception:
+        return "UNRESOLVED_MODEL"
 
 
 def _judge_qa_answer(
@@ -451,10 +512,11 @@ def _select_evidence_chunks(
             chunk_tokens = rough_token_count(chunk)
         selected.append(f"[session_rank={session_rank + 1}]\n{chunk}")
         used_tokens += chunk_tokens
+    selected = _fit_context_to_budget(selected, token_budget)
     return selected, {
         "candidate_sessions": len(sessions),
         "selected_chunks": len(selected),
-        "selected_tokens": used_tokens,
+        "selected_tokens": rough_token_count("\n\n".join(selected)),
     }
 
 
@@ -474,7 +536,28 @@ def _recent_context_within_budget(memories: List[str], token_budget: int) -> Lis
             memory_tokens = rough_token_count(memory)
         selected.append(memory)
         used_tokens += memory_tokens
-    return list(reversed(selected))
+    return _fit_context_to_budget(list(reversed(selected)), token_budget)
+
+
+def _fit_context_to_budget(parts: List[str], token_budget: int) -> List[str]:
+    """Defensively enforce the reported budget including separators and labels."""
+    if token_budget <= 0:
+        return list(parts)
+    fitted = list(parts)
+    while fitted and rough_token_count("\n\n".join(fitted)) > token_budget:
+        if len(fitted) > 1:
+            fitted.pop()
+            continue
+        text = fitted[0]
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if rough_token_count(text[:mid]) <= token_budget:
+                low = mid
+            else:
+                high = mid - 1
+        fitted = [text[:low]] if low else []
+    return fitted
 
 
 def _split_evidence_chunks(text: str, chunk_chars: int, overlap_chars: int) -> List[str]:
@@ -521,23 +604,135 @@ def _exact_match(prediction: str, answer: str) -> bool:
     return _norm(prediction) == _norm(answer)
 
 
-def _answer_f1(
-    prediction: str,
-    answer: str,
-    *,
-    semantic_equivalent: bool = False,
-) -> float:
-    """Use the existing LLM judge to avoid penalizing semantic paraphrases."""
+def _answer_f1(prediction: str, answer: str) -> float:
+    """Token-level F1, reported independently from semantic QA accuracy."""
     predicted = _answer_tokens(prediction)
     expected = _answer_tokens(answer)
     if not predicted or not expected:
-        return 1.0 if semantic_equivalent else float(bool(predicted == expected))
+        return float(bool(predicted == expected))
     hits = sum((Counter(predicted) & Counter(expected)).values())
     if not hits:
-        return 1.0 if semantic_equivalent else 0.0
+        return 0.0
     precision, recall = hits / len(predicted), hits / len(expected)
     lexical_f1 = round(2 * precision * recall / (precision + recall), 6)
-    return max(lexical_f1, 1.0 if semantic_equivalent else 0.0)
+    return lexical_f1
+
+
+def _build_embedding_model(cfg: MemoryExperimentConfig):
+    """Construct the declared Ours embedder; never silently fall back."""
+    backend = cfg.embedding_backend.lower().strip()
+    if backend == "bge_m3":
+        return BGEM3EmbeddingModel(batch_size=cfg.bge_batch_size)
+    if backend == "hashing":
+        return HashingEmbeddingModel()
+    raise ValueError("embedding_backend must be 'bge_m3' or 'hashing'")
+
+
+def _write_example_memories(
+    store: HybridTieredMemoryStore,
+    example: MemoryExample,
+    context: MemoryContext,
+    cfg: MemoryExperimentConfig,
+) -> None:
+    """Write one history, batching BGE embeddings when updates are disabled.
+
+    A no-Judge ablation has no stateful update decision to preserve, so issuing
+    one model call per session is needless and makes a normal LoCoMo-scale
+    evaluation impractically slow.  The stored index text is identical to the
+    regular write path.
+    """
+    texts = list(example.memories)
+    if cfg.use_llm_judge or not hasattr(store.embedding_model, "embed_batch"):
+        for index, memory in enumerate(texts):
+            store.append(
+                memory, MemoryScope.PROJECT, context=context,
+                tags=[example.source or "memory", f"memory-{index}"],
+            )
+        return
+
+    tags_by_item = [[example.source or "memory", f"memory-{index}"] for index in range(len(texts))]
+    summaries = [_summary_for_index(memory) for memory in texts]
+    index_texts = [f"{summary} {' '.join(tags)} {{}}" for summary, tags in zip(summaries, tags_by_item)]
+    embeddings = store.embedding_model.embed_batch(index_texts)
+    if len(embeddings) != len(texts):
+        raise RuntimeError("BGE-M3 batch embedding count does not match input memories")
+    for memory, tags, summary, embedding in zip(texts, tags_by_item, summaries, embeddings):
+        store.write(
+            MemoryItem(
+                content=memory,
+                scope=MemoryScope.PROJECT,
+                scope_id=context.id_for(MemoryScope.PROJECT),
+                tags=tags,
+                summary=summary,
+                embedding=embedding,
+            ),
+            context=context,
+        )
+
+
+def _summary_for_index(text: str, max_chars: int = 1200) -> str:
+    normalized = re.sub(r"\s+", " ", str(text)).strip()
+    return normalized if len(normalized) <= max_chars else normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _with_chunked_memories(example: MemoryExample, chunk_chars: int) -> MemoryExample:
+    """Coalesce utterance-level histories into auditable retrieval units."""
+    if chunk_chars <= 0:
+        return example
+    chunks: List[str] = []
+    current: List[str] = []
+    current_chars = 0
+    for memory in example.memories:
+        addition = len(memory) + (1 if current else 0)
+        if current and current_chars + addition > chunk_chars:
+            chunks.append("\n".join(current))
+            current, current_chars = [], 0
+        current.append(memory)
+        current_chars += addition
+    if current:
+        chunks.append("\n".join(current))
+    return MemoryExample(
+        id=example.id, question=example.question, answer=example.answer,
+        memories=chunks, evidence=list(example.evidence),
+        trajectory_id=example.trajectory_id, source=example.source,
+        metadata={**example.metadata, "history_unit": "coalesced_text_chunk", "history_chunk_chars": chunk_chars},
+    )
+
+
+def _rerank_sessions_with_bge(question: str, sessions: List[str], model: BGEM3EmbeddingModel) -> List[str]:
+    """BGE-M3 rerank of a fixed first-stage candidate set."""
+    if not sessions:
+        return []
+    # Keep reranking tractable on CPU while preserving the most query-relevant
+    # local evidence.  Full source chunks remain available after ranking.
+    rerank_texts = [_query_focused_window(question, session) for session in sessions]
+    vectors = model.embed_batch([question, *rerank_texts])
+    query = vectors[0]
+
+    def cosine(vector: List[float]) -> float:
+        return sum(a * b for a, b in zip(query, vector))
+
+    return [
+        session
+        for _, _, session in sorted(
+            ((cosine(vector), index, session) for index, (session, vector) in enumerate(zip(sessions, vectors[1:]))),
+            key=lambda item: (-item[0], item[1]),
+        )
+    ]
+
+
+def _query_focused_window(question: str, text: str, max_chars: int = 512) -> str:
+    if len(text) <= max_chars:
+        return text
+    terms = [term for term in _retrieval_terms(question) if len(term) > 1]
+    lowered = text.lower()
+    positions = [lowered.find(term) for term in terms if lowered.find(term) >= 0]
+    if not positions:
+        return text[:max_chars]
+    center = min(positions)
+    start = max(0, center - max_chars // 3)
+    end = min(len(text), start + max_chars)
+    return text[start:end]
 
 
 def _answer_tokens(text: str) -> List[str]:
@@ -597,6 +792,21 @@ def _mem0_source_text(item: Dict[str, Any], example: MemoryExample) -> str:
     if 0 <= index < len(example.memories):
         return example.memories[index]
     return _mem0_memory_text(item)
+
+
+def _deduplicated_mem0_source_sessions(
+    result_items: List[Dict[str, Any]], example: MemoryExample,
+) -> List[str]:
+    """Evaluate Mem0 at source-session grain, matching the Ours unit."""
+    unique: List[str] = []
+    seen: set[str] = set()
+    for item in result_items:
+        source_text = _mem0_source_text(item, example)
+        key = _norm(source_text)
+        if key and key not in seen:
+            unique.append(source_text)
+            seen.add(key)
+    return unique
 
 
 def _mem0_user_id(example: MemoryExample) -> str:

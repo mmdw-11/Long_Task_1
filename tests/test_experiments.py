@@ -33,13 +33,12 @@ from engine.experiments.memory import (
 )
 
 
-def test_answer_f1_accepts_semantically_equivalent_llm_judged_answers():
-    assert _answer_f1("2", "twice", semantic_equivalent=True) == 1.0
+def test_answer_f1_is_independent_of_semantic_judgment():
+    assert _answer_f1("2", "twice") == 0.0
     assert _answer_f1(
         "Nate taught people vegan ice cream recipes on his cooking show.",
         "teaching others, cooking show",
-        semantic_equivalent=True,
-    ) == 1.0
+    ) < 1.0
     assert _answer_f1("2", "twice") == 0.0
 from engine.modules.memory.judge import OpenAIMemoryJudge
 
@@ -127,7 +126,10 @@ def test_memory_experiment_engine_backend(tmp_path):
 
     report = run_memory_experiment(
         examples,
-        MemoryExperimentConfig(output_root=str(tmp_path), top_k=2, use_llm_judge=False, qa_solver="extractive"),
+        MemoryExperimentConfig(
+            output_root=str(tmp_path), top_k=2, use_llm_judge=False,
+            qa_solver="extractive", embedding_backend="hashing",
+        ),
     )
 
     assert report.summary()["pass_rate"] == 1.0
