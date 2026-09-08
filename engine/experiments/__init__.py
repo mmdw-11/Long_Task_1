@@ -27,6 +27,8 @@ from .long_task import (
 from .reports import ExperimentReport, save_report
 from .skills import SKILL_METHODS, SkillExperimentConfig, run_skill_experiment
 from .workflow import WorkflowExperimentConfig, run_workflow_experiment
+from .tau_data import load_tau_tasks, prepare_tau_dataset
+from .types import TauToolTask
 
 __all__ = [
     "ExperimentReport",
@@ -53,4 +55,7 @@ __all__ = [
     "SKILL_METHODS",
     "save_jsonl",
     "save_report",
+    "TauToolTask",
+    "load_tau_tasks",
+    "prepare_tau_dataset",
 ]

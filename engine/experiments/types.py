@@ -45,6 +45,49 @@ class SkillExample:
 
 
 @dataclass
+class TauToolTask:
+    """A normalized, stateful task from the official tau2-bench repository.
+
+    Gold fields are retained in the frozen evaluation artifact for replay and
+    scoring, but runners must use :meth:`agent_view` when constructing prompts.
+    This keeps reference actions and target-state assertions out of the agent
+    and generated-skill context.
+    """
+
+    id: str
+    domain: str
+    split: str
+    user_scenario: Dict[str, Any]
+    domain_policy: str
+    tool_schemas: List[Dict[str, Any]]
+    initial_state_ref: str
+    reference_actions: List[Dict[str, Any]] = field(default_factory=list)
+    reward_basis: List[str] = field(default_factory=list)
+    communicate_info: List[str] = field(default_factory=list)
+    env_assertions: List[Dict[str, Any]] = field(default_factory=list)
+    trajectory: List[Dict[str, Any]] = field(default_factory=list)
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
+    read_actions: List[str] = field(default_factory=list)
+    write_actions: List[str] = field(default_factory=list)
+    confirmation_boundaries: List[str] = field(default_factory=list)
+    source_commit: str = ""
+    source_hash: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def agent_view(self) -> Dict[str, Any]:
+        """Return only information that is legal to expose at test time."""
+        return {
+            "id": self.id,
+            "domain": self.domain,
+            "user_scenario": self.user_scenario,
+            "domain_policy": self.domain_policy,
+            "tool_schemas": self.tool_schemas,
+            "initial_state_ref": self.initial_state_ref,
+        }
+
+
+@dataclass
 class WorkflowExample:
     """一条小型编排工作流样本。"""
 

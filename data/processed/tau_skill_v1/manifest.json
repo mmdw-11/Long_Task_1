@@ -1,0 +1,237 @@
+{
+  "leakage": {
+    "id_overlap": false,
+    "scenario_overlap": false
+  },
+  "license": "MIT",
+  "prepared_at": "2026-09-07T13:21:33.430493+00:00",
+  "repository": "https://github.com/sierra-research/tau2-bench",
+  "schema_version": "tau_skill_v1",
+  "seed": 42,
+  "source_commit": "672227c6b6676edc20d57ea53b7000262aae77b9",
+  "source_files": {
+    "airline": {
+      "db_sha256": "7184914bd3720d93f1160a09bb2724c3a5601d8ca39d02d371cbbfa62626f7e2",
+      "official_test": 20,
+      "official_train": 30,
+      "policy_sha256": "7db375ddcce5061cf9f48a5aabe1fc3e52aa2936d6a65b7c5b62e3c7ca54cfe4",
+      "split_sha256": "8249d7af4c654a48e5fa776993c3416c3b68c7213a26d00ec89e976c28363e97",
+      "tasks_sha256": "34dfcf0622792d0d0fa32aa491d21582e1b5d3ec1948e7743bae881885f878ea"
+    },
+    "retail": {
+      "db_sha256": "dbde692e380bb4ad17f9f7841172cf1e69bebad2daa405628ccdc52a42b3b9b0",
+      "official_test": 40,
+      "official_train": 74,
+      "policy_sha256": "4313d3fef8acf919f555fa17fbce929cc3ed1cef2dd8f0d35ff5c8c3364de176",
+      "split_sha256": "5f9949b833e6b99584b87e84ef22f9d81789ea67a52e534c6f7aa91eff08adc7",
+      "tasks_sha256": "f44563d8f36362e2dc58282bb02cfb85010d22f27d9439808758d3e9b2bc16d2"
+    }
+  },
+  "splits": {
+    "airline": {
+      "skill_train": [
+        "9",
+        "15",
+        "14",
+        "1",
+        "39",
+        "27",
+        "7",
+        "28",
+        "33",
+        "36",
+        "47",
+        "38",
+        "17",
+        "23",
+        "43",
+        "46",
+        "34",
+        "11",
+        "10",
+        "42",
+        "21",
+        "0",
+        "3",
+        "5"
+      ],
+      "skill_validation": [
+        "20",
+        "49",
+        "4",
+        "41",
+        "40",
+        "12"
+      ],
+      "test": [
+        "48",
+        "19",
+        "45",
+        "26",
+        "2",
+        "13",
+        "6",
+        "24",
+        "22",
+        "18",
+        "30",
+        "16",
+        "31",
+        "29",
+        "8",
+        "32",
+        "44",
+        "35",
+        "37",
+        "25"
+      ]
+    },
+    "retail": {
+      "skill_train": [
+        "78",
+        "22",
+        "19",
+        "93",
+        "14",
+        "29",
+        "1",
+        "81",
+        "37",
+        "30",
+        "82",
+        "52",
+        "7",
+        "28",
+        "24",
+        "16",
+        "113",
+        "107",
+        "103",
+        "73",
+        "67",
+        "54",
+        "47",
+        "75",
+        "59",
+        "83",
+        "66",
+        "106",
+        "88",
+        "91",
+        "23",
+        "43",
+        "46",
+        "63",
+        "34",
+        "57",
+        "11",
+        "25",
+        "10",
+        "48",
+        "89",
+        "105",
+        "109",
+        "104",
+        "50",
+        "84",
+        "92",
+        "110",
+        "21",
+        "95",
+        "72",
+        "0",
+        "2",
+        "3",
+        "44",
+        "35",
+        "31",
+        "112",
+        "87"
+      ],
+      "skill_validation": [
+        "20",
+        "99",
+        "4",
+        "96",
+        "41",
+        "85",
+        "80",
+        "69",
+        "58",
+        "76",
+        "8",
+        "98",
+        "6",
+        "15",
+        "13"
+      ],
+      "test": [
+        "36",
+        "101",
+        "108",
+        "49",
+        "38",
+        "62",
+        "97",
+        "74",
+        "27",
+        "17",
+        "53",
+        "32",
+        "79",
+        "102",
+        "64",
+        "18",
+        "68",
+        "94",
+        "45",
+        "26"
+      ]
+    }
+  },
+  "statistics": {
+    "airline": {
+      "read_action_count": 47,
+      "reference_action_depth": {
+        "max": 19,
+        "mean": 2.84,
+        "min": 0
+      },
+      "rejection_tasks": 6,
+      "reward_basis": [
+        "COMMUNICATE",
+        "DB"
+      ],
+      "splits": {
+        "skill_train": 24,
+        "skill_validation": 6,
+        "test": 20
+      },
+      "tool_count": 14,
+      "write_action_count": 38
+    },
+    "retail": {
+      "read_action_count": 178,
+      "reference_action_depth": {
+        "max": 13,
+        "mean": 4.883,
+        "min": 0
+      },
+      "rejection_tasks": 2,
+      "reward_basis": [
+        "DB",
+        "NL_ASSERTION"
+      ],
+      "splits": {
+        "skill_train": 59,
+        "skill_validation": 15,
+        "test": 20
+      },
+      "tool_count": 14,
+      "write_action_count": 132
+    }
+  },
+  "tasks_sha256": "2828a93e0d20c3260dedf5ddd1606beab323ee75cb443f8f7cd6bab0bde6c71c",
+  "test_count_per_domain": 20,
+  "validation_ratio": 0.2
+}

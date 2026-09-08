@@ -1,0 +1,6 @@
+# Install only inside .venv-tau (Python 3.12 or 3.13).
+-e data/raw/tau/tau2-bench
+-e .
+python-dotenv>=1.0,<2
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
