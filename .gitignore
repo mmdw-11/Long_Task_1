@@ -5,6 +5,7 @@
 # 环境与密钥
 .env
 .venv/
+.venv-tau/
 venv/
 
 # Python
@@ -20,6 +21,10 @@ dist/
 # AgentScope 运行产物
 runs/
 .memory/
+
+# 第三方 benchmark checkout；仓库版本和数据哈希由实验 manifest 固定
+data/raw/tau/tau2-bench/
+data/processed/tau_skill_v1/tasks.jsonl
 
 # 运行与调试日志
 *.log

@@ -62,7 +62,7 @@ class SkillRepository:
                 "package_sha256": package_sha256,
             }
         )
-        return self.save(record)
+        return self.save(record, versioned=False)
 
     def save(self, record: SkillRecord | Skill, *, versioned: bool = True) -> SkillRecord:
         if isinstance(record, Skill):
@@ -184,7 +184,7 @@ class SkillRepository:
             "rollout_updated_by": approved_by,
             "rollout_updated_at": _utc_now(),
         }
-        return self.save(record)
+        return self.save(record, versioned=False)
 
     def publish(
         self,
@@ -246,7 +246,9 @@ class SkillRepository:
             record.approved_by = approved_by
         if metadata:
             record.metadata = {**record.metadata, **metadata}
-        return self.save(record)
+        # Lifecycle/metadata changes do not create a content release. Publishing is
+        # the sole transition that advances the public version number.
+        return self.save(record, versioned=status == SkillStatus.PUBLISHED)
 
     def delete(self, skill_id: str) -> None:
         if not self.exists(skill_id):

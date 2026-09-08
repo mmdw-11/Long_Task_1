@@ -12,9 +12,12 @@ def resolve_bge_m3_model_path(model_name: str = "BAAI/bge-m3") -> str:
     if model_name != "BAAI/bge-m3":
         return model_name
 
+    project_root = Path(__file__).resolve().parents[2]
     for raw in (
         os.environ.get("BGE_M3_MODEL_PATH"),
         _project_snapshot(),
+        project_root / "runs" / "router_learning" / "bge_m3" / "BAAI--bge-m3",
+        project_root / "runs" / "router_learning" / "bge_m3_new" / "BAAI--bge-m3",
         Path("D:/PythonProject/hf_cache/models/BAAI--bge-m3"),
     ):
         if not raw:

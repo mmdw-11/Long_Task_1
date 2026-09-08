@@ -23,6 +23,7 @@ from engine.experiments import (
     save_jsonl,
     long_task_examples_to_rows,
 )
+from engine.experiments.tau_data import prepare_tau_dataset
 
 
 def main() -> None:
@@ -52,6 +53,14 @@ def main() -> None:
     skills.add_argument("--count", type=int, default=30)
     skills.add_argument("--seed", type=int, default=42)
 
+    tau = subparsers.add_parser("tau", help="freeze official tau2-bench stateful tool tasks")
+    tau.add_argument("--checkout", default="data/raw/tau/tau2-bench")
+    tau.add_argument("--output-dir", default="data/processed/tau_skill_v1")
+    tau.add_argument("--domains", nargs="+", default=["retail", "airline"])
+    tau.add_argument("--test-count-per-domain", type=int, default=20)
+    tau.add_argument("--validation-ratio", type=float, default=0.2)
+    tau.add_argument("--seed", type=int, default=42)
+
     args = parser.parse_args()
     if args.command == "memory":
         examples = sample_memory_examples(
@@ -75,7 +84,7 @@ def main() -> None:
         )
         path = save_jsonl(args.output, long_task_examples_to_rows(examples))
         print({"output": str(path), "tasks": len(examples)})
-    else:
+    elif args.command == "skills":
         examples = build_skill_reuse_dataset(size=args.count, seed=args.seed)
         path = save_jsonl(args.output, [
             {"id": item.id, "task": item.task, "trajectory": item.trajectory,
@@ -84,6 +93,17 @@ def main() -> None:
             for item in examples
         ])
         print({"output": str(path), "tasks": len(examples)})
+    else:
+        result = prepare_tau_dataset(
+            args.checkout,
+            args.output_dir,
+            domains=args.domains,
+            test_count_per_domain=args.test_count_per_domain,
+            validation_ratio=args.validation_ratio,
+            seed=args.seed,
+        )
+        print({"tasks": result["tasks"], "manifest": result["manifest"], "test_index": result["test_index"],
+               "source_commit": result["source_commit"], "tasks_sha256": result["tasks_sha256"]})
 
 
 if __name__ == "__main__":
