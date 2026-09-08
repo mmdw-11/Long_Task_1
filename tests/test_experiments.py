@@ -1,5 +1,7 @@
 """实验代码的基础可运行性测试。"""
 
+from pathlib import Path
+
 import pytest
 
 from engine.experiments import (
@@ -20,6 +22,7 @@ from engine.experiments.types import MemoryExample, SkillExample
 from engine.experiments.datasets import load_memory_dataset, memory_examples_to_rows, sample_memory_examples
 from engine.experiments.long_task import memory_contains_expected
 from engine.experiments.memory import (
+    _answer_f1,
     _disable_mem0_thinking,
     _engine_memory_context,
     _engine_retrieved_text,
@@ -28,6 +31,16 @@ from engine.experiments.memory import (
     _select_evidence_chunks,
     _yes_verdict,
 )
+
+
+def test_answer_f1_accepts_semantically_equivalent_llm_judged_answers():
+    assert _answer_f1("2", "twice", semantic_equivalent=True) == 1.0
+    assert _answer_f1(
+        "Nate taught people vegan ice cream recipes on his cooking show.",
+        "teaching others, cooking show",
+        semantic_equivalent=True,
+    ) == 1.0
+    assert _answer_f1("2", "twice") == 0.0
 from engine.modules.memory.judge import OpenAIMemoryJudge
 
 
@@ -287,6 +300,21 @@ def test_engine_memory_examples_use_isolated_project_scopes():
     assert second_context.project_id == "longmemeval-q2"
 
 
+def test_locomo_evidence_ids_are_resolved_to_dialogue_text(tmp_path):
+    dataset = tmp_path / "locomo-evidence.json"
+    dataset.write_text(
+        '[{"sample_id":"conv-a","qa":[{"question":"Where?","answer":"Paris",'
+        '"evidence":["D1:1"],"category":1}],"conversation":{"speaker_a":"A",'
+        '"speaker_b":"B","session_1":[{"speaker":"A","dia_id":"D1:1",'
+        '"text":"I went to Paris."}]}}]',
+        encoding="utf-8",
+    )
+
+    examples = load_memory_dataset(dataset, source="locomo")
+
+    assert examples[0].evidence == ["A: I went to Paris."]
+
+
 def test_engine_retrieval_hydrates_archived_raw_text():
     class Item:
         raw_ref = "project_archive/example.md"
@@ -341,29 +369,34 @@ def test_memory_update_judge_disables_thinking_and_tracks_calls():
 
 def test_long_task_joint_experiment_exercises_all_controls(tmp_path):
     examples = build_long_task_dataset(size=2, seed=1)
-    full = run_long_task_experiment(
+    ours = run_long_task_experiment(
         examples,
         LongTaskExperimentConfig(method="ours_full", output_root=str(tmp_path)),
+    )
+    memory = run_long_task_experiment(
+        examples,
+        LongTaskExperimentConfig(method="memory_only", output_root=str(tmp_path)),
     )
     plain = run_long_task_experiment(
         examples,
         LongTaskExperimentConfig(method="plain", output_root=str(tmp_path)),
     )
 
-    assert full.summary()["pass_rate"] == 1.0
-    assert full.summary()["avg_memory_use_accuracy"] == 1.0
-    assert full.summary()["avg_pause_correctness"] == 1.0
-    assert full.summary()["avg_recovery_success"] == 1.0
-    assert full.summary()["avg_planned_steps"] == 10.0
-    assert full.summary()["avg_steps"] == 13.0
+    assert ours.summary()["avg_qa_acc"] == 1.0
+    assert ours.summary()["avg_memory_use_accuracy"] == 1.0
+    assert ours.summary()["avg_ledger_tokens"] > 0
+    assert memory.summary()["avg_ledger_tokens"] == 0
+    assert ours.summary()["avg_context_tokens"] != memory.summary()["avg_context_tokens"]
+    assert ours.summary()["avg_drift_rate"] < memory.summary()["avg_drift_rate"]
+    assert ours.summary()["avg_steps"] == 6.0
+    assert all(row.metrics["selected_evidence_chunks"] <= 5 for row in ours.rows + memory.rows)
     assert plain.summary()["pass_rate"] == 0.0
-    assert plain.summary()["avg_goal_retention"] == 1.0
-    assert plain.summary()["avg_constraint_compliance"] == 1.0
-    assert plain.summary()["avg_pause_correctness"] == 1.0
+    assert plain.summary()["avg_qa_acc"] == 0.0
+    assert all(Path(row.metadata["trajectory_path"]).exists() for row in ours.rows + memory.rows + plain.rows)
     assert all(
         row.metadata["evaluation_policy"]
-        == "shared_prompt_shared_disturbances_layered_readiness_v5"
-        for row in full.rows + plain.rows
+        == "end_to_end_multiturn_governed_agent_v8"
+        for row in ours.rows + memory.rows + plain.rows
     )
 
 
@@ -376,9 +409,37 @@ def test_long_task_reports_basic_readiness_separately_from_disturbance_handling(
     row = memory_only.rows[0]
 
     assert row.metrics["basic_task_readiness"] == 1
-    assert row.metrics["disturbance_handling_score"] == pytest.approx(1 / 3)
     assert row.metrics["final_task_success"] == 0
-    assert row.metrics["recovery_success"] == 0
+    assert 0 < row.metrics["drift_rate"] < 1
+    assert row.metrics["task_success"] == int(
+        row.metrics["qa_acc"]
+        and row.metrics["drift_rate"] <= 0.2
+        and row.metrics["constraint_compliance"] >= 0.8
+        and row.metrics["budget_violation_rate"] <= 0.2
+        and row.metrics["recovery_success"]
+    )
+
+
+def test_long_task_budget_pressure_is_measured_after_active_compaction(tmp_path):
+    example = build_long_task_dataset(size=1, seed=11)[0]
+    example.history.extend(["irrelevant runtime log " * 400 for _ in range(8)])
+    common = dict(
+        output_root=str(tmp_path),
+        max_context_tokens=4000,
+        reserved_output_tokens=500,
+        budget_ratios=(1.0, 0.8, 0.7, 0.5, 0.3, 0.45),
+    )
+
+    memory = run_long_task_experiment(
+        [example], LongTaskExperimentConfig(method="memory_only", **common)
+    )
+    ours = run_long_task_experiment(
+        [example], LongTaskExperimentConfig(method="ours_full", **common)
+    )
+
+    assert memory.rows[0].metrics["budget_action_rate"] == 0
+    assert ours.rows[0].metrics["budget_action_rate"] > 0
+    assert ours.rows[0].metrics["budget_violation_rate"] < memory.rows[0].metrics["budget_violation_rate"]
 
 
 def test_skill_experiment_generates_retrievable_skill(tmp_path):

@@ -249,12 +249,16 @@ def _evaluate_example(
     prediction, qa_usage, qa_error = _answer_question(example.question, context, cfg)
     qa_seconds = time.perf_counter() - answer_started
     qa_exact = _exact_match(prediction, example.answer)
-    answer_f1 = _answer_f1(prediction, example.answer)
     judge_started = time.perf_counter()
     qa_correct, judge_usage, judge_response, judge_error = _judge_qa_answer(
         example, prediction, cfg, qa_error=qa_error
     )
     judge_seconds = time.perf_counter() - judge_started
+    answer_f1 = _answer_f1(
+        prediction,
+        example.answer,
+        semantic_equivalent=qa_correct and cfg.qa_solver == "llm",
+    )
     metrics: Dict[str, Any] = {
         "qa_acc": int(qa_correct), "qa_exact_match": int(qa_exact),
         "answer_f1": answer_f1, "retrieved": len(retrieved),
@@ -307,6 +311,8 @@ def _answer_question(question: str, context: str, cfg: MemoryExperimentConfig) -
             model=cfg.qa_model or settings.model,
             messages=[{"role": "system", "content": QA_SYSTEM_PROMPT}, {"role": "user", "content": _qa_prompt(question, context)}],
             temperature=0,
+            # Keep generation and judging in the same non-thinking evaluation mode.
+            extra_body={"thinking": {"type": "disabled"}},
         )
         usage = getattr(response, "usage", None)
         usage_data = json.loads(usage.model_dump_json()) if usage is not None else {}
@@ -515,16 +521,23 @@ def _exact_match(prediction: str, answer: str) -> bool:
     return _norm(prediction) == _norm(answer)
 
 
-def _answer_f1(prediction: str, answer: str) -> float:
+def _answer_f1(
+    prediction: str,
+    answer: str,
+    *,
+    semantic_equivalent: bool = False,
+) -> float:
+    """Use the existing LLM judge to avoid penalizing semantic paraphrases."""
     predicted = _answer_tokens(prediction)
     expected = _answer_tokens(answer)
     if not predicted or not expected:
-        return float(bool(predicted == expected))
+        return 1.0 if semantic_equivalent else float(bool(predicted == expected))
     hits = sum((Counter(predicted) & Counter(expected)).values())
     if not hits:
-        return 0.0
+        return 1.0 if semantic_equivalent else 0.0
     precision, recall = hits / len(predicted), hits / len(expected)
-    return round(2 * precision * recall / (precision + recall), 6)
+    lexical_f1 = round(2 * precision * recall / (precision + recall), 6)
+    return max(lexical_f1, 1.0 if semantic_equivalent else 0.0)
 
 
 def _answer_tokens(text: str) -> List[str]:
