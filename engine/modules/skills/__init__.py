@@ -16,6 +16,8 @@ from ._types import (
 )
 from .evolution import SkillEvolutionService
 from .repository import SkillRepository
+from .installations import SkillInstallationStore
+from .semantic import SkillSemanticIndex
 from .retrieval import SkillRetriever
 from .trace import SkillTraceEvent, SkillTraceStore
 
@@ -30,6 +32,8 @@ __all__ = [
     "SkillMatch",
     "SkillRecord",
     "SkillRepository",
+    "SkillInstallationStore",
+    "SkillSemanticIndex",
     "SkillRetriever",
     "SkillStatus",
     "SkillTraceEvent",
