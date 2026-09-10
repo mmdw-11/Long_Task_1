@@ -2968,10 +2968,12 @@ def create_app(
     def import_skill_git(req: Dict[str, Any], request: Request) -> Dict[str, Any]:
         try:
             url = str(req.get("url") or "")
-            package = read_skill_git(url)
+            requested_subdir = str(req.get("subdir") or "").strip().strip("/")
+            package = read_skill_git(url, requested_subdir)
+            source_path = str(package.get("source_path") or requested_subdir or "")
             user_id=_request_user_id(request)
-            if any(item.owner_user_id==user_id and item.package_sha256==package["sha256"] for item in skills.list()): raise ValueError("该 Git 内容已导入")
-            record = skills.create(name=package["name"],content=package["content"],description=str(req.get("description") or "从 Git 仓库导入"),status=SkillStatus.DRAFT,tags=["imported","git"],metadata={"source":"git","source_url":url,"revision":package["sha256"],"references":package["references"],"scripts_ignored":True},owner_user_id=user_id,visibility="private",source_type="git",validation_status="pending",package_sha256=package["sha256"])
+            if any(item.owner_user_id==user_id and item.package_sha256==package["sha256"] and str((item.metadata or {}).get("subdir") or "")==source_path for item in skills.list()): raise ValueError("该 Git 内容已导入")
+            record = skills.create(name=package["name"],content=package["content"],description=str(req.get("description") or package.get("description") or "从 Git 仓库导入"),status=SkillStatus.DRAFT,tags=["imported","git"],metadata={"source":"git","source_url":url,"subdir":source_path,"revision":package["sha256"],"references":package.get("references") or {},"scripts_ignored":True},owner_user_id=user_id,visibility="private",source_type="git",validation_status="pending",package_sha256=package["sha256"])
             return _skill_payload(record,user_id)
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -2981,7 +2983,7 @@ def create_app(
         try:
             package = read_skill_zip(await request.body())
             user_id=_request_user_id(request)
-            record = skills.create(name=package["name"],content=package["content"],description=request.headers.get("x-skill-description","从 ZIP 包导入"),status=SkillStatus.DRAFT,tags=["imported","zip"],metadata={"source":"zip","sha256":package["sha256"],"references":package["references"],"scripts_ignored":True},owner_user_id=user_id,visibility="private",source_type="zip",validation_status="pending",package_sha256=package["sha256"])
+            record = skills.create(name=package["name"],content=package["content"],description=request.headers.get("x-skill-description") or package.get("description") or "从 ZIP 包导入",status=SkillStatus.DRAFT,tags=["imported","zip"],metadata={"source":"zip","sha256":package["sha256"],"references":package["references"],"scripts_ignored":True},owner_user_id=user_id,visibility="private",source_type="zip",validation_status="pending",package_sha256=package["sha256"])
             return _skill_payload(record,user_id)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -2997,7 +2999,7 @@ def create_app(
             source_type = "zip" if filename.lower().endswith(".zip") else "manual"
             record = skills.create(
                 name=package["name"], content=package["content"],
-                description=request.headers.get("x-skill-description", "从文件导入"),
+                description=request.headers.get("x-skill-description") or package.get("description") or "从文件导入",
                 status=SkillStatus.DRAFT, tags=["imported", "file"],
                 metadata={"source":"file","filename":filename,"sha256":package["sha256"],"references":package["references"],"scripts_ignored":True},
                 owner_user_id=user_id, visibility="private",
