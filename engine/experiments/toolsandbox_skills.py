@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -10,6 +11,46 @@ from typing import Any
 
 
 METHODS = ("no_skill", "manual_skill", "ours_no_validation", "ours_full")
+
+
+class BGERetrievalUnavailable(RuntimeError):
+    """Raised instead of silently changing a formal run to lexical retrieval."""
+
+
+class BGEPolicyRetriever:
+    """Small, auditable BGE-M3 ranker for the experiment's skill library.
+
+    Keyword anchors remain a safety gate, not the ranking signal.  A formal
+    run must construct this object successfully; callers may opt into lexical
+    retrieval only for isolated unit tests and local development.
+    """
+
+    def __init__(self, skills: list["ToolSandboxSkill"], *, embedder: Any | None = None) -> None:
+        try:
+            if embedder is None:
+                from engine.modules.memory import BGEM3EmbeddingModel
+                embedder = BGEM3EmbeddingModel()
+            self._embedder = embedder
+            self._skills = skills
+            self._vectors = [self._embed(skill) for skill in skills]
+        except Exception as exc:
+            raise BGERetrievalUnavailable(
+                "BGE-M3 retrieval is required but could not be initialized; "
+                "install FlagEmbedding and configure a local BGE_M3_MODEL_PATH"
+            ) from exc
+
+    @staticmethod
+    def _text(skill: "ToolSandboxSkill") -> str:
+        return " ".join(skill.applicable_when + skill.not_applicable_when + skill.required_tools + skill.required_slots)
+
+    def _embed(self, skill: "ToolSandboxSkill") -> list[float]:
+        return list(self._embedder.embed(self._text(skill)))
+
+    def score(self, query: str, skill: "ToolSandboxSkill", index: int) -> float:
+        query_vector = list(self._embedder.embed(query))
+        candidate = self._vectors[index]
+        denominator = math.sqrt(sum(x * x for x in query_vector)) * math.sqrt(sum(x * x for x in candidate))
+        return sum(x * y for x, y in zip(query_vector, candidate)) / denominator if denominator else 0.0
 
 _RETRIEVAL_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "before", "by", "do", "for",
@@ -134,11 +175,12 @@ def load_skill_library(root: Path, method: str) -> list[ToolSandboxSkill]:
 
 
 def retrieve_skills(skills: list[ToolSandboxSkill], query: str, *, max_chars: int,
-                    anchor_query: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+                    anchor_query: str | None = None,
+                    bge_retriever: BGEPolicyRetriever | None = None) -> tuple[str, list[dict[str, Any]]]:
     words = _terms(query)
     anchor_words = _terms(anchor_query if anchor_query is not None else query)
     ranked = []
-    for skill in skills:
+    for index, skill in enumerate(skills):
         searchable = " ".join(skill.applicable_when + skill.required_tools + skill.required_slots).lower()
         terms = _terms(searchable)
         overlap = words & terms
@@ -149,7 +191,8 @@ def retrieve_skills(skills: list[ToolSandboxSkill], query: str, *, max_chars: in
         # A single generic word is not enough evidence. This gate prevents a
         # reminder skill from being injected into messaging tasks merely because
         # both descriptions contain words such as "specific" or "missing".
-        score = len(overlap) / max(1, min(len(words), len(terms)))
+        lexical_score = len(overlap) / max(1, min(len(words), len(terms)))
+        score = bge_retriever.score(query, skill, index) if bge_retriever else lexical_score
         ranked.append((score, skill.skill_id, skill, overlap, tool_anchors, domain_match))
     ranked.sort(key=lambda x: (-x[0], x[1]))
     chunks, trace, used = [], [], 0
@@ -157,7 +200,7 @@ def retrieve_skills(skills: list[ToolSandboxSkill], query: str, *, max_chars: in
         content = skill.render()
         strong_anchor = bool(overlap & tool_anchors)
         accepted = domain_match and (strong_anchor or (len(overlap) >= 2 and score >= 0.08)) and used + len(content) <= max_chars
-        trace.append({"skill_id": skill.skill_id, "score": score, "overlap": sorted(overlap),
+        trace.append({"skill_id": skill.skill_id, "score": score, "retrieval_backend": "bge_m3" if bge_retriever else "lexical_dev_only", "overlap": sorted(overlap),
                       "anchors": sorted(tool_anchors), "domain_match": domain_match,
                       "accepted": accepted, "reason": "matched" if accepted else "domain_mismatch_or_weak_match_or_budget"})
         if accepted:

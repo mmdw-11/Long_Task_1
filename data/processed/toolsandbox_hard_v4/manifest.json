@@ -85,5 +85,5 @@
   "source_url": "https://github.com/apple/ToolSandbox",
   "license_file": "LICENSE",
   "tasks_file": "data\\processed\\toolsandbox_hard_v4\\tasks.jsonl",
-  "tasks_sha256": "ce9693a478fce3d7ea33512ba7e6c9dd44272d1eb5dce675edf2a86aad2841ff"
+  "tasks_sha256": "6df4cf12fd32f5bc6b91db0695b7589c143b077d26853a1f89ab8a9995e71eec"
 }

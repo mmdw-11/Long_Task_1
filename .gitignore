@@ -39,3 +39,8 @@ data/raw/toolsandbox/ToolSandbox/
 !.hf_cache/exports/
 .hf_cache/exports/*
 !.hf_cache/exports/lmsys_chatbot_arena_conversations.jsonl.gz
+# Local ToolSandbox source, isolated runtime and reproducible-but-large run artifacts.
+data/raw/toolsandbox/
+.venv-toolsandbox/
+.pip-cache/
+runs/experiments/toolsandbox_hard_v*/
