@@ -97,7 +97,7 @@ class CommunicationManager:
 
     def evaluate(self, capsule: MessageCapsule, *, recipient: str, role: str = "") -> CapsuleDecision:
         if capsule.is_expired(self.clock()): return CapsuleDecision("prune", 0.0, ["expired"], {"freshness": 0.0})
-        text = " ".join([capsule.goal, capsule.subtask, capsule.claim, capsule.next_action])
+        text = self._capsule_text(capsule)
         relevance = _overlap(capsule.goal + " " + capsule.subtask, capsule.claim + " " + role)
         duplicate = max((_similarity(text, self._capsule_text(e.capsule)) for e in self._mailboxes.get(recipient, [])), default=0.0)
         info = 1.0 - duplicate
@@ -134,7 +134,13 @@ class CommunicationManager:
         self.metrics.update({k: int(v) for k, v in (snapshot.get("metrics") or {}).items() if k in self.metrics})
 
     @staticmethod
-    def _capsule_text(c: MessageCapsule) -> str: return " ".join([c.goal, c.subtask, c.claim, c.next_action])
+    def _capsule_text(c: MessageCapsule) -> str:
+        # ``subtask`` commonly defaults to the sender node name.  Including
+        # it makes two otherwise identical relays look artificially distinct
+        # solely because they came from different agents, weakening duplicate
+        # suppression at a fan-in recipient.  Goal/claim/next-action are the
+        # recipient-relevant semantic payload for redundancy comparison.
+        return " ".join([c.goal, c.claim, c.next_action])
 
 
 def _tokens(text: str) -> set[str]: return set(re.findall(r"[\w\u4e00-\u9fff]+", text.lower()))
