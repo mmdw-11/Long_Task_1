@@ -1,0 +1,5 @@
+# Install this file only in .venv-toolsandbox. The official source is installed separately at its frozen commit.
+-e data/raw/toolsandbox/ToolSandbox
+python-dotenv>=1.0,<2
+pytest>=7,<10
+pytest-asyncio>=0.21,<2
