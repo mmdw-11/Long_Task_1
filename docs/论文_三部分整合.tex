@@ -1,0 +1,1699 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+\usepackage[margin=2.54cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,array,calc}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage{upquote}
+\usepackage{hyperref}
+\hypersetup{hidelinks,pdftitle={超长程复杂任务群体智能架构：核心机制与平台使用说明}}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{3}
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\newcommand{\figureplaceholder}[2]{%
+\begin{figure}[htbp]
+\centering
+\fbox{\parbox{0.88\linewidth}{\centering\textbf{待补充图片：#1}\\[0.5em]\small #2}}
+\caption{#1}
+\end{figure}}
+
+\begin{document}
+
+\title{超长程复杂任务群体智能架构：核心机制与平台使用说明}
+\maketitle
+
+\section{核心创新与关键机制}
+
+\subsection{三项核心创新的协同闭环}
+
+本系统面向超长程复杂任务，不将记忆、协作和资源选择视为彼此独立的附加模块，而是构建由任务状态统一驱动的自治闭环。系统首先从用户目标、当前输入、历史状态和资源约束中感知任务；随后由规划器生成可验证的 TODO 和验收条件；执行阶段按任务需要选择异构成员、相关证据、工具和端—边—云推理位置；质量门、漂移检测、预算控制、失败恢复和检查点再将结果反馈给下一轮规划。由此形成“感知—规划—执行—反馈—再规划”的连续过程。
+
+三项核心创新分别承担不同而相互依赖的职责：超长程上下文连续性机制负责保存目标、约束、证据和恢复状态，使系统不会因长历史或中断失去任务语义；TIDE-Mesh 负责根据当前 TODO 选择成员、建立临时稀疏协作边并抑制消息冗余；TIDE-Placement 则负责在满足实时性和可信域约束的前提下选择 DEVICE、EDGE 或 CLOUD 推理位置。前一机制提供稳定任务状态，中间机制决定组织与通信，后一机制确保执行资源与任务需求一致，三者共同支撑可持续的复杂任务交付。
+
+\figureplaceholder{核心创新协同与自治闭环总览}{建议绘制五层闭环：用户目标与环境输入、任务规划与 TODO、动态团队和低熵通信、端—边—云执行、质量/记忆/恢复反馈。图中用三种颜色分别标出 Context Ledger 与 Memory、TIDE-Mesh、TIDE-Placement 的作用范围，并用回边表示质量门、漂移检测和检查点如何触发下一轮决策。}
+
+\begin{longtable}{p{0.20\linewidth}p{0.29\linewidth}p{0.42\linewidth}}
+\toprule
+核心创新 & 直接解决的问题 & 对完整系统闭环的贡献 \\
+\midrule
+超长程上下文连续性与记忆保持 & 历史膨胀、目标稀释、证据丢失、中断后难以恢复 & 将目标、硬约束、计划、事实、失败和预算外部化；按需唤醒证据并恢复一致状态 \\
+TIDE-Mesh 动态异构拓扑与低熵通信 & 固定团队、无序广播、冗余消息和错误级联 & 依据 TODO、能力与资源激活临时协作子图；以 Capsule、贡献门控和状态差分控制信息流 \\
+TIDE-Placement 端—边—云调度 & 单一模型位置、敏感数据外流、复杂任务算力不足和资源故障 & 根据实时性、敏感度、复杂度和资源状态分配推理位置，并在失败后重新调度 \\
+\bottomrule
+\end{longtable}
+
+该总体设计对应评审中的系统完整性、组织架构与协作机制、架构交互、核心算法和资源效率要求。后续案例与综合实验章节将从任务完成度、消息与上下文成本、运行时间、恢复行为和跨模型适配等维度给出证据。
+
+\subsection{超长程上下文连续性与记忆保持：面向复杂任务的外部状态、证据唤醒与可恢复执行}
+
+\subsubsection{1. 问题定义与本章结论}
+
+\paragraph{1.1 从``更长 Prompt''到``可治理状态''}
+
+超长程任务并非只是模型需要记住更多对话。一次持续数十步的执行需要连续保持：最初目标、不可违反的约束、已验证与待核验事实、计划进度、工具结果、资源预算，以及中断后的恢复位置。若将历史按时间顺序全部拼入 Prompt，会产生三类失效：过程日志淹没早期目标；短摘要丢失数值、时间更新和多证据关系；中断后只能让模型猜测历史，无法审计恢复是否正确。
+
+本文将\textbf{上下文连续性}定义为：在有限输入预算下，系统能够在每个节点重建与当前决策相关、来源可追溯的任务状态，并在异常后恢复目标、约束、计划和证据的一致版本。为此，本文不依赖``无限上下文''，而是将状态外部化为账本、记忆、原文归档和检查点，并以预算、漂移和恢复机制约束整个运行过程。
+
+设第 \(s\) 步的节点可见上下文为 \(C_s\)，有效输入预算为 \(B_{in}\)，则系统希望构造：
+
+\[
+C_s=\operatorname{Assemble}(L_s,I_s,E_s),\qquad \operatorname{Tok}(C_s)\le B_{in}.
+\]
+
+其中，\(L_s\) 是稳定的 Context Ledger，\(I_s\) 是当前节点输入，\(E_s\) 是按需唤醒的历史证据。这里的核心是让``任务骨架''始终可见，让``历史细节''仅在需要时出现。
+
+\begin{quote}
+【图片占位：图 1 超长程任务的上下文失效与解决路径。左侧为全量历史拼接导致窗口膨胀、目标稀释和中断失忆；右侧为 Ledger、Memory、Archive、Budget/Drift/Checkpoint 形成的闭环。】
+\end{quote}
+
+\paragraph{1.2 设计目标}
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+目标 & 设计机制 & 节点层面的可观察结果 \\
+\midrule
+\endhead
+目标不漂移 & 原始目标、硬约束和当前 TODO 稳定注入 & 每一轮均可重锚定任务意图 \\
+历史可用不过载 & 分层记忆、摘要索引、原文按需展开 & 上下文随相关证据增长，而非随全部历史增长 \\
+事实可追溯 & \texttt{summary} 与 \texttt{raw\_ref} 双轨保存 & 摘要可回到原始会话、工具输出或归档 \\
+预算可治理 & BudgetController 和有效输入上限 & 超限时显式暂停并留下原因 \\
+中断可恢复 & Context/Graph Checkpoint & 恢复外部状态而非让模型猜进度 \\
+\bottomrule
+\end{longtable}
+
+本章不把``答案字符串在历史中出现''直接视为 QA 正确率，也不把确定性构造场景的治理通过率写成真实 LLM Agent 的端到端成功率。第 5、6 节将严格区分这。
+
+\paragraph{1.3 实验三的核心结论}
+
+当前工程已经实现账本、预算控制、漂移检测、上下文压缩归档、四层记忆作用域、分级唤醒和检查点，并通过 Hook 生命周期接入图执行。新版实验三在 100 条 LoCoMo 多轮任务上验证了该闭环：Ours Full 的 Goal Retention 为 0.90、Constraint 为 0.85、Drift Rate 为 0.10、Recovery 为 0.91、Budget Violation 为 0.00，且 Avg Context Tokens 为 954。
+
+在记忆证据层面，Ours Full 的 Gold Recall@5 为 0.65、Evidence Sufficiency 为 0.63、Memory Use Accuracy 为 0.40。由此说明，系统能够将任务骨架、历史证据和恢复状态外部化，并在多轮扰动条件下按需重建受控上下文。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{2. 系统状态模型与总体架构}
+
+\paragraph{2.1 四类外部状态}
+
+系统不让单一摘要承担所有职责，而是将状态拆分为四类。
+
+\begin{longtable}[]{@{}llll@{}}
+\toprule
+状态对象 & 回答的问题 & 核心内容 & 生命周期 \\
+\midrule
+\endhead
+Context Ledger & 现在要做什么、做到哪里 & 原始目标、约束、计划、TODO、事实、失败、预算、下一动作 & 单次 run \\
+Memory Store & 哪些历史与当前问题相关 & 带作用域、标签、时间和重要度的记忆项及索引 & 节点至跨项目 \\
+Cold Archive & 原始证据在哪里 & 会话片段、节点输出、工具返回等完整载荷 & 可长期保留 \\
+Checkpoint & 中断后从何处继续 & 账本快照、归档引用、前沿节点、图状态 & 单次 run，可持久化 \\
+\bottomrule
+\end{longtable}
+
+例如，预算约束应稳定保存在 Ledger；上周工具得到的原始表格应作为可检索、可回溯的 Archive 证据；``第 8 步完成、第 9 步待重试''则属于 Ledger 与 Checkpoint 共同维护的恢复状态。只有将它们分开，系统才能明确哪些内容不可丢、哪些内容可压缩、哪些内容应在恢复时展开。
+
+\paragraph{2.2 Context Ledger：稳定任务锚点}
+
+\texttt{ContextLedger} 是 run 级上下文骨架，保存 \texttt{original\_goal}、\texttt{hard\_constraints}、\texttt{current\_plan}、已完成/待完成步骤、\texttt{todo\_items} 与修订事件、\texttt{key\_facts}、\texttt{open\_questions}、工具和失败摘要、预算以及 \texttt{next\_action}。节点开始时，这些字段会渲染为固定结构：
+
+\begin{verbatim}
+[Stable Task Anchor]
+Original Goal / Hard Constraints
+Current Node Role and Step Objective
+Completed and Pending Todos
+Verified Facts / Things Not To Assume
+Expected Output Contract / Budget / Next Action
+\end{verbatim}
+
+账本的职责是保证``模型即使没有命中任何历史记忆，仍不会忘记任务是什么''。检索层只补充当前决策所需的历史细节，不能取代账本。
+
+\paragraph{2.3 四层作用域与多介质记忆}
+
+记忆从窄到宽划分为 WORKING、TASK、PROJECT、GLOBAL 四层；检索时可从当前局部状态逐级扩展，避免项目或任务之间相互污染。
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+作用域 & 典型内容 & 隔离理由 \\
+\midrule
+\endhead
+WORKING & 当前节点草稿、局部中间量 & 仅对本节点有效 \\
+TASK & 当前 run 的中间结论、执行反馈 & 不应被其他 run 默认继承 \\
+PROJECT & 同项目跨 run 的历史结论、资料 & 防止跨项目串扰 \\
+GLOBAL & 低风险、通用稳定知识 & 必须谨慎写入 \\
+\bottomrule
+\end{longtable}
+
+作用域与物理介质是正交的：HOT 提供进程内低延迟读取，WARM 提供可选 TTL 缓存，STRUCTURED 保存结构化元数据，SEMANTIC 支持向量检索，COLD 保存 Markdown/JSONL 审计归档，GRAPH 为关系记忆扩展预留接口。单条记忆可抽象为：
+
+\[
+m=(id,content,summary,raw\_ref,scope,scope\_id,tags,importance,time,metadata).
+\]
+
+\texttt{summary} 服务检索和轻量注入，\texttt{raw\_ref} 指向完整证据；实际实现支持 DENSE、SPARSE、HYBRID 和 HYBRID\_TEMPORAL 检索。
+
+\begin{quote}
+【图片占位：图 2 任务状态与分层记忆。中心画 Context Ledger；外圈依次为 WORKING、TASK、PROJECT、GLOBAL；每一层映射到 HOT/WARM/STRUCTURED/SEMANTIC/COLD。用箭头显示 \texttt{summary} 与 \texttt{raw\_ref} 的双轨关系。】
+\end{quote}
+
+\paragraph{2.4 摘要—归档—唤醒的双轨证据链}
+
+长载荷不应反复完整输入，也不能只留无来源摘要。系统采用以下闭环：
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  节点结束后提取结果摘要、关键事实、标签和失败原因；
+\item
+  超过阈值的原始输出写入冷归档，摘要保存 \texttt{raw\_ref}；
+\item
+  摘要、时间、作用域和向量进入检索索引；
+\item
+  后续节点根据目标、角色、输入和近期状态检索摘要候选；
+\item
+  仅在命中、风险或恢复需要时展开原文，并受预算限制。
+\end{enumerate}
+
+这意味着压缩并非删除：系统以短文本完成大部分定位，以原文保证可核验性。审计者可以沿 \texttt{raw\_ref} 回到会话或工具原始输出，检查摘要是否遗漏了更新事实或关键数字。
+
+\paragraph{2.5 分级唤醒}
+
+\begin{longtable}[]{@{}lllrl@{}}
+\toprule
+等级 & 适用场景 & 作用域 & Top-K & 检索与归档策略 \\
+\midrule
+\endhead
+Silent & 低风险局部步骤 & WORKING、TASK & 3 & 稠密检索；不展开 \\
+Standard & 常规节点 & 四层级联 & 5 & 混合检索；按需展开 \\
+Deep & 多证据复核 & 四层级联 & 8 & 混合检索；预展开前 2 条 \\
+Recovery & 中断恢复、追溯 & 四层级联 & 10 & 时态混合检索；展开全部命中归档 \\
+\bottomrule
+\end{longtable}
+
+Recovery Profile 在当前实现中使用 0.15 的时间权重。这里的级联不是把所有层无差别拼接，而是先搜索最窄的相关范围，再逐级扩展；风险更高、需要核验或恢复时才提高唤醒深度。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{3. 上下文连续性运行机制}
+
+\paragraph{3.1 节点前：稳定锚点与当前证据分别构造}
+
+HookManager 在 \texttt{on\_step\_start} 更新账本中的步骤和前沿节点；在实际调用节点前，分别执行账本注入、记忆唤醒和预算检查。第 (s) 步上下文可表示为：
+
+\[
+C_s=A(L_s)\oplus I_s\oplus R(q_s,M)\oplus O_s.
+\]
+
+其中 \(A(L_s)\) 为稳定任务锚点，\(R(q_s,M)\) 为检索证据，\(O_s\) 为节点角色和输出约束。该顺序保证检索失败时仍能保持目标和约束；检索命中时，原始证据又不会覆盖任务骨架。
+
+\begin{quote}
+【图片占位：图 3 节点上下文装配泳道图。Graph State 分别产生 Ledger Anchor 和 Query；Query 经 Cascade Retrieval/Archive Expansion，与当前输入一起进入 Budget Gate，最后注入节点 Prompt。】
+\end{quote}
+
+\paragraph{3.2 显式预算闸门}
+
+\texttt{ContextBudgetController} 在调用前估算状态 token，预留输出预算后计算有效输入上限：
+
+\[
+B_{in}=B_{max}-B_{out}.
+\]
+
+若已用上下文超出 \(B_{in}\)，控制器返回 \texttt{allowed=False}，将运行状态标为 \texttt{budget\_paused}，并写入已用 token、限制值和暂停原因；此时应压缩、降低唤醒深度、等待人工决策或从检查点恢复，而不是静默截断。当前估算是与模型无关的保守近似，正式报告还应同时给出模型侧实际 token，不能将该近似当作精确计费。
+
+\paragraph{3.3 漂移检测与受限计划更新}
+
+\texttt{DriftDetector} 不只检测图环，还检测语义重复、重复资源/工具/文件操作、TODO 长期不前移和目标语义偏离；必要时可加入 LLM Judge。检测结果作为带证据的失败摘要进入 Ledger，使后续节点知道``为何不能继续重复''，而不是只收到一句无来源告警。
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+信号 & 典型现象 & 响应 \\
+\midrule
+\endhead
+节点或动作重复 & 同一操作连续重试 & 暂停、重规划或切换节点 \\
+语义摘要重复 & 多轮没有新增进展 & 标记停滞 \\
+资源重复 & 反复读同一文件、调用同一工具 & 形成结构性循环证据 \\
+待办积压 & TODO 反复重开或不前移 & 检查计划一致性 \\
+目标偏离 & 当前状态远离原始目标 & 重新注入目标并校正 \\
+\bottomrule
+\end{longtable}
+
+\paragraph{3.4 节点后：事实固化与检查点}
+
+节点结束后，系统抽取输出、工具结果、关键事实和失败原因；长结果写入 Archive，摘要写入 TASK 记忆，账本同步记录事实、TODO 事件与下一动作。记忆更新接口支持 \texttt{ADD}、\texttt{UPDATE}、\texttt{DELETE}、\texttt{NOOP}，可用于知识更新判断；但该 Judge 的稳定收益尚未证实，不能因接口存在就声称解决事实演化。
+
+Context Checkpoint 保存 Ledger、\texttt{MEMORY.md}、归档引用和元数据；Graph Checkpoint 保存执行步数、前沿节点和图状态。恢复流程是``恢复外部状态 → Recovery 唤醒证据 → 重新预算检查 → 从前沿节点继续''，而不是把旧 Prompt 重发并让模型猜测。
+
+\begin{quote}
+【图片占位：图 4 执行与恢复状态机。至少包含 RUNNING、BUDGET\_PAUSED、NODE\_ERROR、CHECKPOINTED、RECOVERING、RESUMED；恢复路径必须同时恢复 Ledger、GraphState 和 \texttt{raw\_ref}。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{4. 核心算法}
+
+\begin{verbatim}
+Algorithm 1  Context-Continuous Node Execution
+Input : node n, state X, memory M, ledger store L, budget controller B
+Output: node update ΔX or recoverable paused state
+
+1  r ← ResolveRunId(X); ledger ← L.LoadOrCreate(r, X)
+2  ledger ← UpdateStepState(ledger, current_step, frontier)
+3  q ← BuildQuery(n, X, ledger.original_goal, ledger.active_todo_id)
+4  profile ← SelectWakeupProfile(n, ledger, X)
+5  evidence ← M.CascadeWake(q, profile, scope_context(X))
+6  C ← Assemble(RenderStableAnchor(ledger), CurrentInput(X),
+                evidence.context_text, OutputContract(n))
+7  d ← B.Check(C)
+8  if d.allowed = false then
+9      Save(ledger, d); SaveContextCheckpoint(ledger, X)
+10     return MarkPaused(X, d.pause_reason)
+11 end if
+12 Inject(C, X); return Invoke(n, X)
+\end{verbatim}
+
+算法的关键是稳定锚点和检索证据分开生成，且在最终装配后再过预算闸门。若把目标也交给检索，目标可能因相似度不足而消失；若只保留账本，节点又缺少数值、时间和原始会话细节。
+
+\begin{verbatim}
+Algorithm 2  Cascade Wakeup with Archive Expansion
+1  按作用域从窄到宽召回候选；按 content/raw_ref 去重并排序
+2  选择 profile.top_k 条候选
+3  对每一候选：若 profile 要求且原文仍符合预算，则展开 raw_ref；否则注入摘要和引用
+4  返回有序证据集合
+\end{verbatim}
+
+实验路径采用``高召回候选集合 → BGE-M3 稠密重排 → 预算内 Top-5 片段选择''。相较于直接将会话整体送入模型，该过程以证据片段为粒度完成选择和注入，更适合多轮上下文治理场景。
+
+设索引候选数为 \(K_c\)，最终证据数为 \(K\)，单条展开长度为 \(R\)，则重排约为 \(O(K_c)\) 至 \(O(K_c\log K_c)\)，归档展开约为 \(O(KR)\)。系统不消除检索和重排成本，而是用``小而稳定的账本 + 有上限的相关证据''替代每一步全历史线性输入。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{5. 实验三：多轮上下文连续性与记忆保持验证}
+
+\paragraph{5.1 实验目标与对照方法}
+
+实验三验证系统在多轮决策流转中持续保持目标、动态约束和历史证据的能力，并考察其在目标漂移、动态预算压力和执行中断下的上下文连续性。四种方法面对同一批历史会话、相同的六轮事件序列、相同的预算变化和相同的故障注入规则。
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+方法 & 配置 \\
+\midrule
+\endhead
+Plain Agent & 不注入外部历史记忆，不启用 Ledger、漂移控制、预算控制或检查点恢复 \\
+Full-Context Agent & 在有效输入预算内保留完整历史尾部，不启用分层记忆与运行治理模块 \\
+Memory Only & 使用 BGE-M3 检索历史证据，但不启用 Ledger、漂移控制、预算控制或检查点恢复 \\
+Ours Full & BGE-M3 Top-5 证据唤醒 + Context Ledger + 漂移防护 + 上下文压缩 + 检查点恢复 \\
+\bottomrule
+\end{longtable}
+
+Full-Context Agent 是受输入预算约束的全历史基线：当完整历史超过预算时，保留最新的完整历史尾部。Memory Only 与 Ours Full 使用相同的 BGE-M3 检索器和 Top-5 证据集合，以分离检索能力与上下文治理能力。
+
+\paragraph{5.2 数据集与多轮任务构造}
+
+实验数据来自 LoCoMo 公开多会话对话集。基于原始 10 条长对话，系统筛选并固化 100 条唯一任务，数据文件为 \texttt{data/processed/locomo\_multiturn\_gold\_100\_v12.jsonl}，SHA-256 为 \texttt{C102DD765D0EB054A3BB0BAB90C99B3B12B50B9278644AB09EDFB84D5D7B6414}。
+
+数据集仅保留具有 1--2 条人工标注 gold evidence 的直接事实型问题：其中 4 条任务具有 1 条 gold evidence，96 条具有 2 条 gold evidence。每条问题与至少一条 gold evidence 保持可检索的词项锚点；同时保留完整历史、原始目标、两条初始硬约束、一个中途新增约束、一个冲突干扰指令及可恢复计划。每条任务使用独立 ID、运行目录、记忆作用域和轨迹文件。
+
+每个任务采用固定六轮事件流：第 0 轮建立目标，第 1 轮推进计划，第 2 轮加入新约束并建立检查点，第 3 轮注入目标漂移干扰并触发中断，第 4 轮注入大规模运行日志形成预算压力，第 5 轮基于历史证据完成问题回答。中断模式由任务 ID 的稳定哈希确定，覆盖瞬态中断、历史丢失、检查点丢失和状态丢失，确保四种方法经历相同扰动分布。
+
+模型上下文窗口设为 16,384 token，并预留 2,048 token 用于输出，有效输入预算为 14,336 token。检索阶段将历史划分为不超过 600 字符的连续片段，在 100 个候选片段上用 BGE-M3 稠密重排，并向 Memory Only 与 Ours Full 注入 Top-5 证据。Ours Full 在预算压力后按``目标—约束—当前事件—治理决定—账本—Top-K 证据—近期轨迹''的优先级组织上下文。
+
+\paragraph{5.3 指标定义}
+
+表中仅报告以下九项指标。除 Avg Context Tokens 外，均先在单任务粒度计算，再对 100 条任务取平均值。
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}@{}}
+\toprule
+指标 & 定义与计算方法 \\
+\midrule
+\endhead
+Evidence Suff. & 语义裁判根据问题、参考答案、gold evidence 与实际注入的 Top-K 证据，判断该证据集合是否足以推出答案；其结果在任务上的平均值。 \\
+Gold Recall@5 & 设第 \(i\) 条任务的 gold evidence 集合为 \(G_i\)，Top-5 检索证据为 \(R_i\)，计算 \(\frac{1}{|G_i|}\sum_{g\in G_i}\mathbb{I}[g\subseteq R_i]\)，再对任务求均值。 \\
+Memory Use Acc. & 仅当实际 Top-K 证据被判定充分，且基于该证据生成的最终回答经语义裁判判定正确时记为 1，即 \(\mathrm{MUA}_i=\mathrm{Suff}_i\land\mathrm{Correct}_i\)。 \\
+Goal Retention & 轨迹裁判逐轮判断当前行动是否仍服务于原始目标，取六轮判断结果的平均值。 \\
+Constraint & 从第 2 轮新增约束起，逐轮检查当前状态是否同时保留初始硬约束与新增约束，取相关轮次平均值。 \\
+Drift Rate & 被轨迹裁判判定为实质性转向冲突目标或放弃原任务的轮次数除以六轮总数；越低越好。 \\
+Recovery & 中断发生后，若系统在之后至多 3 轮内恢复中断前进度、原始目标和全部约束，则该任务记为 1；对所有任务取平均值。 \\
+Budget Violation & 每轮先按照动态预算检查原始上下文；采用压缩后仍超过预算则记为 1。该指标为全部任务、全部轮次的平均违规率；越低越好。 \\
+Avg Context Tokens & 每轮完成上下文组织与预算处理后的 token 估计值，去除共享系统提示词后在全部任务和轮次上取平均值。 \\
+\bottomrule
+\end{longtable}
+
+轨迹与证据裁判均采用结构化 JSON 输出和温度为 0 的固定配置；每条任务均保存 Top-K 证据、逐轮上下文摘要、行动、预算判定、恢复状态和裁判结果。
+
+\begin{quote}
+【图片占位：图 5 多轮实验协议。展示``目标建立→计划推进→新增约束/检查点→漂移与中断→预算压力→基于证据回答''的六轮序列，以及四种方法共享同一事件流。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{6. 实验三结果与分析}
+
+\paragraph{6.1 总体结果}
+
+表 6 给出 LoCoMo 多轮长程任务上的正式结果。所有方法均在相同 100 条任务、相同 Top-5 配置、相同动态预算与相同故障注入条件下运行。
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.07}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 20\tabcolsep) * \real{0.09}}@{}}
+\toprule
+Method & N & Evidence Suff. & Gold Recall@5 & Memory Use Acc. & Goal Retention & Constraint & Drift Rate & Recovery & Budget Violation & Avg Context Tokens \\
+\midrule
+\endhead
+Plain Agent & 100 & 0.00 & 0.00 & 0.00 & 0.60 & 0.56 & 0.40 & 0.21 & 0.17 & 1,132 \\
+Full-Context Agent & 100 & 0.40 & 0.54 & 0.24 & 0.76 & 0.70 & 0.25 & 0.78 & 0.82 & 13,440 \\
+Memory Only & 100 & \textbf{0.64} & \textbf{0.65} & 0.31 & 0.59 & 0.47 & 0.41 & 0.19 & 0.17 & 1,794 \\
+Ours Full & 100 & 0.63 & \textbf{0.65} & \textbf{0.40} & \textbf{0.90} & \textbf{0.85} & \textbf{0.10} & \textbf{0.91} & \textbf{0.00} & \textbf{954} \\
+\bottomrule
+\end{longtable}
+
+\paragraph{6.2 证据唤醒与记忆使用}
+
+Memory Only 与 Ours Full 均使用 BGE-M3 Top-5 检索，两者的 Gold Recall@5 同为 0.65，说明在相同候选与检索配置下，所提出框架能够保持稳定的证据召回能力。Ours Full 的 Evidence Sufficiency 为 0.63，表明最终注入的 Top-K 证据在多数任务中能够形成回答所需的信息闭环；其 Memory Use Accuracy 达到 0.40，为四种方法中最高，说明外部记忆、账本状态和多轮治理共同提高了已唤醒证据在最终任务中的有效使用比例。
+
+\paragraph{6.3 目标、约束与漂移控制}
+
+Ours Full 的 Goal Retention 为 0.90、Constraint 为 0.85，分别较 Full-Context Agent 提升 0.14 和 0.15。第 3 轮冲突指令到来后，系统利用漂移防护将原始目标与活动约束重新注入当前上下文，使 Drift Rate 降至 0.10；该结果低于其余三种方法，验证了 Context Ledger 与漂移控制对多轮决策方向的稳定作用。
+
+\paragraph{6.4 中断恢复与预算控制}
+
+在统一的状态丢失、历史丢失、检查点丢失和瞬态中断条件下，Ours Full 的 Recovery 为 0.91。其检查点保存目标、约束、执行进度和轨迹状态，使恢复过程能够回到中断前的可执行状态。
+
+在动态预算压力下，Ours Full 的 Budget Violation 为 0.00。系统在检测到预算压力后对运行日志和近期轨迹进行压缩，并以任务目标、约束、治理决定、账本和检索证据为优先级重新组合上下文。Ours Full 的 Avg Context Tokens 为 954，较 Full-Context Agent 的 13,440 降低 \textbf{92.9\%}，同时低于 Plain Agent 的 1,132 和 Memory Only 的 1,794，表明上下文压缩机制在维持任务骨架与证据可用性的同时实现了稳定的预算约束。
+
+\paragraph{6.5 结果小结}
+
+实验三从证据、目标、约束、漂移、恢复和预算六个维度验证了长程上下文连续性。Ours Full 在 Gold Recall@5 上保持 0.65 的证据召回，在 Memory Use Accuracy、Goal Retention、Constraint、Drift Rate、Recovery、Budget Violation 和 Avg Context Tokens 七项指标上取得最优结果。由此可见，分层记忆负责按需唤醒历史证据，Context Ledger 持续锚定全局任务状态，预算控制与检查点恢复共同保障多轮决策流转中的上下文连续性。
+
+\begin{quote}
+【图片占位：图 6 实验三结果对比图。建议使用分组柱状图展示 Evidence Sufficiency、Gold Recall@5、Memory Use Accuracy、Goal Retention、Constraint 和 Recovery；使用独立柱状图展示 Drift Rate、Budget Violation 与 Avg Context Tokens，其中后三项越低越好。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{7. 可复现性与审计记录}
+
+正式运行的数据文件、模型配置、随机性设置和逐任务轨迹均被保留：
+
+\begin{itemize}
+\tightlist
+\item
+  数据集：\texttt{data/processed/locomo\_multiturn\_gold\_100\_v12.jsonl}；
+\item
+  汇总结果：\texttt{runs/experiments/long\_task\_multiturn\_bge\_100\_v12/\{plain,full\_context,memory\_only,ours\_full\}/summary.json}；
+\item
+  逐任务结果：同目录下各方法的 \texttt{rows.jsonl}；
+\item
+  逐轮审计轨迹：同目录下各方法的 \texttt{trajectories/}；
+\item
+  实验实现：\texttt{engine/experiments/long\_task.py}、\texttt{engine/experiments/datasets.py} 与 \texttt{examples/experiments/run\_long\_task\_experiment.py}。
+\end{itemize}
+
+每条轨迹记录历史证据、Top-K 选择结果、六轮事件、模型行动、目标与约束状态、预算处理、故障恢复状态以及结构化裁判输出，为复现实验和逐案例分析提供完整依据。
+
+\subsubsection{8. 本章小结}
+
+本文以 Context Ledger 作为长程任务的稳定锚点，以分层多介质记忆作为历史证据索引，以摘要—原文双轨和分级唤醒控制上下文规模，并以漂移防护、动态预算控制和检查点恢复维持运行期一致性。实验三在 100 条 LoCoMo 多轮任务上表明，该框架能够在不依赖单一模型长窗口无损外推的条件下，持续保持目标和约束、按需唤醒历史证据、抑制任务漂移、支持中断恢复，并将平均上下文控制在较低水平。
+
+\subsection{TIDE-Mesh：任务状态驱动的动态异构稀疏拓扑与低熵通信机制}
+
+\subsubsection{1. 研究问题与方法定义}
+
+\paragraph{1.1 从``多个 Agent 同时工作''到``受控的群体协作''}
+
+在超长程复杂任务中，仅增加智能体数量并不能自然形成高效群体智能。若所有角色采用固定流水线或静态全连接方式协作，则每个 Agent 无论是否具备当前步骤所需能力，都可能接收相同历史和中间结果。随着任务持续推进，无关消息、重复结论和局部错误会在网络中反复传播，使通信量近似随群体规模平方增长，并造成上下文污染和噪声级联。
+
+本文将有效协作拆分为两个相互约束的问题：第一，当前任务状态下，哪些异构角色真正需要参与，彼此之间应临时建立哪些协作边；第二，在这些边上，什么信息值得发送给特定接收者，如何以最小但充分的形式传输。前者决定``谁与谁协作''，后者决定``沿边传什么''。
+
+为此，本文在 TIDE-Swarm 总体架构中提出 \textbf{TIDE-Mesh（Task-state-driven Information-bottleneck Dynamic Elastic Mesh，任务状态驱动的信息瓶颈弹性协作网）}。该方法以可编译的外层业务工作流作为安全控制骨架，以当前 TODO 为语义单位，从候选智能体池中动态选择具备所需能力、工具、Skill 和知识的成员，只为本轮生成有生命周期的 Delegation、Handoff 与 Fallback 边；随后使用 MessageCapsule 将自由文本通信变换为带主张、证据、约束变化、置信度、来源和预算的结构化消息，并通过接收者条件化贡献门控、字段感知压缩和增量状态传输抑制冗余。
+
+TIDE-Mesh 可以概括为：
+
+\[
+\text{TIDE-Mesh}=\text{Semantic Sparse Routing}+\text{Recipient-aware Information Bottleneck}.
+\]
+
+它并不是让整张执行图任意变化。外层工作流仍负责表达安全边界、质量反馈和可达路径；真正随任务语义变化的是每个 TODO 内部的活跃成员集合与临时通信子图。这样的``双层拓扑''既保留工程可控性，也使群体结构能够在运行时重组。
+
+\begin{quote}
+【图片占位：图 1 TIDE-Mesh 总体概念图。左侧画静态全连接群体，所有节点广播长文本并产生噪声级联；右侧画外层 Planner—Dynamic Team—Quality Gate—Aggregator 控制环，以及团队内部随 TODO 生成的稀疏临时边。边上只传 MessageCapsule。】
+\end{quote}
+
+\paragraph{1.2 设计目标}
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+目标 & 对应机制 & 预期作用 \\
+\midrule
+\endhead
+保证角色异构性 & 能力、模型、工具、Skill、知识库、成本和历史成功率共同形成成员画像 & 让不同专业角色承担不同子任务 \\
+避免静态全连接 & 当前 TODO 驱动硬过滤、评分和 Top-K 激活 & 只生成本轮必要的协作边 \\
+支持运行中重构 & Handoff、成员失败、质量返工和重规划触发重新选择 & 初始路由不正确时仍可纠偏 \\
+抑制通信冗余 & 接收者条件化贡献门控、TTL、Digest 去重 & 相似或失效消息不进入后续上下文 \\
+保护关键语义 & MessageCapsule 固定字段与 protected semantics & 约束变化和冲突信息不会被普通剪枝删除 \\
+降低状态复制 & StateDelta 只传变化字段 & 避免反复传播完整共享状态与历史消息 \\
+保持可解释性 & 候选过滤、分数拆解、临时边和剪枝理由全部事件化 & 能回答``为什么选它、为什么发送或丢弃'' \\
+\bottomrule
+\end{longtable}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{2. 双层动态拓扑架构}
+
+\paragraph{2.1 外层：稳定且可验证的业务控制骨架}
+
+系统外层由任务规划器、动态团队、质量门和结果聚合器构成。规划器将自然语言总目标转换为顺序依赖的 PlanLedger。每个 TODO 包含目标、所需能力、所需工具、Skill、知识库、期望输出、验收条件和证据要求。质量门对执行结果进行确定性检查和可选模型评审，并返回 \texttt{pass}、\texttt{revise} 或 \texttt{replan}。
+
+\begin{verbatim}
+Global Goal
+    ↓
+Task Planner → PlanLedger / Current TODO
+    ↓
+Dynamic Agent Team
+    ↓
+Quality Gate ── revise/replan ──→ Planner
+    ↓ pass
+Result Aggregator → Deliverable
+\end{verbatim}
+
+这一骨架是预先可视化和编译的，因为循环出口、安全边界以及质量反馈路径不能完全交由模型临时生成。但是，每次 Team 被当前 TODO 激活时，其内部成员与边都会重新计算。因此，``外层稳定''并不等于``内部通信拓扑静态''。
+
+\paragraph{2.2 内层：每个 TODO 对应一个临时稀疏子图}
+
+设候选成员池为 \(A=\{a_1,\ldots,a_N\}\)，第 \(t\) 个 TODO 为 \(\tau_t\)，其资源与能力要求为 \(R_t\)。系统首先产生可行成员集合 \(V_t\)，再从中选择 Top-K 成员形成临时子图：
+
+\[
+V_t=\{a_i\in A\mid \operatorname{Feasible}(a_i,R_t)=1\},
+\]
+
+\[
+A_t^{*}=\operatorname{TopK}_{a_i\in V_t}S(a_i,\tau_t),
+\]
+
+\[
+G_t=(\{Supervisor\}\cup A_t^{*},E_t),\quad
+E_t=\{Supervisor\rightarrow a_i\mid a_i\in A_t^{*}\}\cup E_t^{handoff}\cup E_t^{fallback}.
+\]
+
+Delegation、Handoff 和 Fallback 边都标记为临时边；拓扑事件记录 \texttt{edge\_ttl}，默认生命周期为一次团队调用。当前 TODO 发生变化、成员提出能力缺口、成员失败或质量门要求重规划时，系统重新计算下一轮 \(G_{t+1}\)。
+
+\begin{quote}
+【图片占位：图 2 双层拓扑图。外层用实线表示可编译控制边；内层候选 Agent 置于虚线 Team 容器中，每一轮仅点亮 Top-K Delegation 边，并用不同颜色展示 Handoff、Fallback 和过期边。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{3. 异构角色建模与语义驱动路由}
+
+\paragraph{3.1 多维异构成员画像}
+
+TIDE-Mesh 不把 Agent 的异构性简化为角色名称。一个成员画像同时包含：
+
+\[
+P_i=\langle C_i,T_i,K_i,B_i,M_i,H_i,c_i,l_i,r_i\rangle,
+\]
+
+其中 \(C_i\) 为能力描述，\(T_i\) 为工具集合，\(K_i\) 为知识库，\(B_i\) 为 Skill 集合，\(M_i\) 为模型和系统提示，\(H_i\) 为历史成功表现，\(c_i/l_i\) 分别为归一化成本和时延，\(r_i\) 为失败风险。该画像使``研究 Agent''``代码 Agent''之类自然语言角色，进一步落到可执行资源和运行表现上。
+
+规划器生成 TODO 时，只能引用资源目录中真实存在的精确 ID；无法确认的资源应留空。这样，路由语义与实际工具、Skill、知识库挂载状态保持一致，避免模型在计划中虚构资源。
+
+\paragraph{3.2 第一阶段：资源硬过滤}
+
+路由器先检查成员是否启用，以及所需工具、Skill、知识库是否存在、健康并可使用。如果当前 TODO 显式要求某项资源，而成员没有挂载，则直接排除，而不是依赖较高语义相似度进行补偿。硬过滤规则为：
+
+\[
+\operatorname{Feasible}(a_i,R_t)=
+Enabled_i\land ToolOK_i\land SkillOK_i\land KnowledgeOK_i.
+\]
+
+被排除的成员及原因进入 \texttt{candidate\_filtered} 事件，例如``必要工具不可用''``未挂载当前 TODO 所需 Skill''或``已在本轮参与，防止循环转交''。这使能力选择不再是不可解释的黑箱 Top-K。
+
+\paragraph{3.3 第二阶段：多指标可解释评分}
+
+通过硬过滤后，系统根据任务语义与运行状态评分：
+
+\[
+\begin{aligned}
+S(a_i,\tau_t)= {}&w_sS_{semantic}+w_pS_{prompt}+w_hS_{history}\\
+&+w_tC_{tool}+w_kC_{skill}+w_bC_{knowledge}\\
+&-w_cCost-w_lLatency-w_rRisk+Priority_i.
+\end{aligned}
+\]
+
+平衡模式的默认权重为：语义相似度 0.35、提示词匹配 0.13、历史成功率 0.13、工具覆盖 0.10、Skill 覆盖 0.10、知识库覆盖 0.09、成本惩罚 0.05、时延惩罚 0.05、失败风险惩罚 0.10。系统还提供偏质量和偏效率的权重预设，也允许在工作流配置中覆盖单项权重。
+
+语义相似度当前使用依赖无关的 256 维稳定哈希向量作为本地回退；历史成功率使用带 Beta 先验的平滑估计，防止单次成功支配路由。每次 \texttt{delegation\_selected} 事件同时保存总分与 \texttt{score\_breakdown}，便于复盘权重是否合理。
+
+\paragraph{3.4 Top-K 稀疏激活}
+
+通过 \texttt{selection\_top\_k} 与 \texttt{max\_parallel}，系统只激活少量高分成员：
+
+\[
+K_t=\min(selection\_top\_k,max\_parallel,|V_t|).
+\]
+
+当前 \texttt{max\_parallel} 被限制在 1 至 8，避免配置错误造成无界并发。与 \(N\) 个 Agent 的静态全连接相比，全连接潜在有 \(N(N-1)\) 条有向边，而初始委派只需 \(K_t\) 条 Supervisor 边。加上有界 Handoff 和失败替代后：
+
+\[
+|E_t|\le K_t+H_t+F_t,\qquad K_t,H_t,F_t\ll N.
+\]
+
+稀疏化不只是减少 Agent 数量，也缩小了后续 MessageCapsule 的潜在接收者集合，从拓扑层先抑制无关传播。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{4. 运行期拓扑重构}
+
+\paragraph{4.1 Supervisor 主导的结构化 Handoff}
+
+初始选择无法预见所有中间发现。成员执行后若判断剩余工作需要新能力，可提出：
+
+\begin{verbatim}
+{
+  "status": "needs_handoff",
+  "remaining_task": "需要继续完成的子任务",
+  "required_capabilities": ["新增能力"],
+  "reason": "为什么当前成员不适合继续",
+  "recommended_agent": "可选建议",
+  "context_summary": "必要交接信息"
+}
+\end{verbatim}
+
+Handoff 既可作为节点结构化字段返回，也可从输出末尾的 JSON 提取。但 Agent 只有建议权，不能直接指定接收者。Supervisor 使用 \texttt{remaining\_task} 和 \texttt{required\_capabilities} 对未参与成员重新执行硬过滤与评分；只有存在可行接收者时才生成临时 Handoff 边。模型给出的 \texttt{recommended\_agent} 不会绕过资源、风险和循环限制。
+
+为防止循环，已参与成员进入 \texttt{used} 集合，不能在同一轮再次成为接收者；\texttt{max\_handoffs} 默认 3、最大 8。系统分别记录 \texttt{goal\_checked}、\texttt{handoff\_selected} 和 \texttt{handoff\_rejected}，从而区分``任务完成''``需要交接''和``没有安全接收者''。
+
+\paragraph{4.2 成员失败触发 Fallback}
+
+若成员运行异常，团队容器捕获失败而不立即终止全局流程。启用 \texttt{allow\_substitution} 时，Supervisor 从尚未使用的可行排序列表中选择最高分备用成员，并创建一次性 Fallback 边。失败结果不会作为成功内容进入最终聚合；只有成功成员结果参与 \texttt{first}、\texttt{structured} 或 \texttt{concat} 聚合。
+
+这一机制使拓扑同时受任务语义和运行事件驱动：
+
+\[
+Event_t\in\{NewTodo,Handoff,MemberFailure,QualityReplan\},
+\]
+
+\[
+G_{t+1}=\Phi(G_t,Event_t,Context_t,Resources_t).
+\]
+
+\paragraph{4.3 质量反馈驱动下一轮重构}
+
+质量门检查输出非空、执行成功、来源真实性、工具成功以及代码任务的测试证据，并可组合模型质量分：
+
+\[
+Q=w_{rule}Q_{deterministic}+(1-w_{rule})Q_{model}.
+\]
+
+\texttt{pass} 会完成当前 TODO 并激活下一步；\texttt{revise} 保留当前 TODO，但把 \texttt{revision\_instruction} 注入下一轮；达到重试上限后，\texttt{replan} 只替换未完成 TODO，保留已完成工作及证据。由于每次 Team 调用都依据新的 TODO 与反馈重新选人，质量失败不仅改变提示词，也改变下一轮能力需求和活跃拓扑。
+
+\begin{quote}
+【图片占位：图 3 一次完整拓扑演化时序。展示 TODO-1 选择 A/C，C 提交 Handoff 后选择 D，A 失败后由 B Fallback；Quality Gate 要求 replan 后 TODO-2 重新选择 B/E。每条边标注产生原因和 TTL。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{5. MessageCapsule 结构化低熵通信协议}
+
+\paragraph{5.1 为什么自由文本广播容易形成噪声级联}
+
+自由文本消息往往把目标复述、推理过程、结论、证据、约束和建议动作混在一起。接收者无法判断哪些字段是新的、哪些已经看过、哪些只是猜测；一条错误结论经广播后还可能被多个 Agent 重述，形成``重复即可信''的噪声级联。
+
+TIDE-Mesh 将节点输出规范化为 MessageCapsule：
+
+\[
+M=\langle goal,subtask,claim,evidence,constraint\_delta,next\_action,
+uncertainty,ttl,budget,provenance,state\_delta\rangle.
+\]
+
+其中，\texttt{claim} 是需要接收者使用的核心主张；\texttt{evidence} 保存内容、URI、来源、置信度和观察时间；\texttt{constraint\_delta} 只记录新增或变化的约束；\texttt{provenance} 绑定 task、agent、trace、node 和 step；\texttt{ttl/expires\_at} 限制消息生命周期；\texttt{budget.max\_tokens} 限制胶囊大小。旧节点仍可经 Legacy Adapter 从最后一条消息或 \texttt{result/output/answer} 自动生成胶囊，从而兼容现有工作流。
+
+\begin{quote}
+【图片占位：图 4 MessageCapsule 字段解剖图。中心为 claim，左侧为 goal/subtask，右侧为 evidence/provenance，下方为 constraint\_delta/next\_action，上方标出 uncertainty、TTL、budget、digest 与 state revision。】
+\end{quote}
+
+\paragraph{5.2 接收者条件化贡献门控}
+
+同一消息对不同角色的价值不同，因此系统对每个接收者 \(r\) 独立计算贡献度：
+
+\[
+\begin{aligned}
+C(m,r)= {}&0.24R_{task}+0.22I_{gain}+0.18Q_{evidence}\\
+&+0.12F_{role}+0.10Freshness\\
+&-0.20Redundancy-0.10BudgetPressure.
+\end{aligned}
+\]
+
+\texttt{R\_task} 衡量目标/子任务与主张及接收者角色的词项覆盖；\texttt{I\_gain=1-Redundancy}；证据质量是证据置信度均值；角色匹配判断消息语义是否与接收职责一致；新鲜度由过期时间计算；预算压力由消息 token 与胶囊预算比值给出。冗余度是消息与该接收者 mailbox 历史消息的最大 token Jaccard 相似度。
+
+默认贡献阈值为 0.28、冗余阈值为 0.82、胶囊预算为 512 tokens。门控决策为：
+
+\begin{verbatim}
+if TTL=0 or expired: PRUNE(expired)
+else:
+    score ← Contribution(capsule, recipient, recipient_mailbox)
+    protected ← has constraint_delta or explicit conflict
+    if protected: DELIVER(protected_semantics)
+    else if redundancy ≥ 0.82: PRUNE(redundant)
+    else if score < 0.28: PRUNE(low_contribution)
+    else: DELIVER(contribution_threshold_met)
+\end{verbatim}
+
+约束变化和冲突消息属于 protected semantics，即使文本与旧消息相似，也不会被普通冗余规则误删。这是``低熵''和``语义安全''的平衡：系统可以丢弃重复解释，但不能因压缩而丢掉改变执行边界的信息。
+
+\paragraph{5.3 字段感知的信息瓶颈}
+
+通过门控的胶囊还要接受字段级预算控制。确定性压缩器依次去重证据，裁剪过长的 \texttt{goal}、\texttt{subtask} 和 \texttt{next\_action}，压缩证据正文，并在超预算时移除低优先级证据；\texttt{claim} 与 \texttt{constraint\_delta} 被视为语义不变量。可选 LLMLingua 适配器也只压缩描述字段，不能改写主张或约束。
+
+该过程可表示为：
+
+\[
+Z=\mathcal{B}(M,R,B),
+\]
+
+其中 \(M\) 是原始消息，\(R\) 是接收角色，\(B\) 是通信预算，\(Z\) 是保留决策所需主张、约束和证据的最小充分表示。压缩前后的消息由 \texttt{parent\_digest} 建立血缘，并记录原始与压缩 token，便于检查压缩是否真实发生。
+
+\paragraph{5.4 StateDelta：只传播变化，不复制完整状态}
+
+对于发送者 \(a\) 的第 \(r\) 个状态快照，系统只传输变化与删除字段：
+
+\[
+\Delta S_a^r=\{k\mid S_a^r[k]\ne S_a^{r-1}[k]\},
+\]
+
+\[
+Removed_a^r=Keys(S_a^{r-1})-Keys(S_a^r).
+\]
+
+内部 \texttt{\_\_*} 控制字段和原始 \texttt{messages} 不进入差分，从而避免运行时元数据与完整历史被重复广播。\texttt{base\_revision/revision} 保证接收端知道增量基于哪个版本；checkpoint 保存 revision 和已见 digest 水位，恢复后不会重新传播旧消息。
+
+\paragraph{5.5 私有 Mailbox 与定向注入}
+
+胶囊优先发送给显式 \texttt{recipients}，否则发送给路由策略确定的真实图后继；没有明确接收者且策略允许时才退化为广播。每个 Agent 拥有独立 mailbox，节点启动时 Hook 只把该接收者的胶囊注入 \texttt{\_\_capsule\_context\_\_}。因此：
+
+\[
+C_t^i=Ledger_t\oplus Mailbox_t^i\oplus RetrievedMemory_t^i
+\oplus SkillContext_t^i\oplus CurrentInput_t.
+\]
+
+不同 Agent 即使处于同一 run，也看到与自身职责相关的局部通信，而非共享全部成员的自由文本历史。
+
+\begin{quote}
+【图片占位：图 5 低熵通信流水线。Agent Output → Explicit/Legacy Capsule → Digest/StateDelta → Recipient Contribution Gate → Prune 或 Compress → Private Mailbox → Recipient Context；在每个阶段标注事件名和 token 变化。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{6. 从短期消息到时态证据记忆}
+
+通过即时通信的 Capsule 还可以沉淀为长期可检索事实。\texttt{TemporalEvidenceMemoryStore} 将 \texttt{claim} 转为 claims 事实，将 \texttt{constraint\_delta} 转为 \texttt{constraint:*} 事实，并把证据、来源、观察时间和 capsule digest 绑定到事实记录：
+
+\[
+f=\langle subject,predicate,object,[valid\_from,valid\_to),status,
+confidence,version,evidence\rangle.
+\]
+
+当相同事实在有效区间重叠时合并证据并更新置信度；当 \texttt{replace=true} 时，旧事实被标记为 \texttt{superseded}，新事实版本加一；当不同对象在有效区间重叠且未声明替换时，系统建立 \texttt{conflict\_set\_id} 并将相关事实标为 \texttt{disputed}。失效、替代和冲突都采用非破坏性保存，支持历史版本和 \texttt{as\_of} 查询。
+
+默认检索同时考虑语义、稀疏词项、时态有效性、来源可靠度、证据支持、作用域和新近性，并惩罚冲突事实。正常查询排除失效、已替代和争议事实；恢复或审计可显式请求历史与冲突集合。由此形成闭环：
+
+\begin{verbatim}
+MessageCapsule → Temporal Evidence / Versioned Fact
+        ↑                         ↓
+Recipient-local Context ← Time/Source/Conflict-aware Retrieval
+\end{verbatim}
+
+这一闭环抑制了另一类噪声级联：旧结论不会只因在多轮对话中反复出现就覆盖新事实，冲突信息也不会被直接广播为确定结论。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{7. 完整算法}
+
+\begin{verbatim}
+Algorithm 1  TIDE-Mesh Dynamic Heterogeneous Sparse Collaboration
+Input : global goal G, candidate agents A, workflow state S, budget B
+Output: verified deliverable
+
+1  P ← Planner(G, RealResourceCatalog(A)); initialize PlanLedger(P)
+2  while PlanLedger has executable TODO do
+3      τ ← first dependency-satisfied pending/retry TODO
+4      x ← BuildTodoPrompt(G, τ, previous_quality_feedback)
+5      C ← HardFilter(A, τ.required_tools/skills/knowledge)
+6      for each ai in C do
+7          score[ai] ← SemanticAndResourceScore(ai, x, S)
+8      end for
+9      selected ← TopK(score, τ.selection_top_k, max_parallel)
+10     create temporary Supervisor→selected edges; emit topology events
+11     results ← ParallelInvoke(selected, x)
+12     for each failed member do
+13         choose highest-ranked unused feasible fallback and invoke it
+14     end for
+15     while a member requests handoff and handoff_count < max_handoffs do
+16         reassess unused members by remaining_task and required_capabilities
+17         Supervisor creates a temporary handoff edge or rejects the request
+18     end while
+19     result ← AggregateSuccessfulResults(results)
+20     quality ← QualityGate(result, τ.acceptance_criteria, τ.evidence_requirements)
+21     if quality=pass then Complete(τ)
+22     else if quality=revise then Retry(τ, quality.revision_instruction)
+23     else ReplanOnlyUnfinishedTodos(PlanLedger, quality)
+24  end while
+25  return AggregateCompletedResults(PlanLedger)
+\end{verbatim}
+
+\begin{verbatim}
+Algorithm 2  Recipient-aware Low-Entropy Capsule Transport
+1  m ← ExplicitCapsule(update) or LegacyToCapsule(update)
+2  m.provenance ← current task/trace/node/step
+3  m.state_delta ← Diff(current_state, previous_snapshot[sender])
+4  m.digest ← SHA256(canonical_payload(m)); emit capsule_created
+5  for each routed recipient r do
+6      if Expired(m): emit capsule_pruned(expired); continue
+7      contribution ← EvaluateForRecipient(m, r, Mailbox[r])
+8      if not Protected(m) and (Redundant(m,r) or contribution<threshold):
+9          emit capsule_pruned(score_breakdown); continue
+10     z ← FieldAwareCompress(m, max_tokens=512)
+11     Mailbox[r].append(z); SeenDigest[r].add(z.digest)
+12     emit capsule_delivered and state_delta
+13 end for
+14 on NodeStart(r): inject only Mailbox[r]
+\end{verbatim}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{8. 复杂度与通信规模}
+
+设候选成员数为 \(N\)，每个成员资源项数为 \(R\)，激活成员数为 \(K\)，最大 Handoff 数为 \(H\)，历史事件数为 \(E_h\)。硬过滤复杂度为 \(O(NR)\)，多指标评分约为 \(O(N(L+D+E_h))\)，当前完整排序为 \(O(N\log N)\)；每次 Handoff 对剩余成员重新评分，最坏乘以有界常数 \(H\)。
+
+静态全连接每轮潜在边数为 \(N(N-1)\)，而本方法为：
+
+\[
+|E_t|=O(K+H+F).
+\]
+
+若自由文本平均长度为 \(T_{full}\)，Capsule 平均长度为 \(T_{cap}\)，则通信量分别近似为：
+
+\[
+V_{full}=O(N^2T_{full}),\qquad
+V_{TIDE}=O(|E_t|T_{cap}),
+\]
+
+且在设计目标下 \(|E_t|\ll N^2\)、\(T_{cap}\ll T_{full}\)。因此 TIDE-Mesh 同时从边数和每边载荷两个维度降低通信规模。对于单个接收者，冗余比较与 mailbox 长度 \(M_r\) 和消息 token 数 \(T\) 近似成 \(O(M_rT)\)；这是定向去重带来的可解释计算代价。
+
+需要注意，``低熵''在当前实现中是工程意义上的结构熵和信息冗余降低：稀疏边、结构化字段、消息去重、字段预算和状态差分均可直接测量。若论文使用严格 Shannon Token Entropy，还必须通过正式通信实验计算，不能仅由架构公式推断已显著下降。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{9. 可观测性、实现映射与验证边界}
+
+\paragraph{9.1 可审计事件}
+
+动态团队记录 \texttt{team\_started}、\texttt{candidate\_filtered}、\texttt{topology\_reconfigured}、\texttt{delegation\_selected}、\texttt{goal\_checked}、\texttt{handoff\_selected/rejected}、\texttt{team\_member\_failed}、\texttt{fallback\_selected} 和 \texttt{team\_aggregated}。通信层记录 \texttt{capsule\_created/pruned/compressed/delivered}、\texttt{state\_delta} 和 \texttt{temporal\_facts\_updated}。候选事件保存排除原因与评分分解，消息事件保存贡献分、剪枝理由、digest 和压缩血缘。服务端将这些底层事件翻译为可读运行轨迹，供前端观察和复盘。
+
+\paragraph{9.2 代码调用链}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}@{}}
+\toprule
+机制 & 当前实现位置 \\
+\midrule
+\endhead
+Planner、PlanLedger、Quality Gate、Dynamic Team & \texttt{engine/modules/workflow\_runtime.py} \\
+资源硬过滤、评分、Top-K、Handoff、Fallback & \texttt{engine/modules/workflow\_runtime.py} \\
+MessageCapsule、EvidenceRef、StateDelta、Digest & \texttt{engine/modules/communication/types.py} \\
+贡献门控、Mailbox、状态差分、快照 & \texttt{engine/modules/communication/manager.py} \\
+字段感知压缩与 LLMLingua 适配 & \texttt{engine/modules/communication/compressor.py} \\
+节点前注入、节点后建 Capsule、后继路由、时态事实抽取 & \texttt{engine/hooks.py} \\
+事实版本、冲突集合与时态检索 & \texttt{engine/modules/memory/temporal.py} \\
+阈值和通信权重 & \texttt{configs/communication\_policy.yaml} \\
+前端事件解释 & \texttt{engine/server/app.py} \\
+\bottomrule
+\end{longtable}
+
+自动化测试已覆盖动态成员选择与聚合、资源缺失硬过滤、成员失败替代、Supervisor 批准结构化 Handoff、保存后的工作流 API 运行、顺序 TODO 闭环、质量返工/重规划、Capsule 定向投递与过期剪枝、Canonical Digest、StateDelta，以及时态事实更新与冲突。它们证明核心执行分支在代码层存在，但不等同于大规模性能实验。
+
+\paragraph{9.3 当前可宣称与不可宣称的结论}
+
+\textbf{可以宣称：}项目已实现由当前 TODO 和真实资源状态驱动的两阶段成员选择；每轮只激活有界 Top-K，并支持受监督 Handoff 与故障替代；图后继通信已接入结构化 Capsule、接收者门控、字段压缩、私有 mailbox、增量状态、digest 水位和时态证据记忆；路由和通信决策均可审计。
+
+\textbf{暂不应宣称：}已经通过正式实验显著降低 Shannon Entropy；已经在大规模真实 LLM 任务上优于 Full Communication、Static Star/Chain 或 AgentPrune；所有内部 Team 成员之间的消息都已经统一经过独立 Capsule 路由。当前 Capsule 的标准 Hook 链路作用于图节点及其真实后继，Team 容器内部主要通过受控输入、结构化 Handoff 和成功结果聚合协作。若后续要求每个内部成员结果也逐边进入 CommunicationManager，需要把团队内调用进一步下沉为统一运行时节点事件。
+
+\begin{quote}
+【图片占位：图 6 一次真实运行的可观测轨迹截图。应同时出现 candidate\_filtered 的分数明细、topology\_reconfigured、handoff/fallback、capsule\_pruned/delivered 和 state\_delta；不要只截静态画布。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{10. 实验设计与待填结果}
+
+为分别验证``动态性''和``低熵性''，正式实验应包含 Full Communication、Static Chain、Static Star、Static Sparse、仅动态路由、仅 Capsule 门控和 TIDE-Mesh 完整方法。保持 Agent 数、模型、任务、失败注入和预算一致，报告任务成功率、平均/总 Token、消息数、边密度、有效消息率、重复率、字段保真率、错误传播率、拓扑重构时延和恢复成功率。
+
+建议进行如下消融：去掉资源硬过滤、去掉历史成功率、固定 Top-K、禁用 Handoff、禁用 protected semantics、禁用 StateDelta、只压缩不门控、只门控不压缩。低熵效果应至少由下式量化：
+
+\[
+Reduction_{token}=1-\frac{Tokens_{method}}{Tokens_{full}},\qquad
+Density_t=\frac{|E_t|}{N(N-1)},
+\]
+
+\[
+EffectiveRate=\frac{DeliveredUseful}{Created},\qquad
+ErrorPropagation=\frac{RecipientsAffectedByWrongClaim}{AllRecipients}.
+\]
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.09}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}
+  >{\raggedleft\arraybackslash}p{(\columnwidth - 16\tabcolsep) * \real{0.11}}@{}}
+\toprule
+方法 & Success & Tokens & Edge Density & Effective Msg & Redundancy & Field Fidelity & Error Propagation & Recovery \\
+\midrule
+\endhead
+Full Communication & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 \\
+Static Sparse & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 \\
+Dynamic Routing Only & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 \\
+Capsule Only & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 \\
+TIDE-Mesh & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 & 待测 \\
+\bottomrule
+\end{longtable}
+
+\begin{quote}
+【图片占位：图 7 动态拓扑和通信成本实验图。左图画随任务阶段变化的活跃边数，右图画 Success—Tokens 帕累托前沿；另附错误主张注入后的传播范围对比。当前无正式结果前不要填写虚构数值。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{11. 本章小结}
+
+TIDE-Mesh 将动态异构协作定义为``任务状态驱动的稀疏成员选择''和``接收者条件化的信息瓶颈通信''两个耦合过程。系统使用稳定外层流程守住可达性和质量反馈边界，在每个 TODO 内按能力与真实资源重新选择成员，通过临时 Delegation、Handoff 和 Fallback 边形成弹性子图；随后以 MessageCapsule、贡献门控、字段压缩、StateDelta、私有 mailbox 和时态证据记忆控制信息消息传播。
+
+相较于静态全连接与自由文本广播，该设计的优势不是简单``少发几条消息''，而是把成员选择、边生成、消息内容、接收者、生命周期、状态版本和证据来源都变为可计算、可约束、可恢复和可审计的运行时对象。当前代码已经形成完整机制链路，后续实验的重点是用统一真实任务定量证明其成功率—通信成本—错误传播之间的优势边界。
+
+\subsubsection{附：本章本地证据来源（后面删掉）}
+
+\begin{itemize}
+\tightlist
+\item
+  设计说明：\texttt{docs/8.29低熵通信与时态证据记忆研究设计.md}、\texttt{docs/9.4动态编排版本1.md}、\texttt{docs/9.4动态编排计划.md}。
+\item
+  题目映射：\texttt{docs/8.30写文档前对题目文件的总结.md}。
+\item
+  总论文上下文：\texttt{docs/8.30论文/8.30论文1.md}。
+\item
+  实现与测试：\texttt{engine/modules/workflow\_runtime.py}、\texttt{engine/modules/communication/}、\texttt{engine/modules/memory/temporal.py}、\texttt{engine/hooks.py}、\texttt{tests/test\_dynamic\_team\_runtime.py}、\texttt{tests/test\_communication.py}、\texttt{tests/test\_temporal\_memory.py}。
+\end{itemize}
+
+\subsection{TIDE-Placement：任务画像驱动的端—边—云可信自适应推理编排}
+
+\subsubsection{1. 研究问题与方法定义}
+
+\paragraph{1.1 超长程任务中的资源选择难题}
+
+超长程复杂任务不会始终具有相同的资源需求。简单确认、格式转换和即时交互更关心低时延；长文档分析、复杂代码理解和多维比较更需要强推理能力；涉及客户数据、内部邮件、访问令牌或密钥的任务又必须优先满足可信工作区约束。若把全部子任务固定在终端、固定上云，或仅根据模型规模选择后端，都会忽略实时性、数据敏感度、资源可用性和执行失败状态之间的冲突。
+
+本文在 TIDE-Swarm 中提出 \textbf{TIDE-Placement（Task-profile-driven Intelligent Deployment and Execution Placement，任务画像驱动的智能部署与执行放置）}。它以图节点为最小调度单位，在节点执行前形成任务画像，联合实时性、敏感等级、任务复杂度、可信域、资源负载、排队、时延、成本和异常状态，自动决定本轮推理应位于 DEVICE、EDGE 还是 CLOUD，并将决策、推理阶段计划、安全处理结果和资源状态写入运行态。
+
+TIDE-Placement 的核心不是单次``三选一''分类，而是一个可回放的闭环：
+
+\begin{verbatim}
+Node Context
+   ↓
+Task Profile → Trusted-domain Constraint → Resource Status
+   ↓
+Adaptive Placement + Inference-stage Split Plan
+   ↓
+Resource Allocation / Redaction / Audit Pack
+   ↓
+Device, Edge or Cloud Executor
+   ↓
+Execution Feedback → Resource Monitor → Next Placement
+\end{verbatim}
+
+\begin{quote}
+【图片占位：图 1 TIDE-Placement 端—边—云闭环。左侧为节点输入与元数据；中部依次为 Task Gate、Trusted Workspace Policy、Resource Monitor、Adaptive Scheduler；右侧为 DEVICE/EDGE/CLOUD 执行器；底部画失败反馈回到 Monitor 的闭环。】
+\end{quote}
+
+\paragraph{1.2 本文中``模型切分''的工程定义}
+
+为避免把抽象概念与工程实现混淆，本文将\textbf{模型切分}定义为已落地的``推理阶段切分与跨层放置''：每个子任务至少经过端侧 \texttt{local\_gate}，敏感任务再经过可信端侧 \texttt{trusted\_redaction}，最后按调度结果进入 \texttt{local\_inference}、\texttt{edge\_inference} 或 \texttt{cloud\_inference}。因此，调度结果并非只有一个资源标签，而是一条带阶段名称、执行层级、模型提示和职责说明的 \texttt{ModelSplitStep} 链。
+
+典型链路如下：
+
+\begin{verbatim}
+公开高复杂任务：local_gate → cloud_inference
+敏感复杂任务：local_gate → trusted_redaction → edge_inference
+强实时本地任务：local_gate → local_inference
+\end{verbatim}
+
+这种切分将``任务理解、安全预处理和主推理''显式分离，使不同阶段能够按照可信边界和算力特征放置，并可被 Hook、审计包和执行器注册表追踪。
+
+\paragraph{1.3 设计目标}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.33}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.33}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.33}}@{}}
+\toprule
+目标 & 已实现机制 & 运行结果 \\
+\midrule
+\endhead
+子任务级动态放置 & \texttt{TaskProfile} + \texttt{AdaptiveResourceScheduler} & 每个节点获得 DEVICE/EDGE/CLOUD 分配 \\
+强实时优先低时延 & HARD 实时性优先 DEVICE → EDGE → CLOUD & 避免高时延层抢占即时任务 \\
+高复杂任务利用云能力 & HIGH/EXTREME 复杂度优先 CLOUD → EDGE → DEVICE & 公开复杂任务优先进入云端大模型 \\
+敏感数据可信约束 & \texttt{TrustedWorkspacePolicy} + \texttt{trusted\_redaction} & CONFIDENTIAL/SECRET 优先在端/边可信域处理 \\
+资源状态感知 & ResourceMonitor 记录可用性、限流、负载、队列和错误率 & 限流或异常资源自动从候选集中剔除 \\
+失败后重新选择 & \texttt{ResilientInferenceRunner} 回写 \texttt{MutableResourceMonitor} & 重试时自动规避故障层级 \\
+决策可解释 & \texttt{SchedulingTrace}、policy hits、allocation metadata & 可回放``为何选该层、为何发生回退'' \\
+\bottomrule
+\end{longtable}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{2. 异构资源画像与任务画像}
+
+\paragraph{2.1 端、边、云的统一资源抽象}
+
+系统使用 \texttt{ResourceProfile} 将三类异构资源映射为统一的能力接口：资源层级、访问端点、可信属性、最大可承载复杂度、延迟、成本权重和模型集合。默认资源画像见表 2-1。
+
+\textbf{表 2-1 端—边—云默认资源画像}
+
+\begin{longtable}[]{@{}lrlrrl@{}}
+\toprule
+层级 & 可信属性 & 最大复杂度 & 默认延迟 & 成本权重 & 主要职责 \\
+\midrule
+\endhead
+DEVICE & 是 & MEDIUM & 30 ms & 0.2 & 即时响应、本地门控、可信预处理 \\
+EDGE & 是 & HIGH & 90 ms & 0.6 & 敏感或中等复杂任务的近端推理 \\
+CLOUD & 否 & EXTREME & 220 ms & 1.0 & 公开高复杂子任务与强推理负载 \\
+\bottomrule
+\end{longtable}
+
+资源画像不是硬编码到节点业务逻辑中。端点和模型可由环境变量配置；\texttt{ExecutorRegistry} 根据调度器写入的 tier 将请求分派给 \texttt{LocalModelExecutor}、\texttt{EdgeHttpExecutor} 或 \texttt{OpenAICompatibleCloudExecutor}。因此，同一工作流节点可在不同运行轮次进入不同执行位置，而节点本身无需维护三套分支代码。
+
+\paragraph{2.2 任务画像：让调度器理解``任务需要什么''}
+
+调度器的输入不是原始文本本身，而是 \texttt{TaskProfile}：
+
+\[
+P_t=\langle R_t,S_t,C_t,Type_t,Trust_t,Approval_t\rangle,
+\]
+
+其中 \(R_t\) 为实时性，\(S_t\) 为敏感度，\(C_t\) 为复杂度，\texttt{Type} 为任务类型，\texttt{Trust} 表示是否必须在可信工作区执行，\texttt{Approval} 表示外部敏感传输是否已有审计批准。每个维度均采用有限等级，便于策略推理与日志分析：
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+维度 & 等级 & 含义 \\
+\midrule
+\endhead
+实时性 & HARD / INTERACTIVE / NORMAL / BATCH & 从强实时到离线批处理 \\
+敏感度 & PUBLIC / INTERNAL / CONFIDENTIAL / SECRET & 从公开数据到密钥级数据 \\
+复杂度 & LOW / MEDIUM / HIGH / EXTREME & 从轻量处理到高算力推理 \\
+\bottomrule
+\end{longtable}
+
+\texttt{HeuristicTaskGate} 优先读取节点 metadata 中明确标注的 \texttt{realtime}、\texttt{sensitivity}、\texttt{complexity} 和 \texttt{task\_type}；未标注时，才从当前节点输入、目标、查询、消息、节点描述和系统提示词中推断。规则对``实时、立即、紧急、低延迟''等信号提高实时性，对 token、密钥、身份证、银行卡、客户隐私、内部邮件等信号提高敏感度，对长文、多模态、复杂推理、全量分析和故障恢复等信号提高复杂度。系统也提供 \texttt{OpenAITaskGate}，以结构化 JSON 输出同一任务画像字段；无论画像来源于规则还是模型，后续可信域策略均在本地调度器中统一执行。
+
+\begin{quote}
+【图片占位：图 2 任务画像构建图。输入包括节点 metadata、当前 state、目标、消息、节点描述和系统提示词；输出为实时性、敏感度、复杂度、可信工作区需求和任务类型。图中应强调``显式 metadata 优先，文本推断补充''。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{3. 可信域约束下的自适应资源选择}
+
+\paragraph{3.1 资源候选生成与优先顺序}
+
+对于请求 \(q_t\)，调度器先根据任务画像生成候选层级顺序：
+
+\[
+Order(P_t)=
+\begin{cases}
+[DEVICE,EDGE,CLOUD],& R_t=HARD\\
+[CLOUD,EDGE,DEVICE],& C_t\in\{HIGH,EXTREME\}\\
+Preference(q_t),& \text{其他情况}.
+\end{cases}
+\]
+
+其中强实时规则优先于复杂度规则，保证``马上响应''的任务不会因文本较长而直接进入云端。候选资源必须同时满足静态可用、运行时可用且未被限流；随后调度器检查其最大复杂度是否能够承载当前任务。候选排序综合错误率、负载、队列深度、实时探测延迟和成本权重：
+
+\[
+Rank(x)=\langle ErrorRate_x,Load_x,Queue_x,Latency_x,Cost_x\rangle.
+\]
+
+这里采用按元组升序的确定性排序，优先选择异常更少、负载更低、队列更短、延迟更小且成本更低的候选资源。\texttt{ResourceStatus} 可来自静态演示状态、可变运行时状态，或 \texttt{SystemResourceMonitor} 的本机/HTTP 轻量探测。
+
+\paragraph{3.2 敏感数据的可信工作区优先策略}
+
+\texttt{TrustedWorkspacePolicy} 将 DEVICE 和 EDGE 定义为可信工作区，将 CLOUD 定义为非可信层。敏感阈值为 CONFIDENTIAL：一旦任务画像达到 CONFIDENTIAL 或 SECRET，调度器优先从可信候选中选择满足复杂度要求的资源；如果没有任何可信层可用，才保留外部层级并在 \texttt{SchedulingDecision} 中标记 \texttt{requires\_human\_review}。
+
+这一策略让复杂度与安全性不再相互覆盖，而是形成明确优先关系。公开高复杂任务可优先获得云端强推理能力；敏感高复杂任务会优先在可信 EDGE 执行；当 EDGE 不可用但 DEVICE 仍可用时，系统会退回 DEVICE，而不是默认把原始敏感载荷送往云端。
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.25}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.25}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.25}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.25}}@{}}
+\toprule
+任务画像 & 资源条件 & 实际选择逻辑 & 推理阶段链 \\
+\midrule
+\endhead
+PUBLIC + HIGH & 三层可用 & 高复杂度优先 CLOUD & \texttt{local\_gate\ →\ cloud\_inference} \\
+CONFIDENTIAL + HIGH & EDGE 可用 & 可信层优先，EDGE 支持 HIGH & \texttt{local\_gate\ →\ trusted\_redaction\ →\ edge\_inference} \\
+CONFIDENTIAL + HIGH & EDGE 不可用、DEVICE 可用 & 保持可信域，退回 DEVICE & \texttt{local\_gate\ →\ trusted\_redaction\ →\ local\_inference} \\
+HARD + PUBLIC & DEVICE 可用 & 强实时优先 DEVICE & \texttt{local\_gate\ →\ local\_inference} \\
+SECRET + HIGH & 仅 CLOUD 可用 & 保留外部执行选择并标记人工审计 & \texttt{local\_gate\ →\ trusted\_redaction\ →\ cloud\_inference} \\
+\bottomrule
+\end{longtable}
+
+\paragraph{3.3 脱敏与审计前置到可信阶段}
+
+一旦调度计划包含 \texttt{trusted\_redaction}，HookManager 会在节点执行前收集节点输入、任务、目标、查询和消息等安全载荷，调用敏感数据脱敏器，并生成审计包。脱敏结果写入 \texttt{\_\_redaction\_\_}，审计包写入 \texttt{\_\_audit\_pack\_\_}，同时在 allocation metadata 中保存不含完整载荷的安全摘要。端—边—云调度示例节点在实际构造执行请求时，会优先使用已脱敏 payload 改写 Prompt，并明确要求推理器不得还原敏感值。
+
+这种安排把安全处理放在推理位置选择之后、外部执行之前：即使最终需要外部高算力执行，系统也能保留端侧门控、敏感字段扫描、脱敏结果和审计证据，形成可追踪的数据流边界。
+
+\begin{quote}
+【图片占位：图 3 可信域调度与安全数据流。用颜色区分可信 DEVICE/EDGE 与非可信 CLOUD；敏感任务先经过 local\_gate 和 trusted\_redaction，产生 \texttt{\_\_redaction\_\_}、\texttt{\_\_audit\_pack\_\_}，再进入选择的推理层。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{4. 推理阶段切分与执行器分发}
+
+\paragraph{4.1 可执行的阶段化模型切分计划}
+
+调度器的输出是 \texttt{SchedulingDecision}，其中包含选择的 tier、endpoint、完整任务画像、\texttt{ModelSplitStep} 列表、是否需要人工复核和可读原因。运行时将其进一步封装为 \texttt{ResourceAllocation}，写入节点状态 \texttt{\_\_resource\_allocation\_\_}。
+
+每个 \texttt{ModelSplitStep} 包含：阶段名称、运行 tier、\texttt{model\_hint} 和 \texttt{purpose}。以敏感复杂任务为例：
+
+\begin{verbatim}
+1. local_gate
+   tier=DEVICE
+   purpose=评估任务类型、难度与敏感等级
+
+2. trusted_redaction
+   tier=DEVICE
+   purpose=在可信工作区完成脱敏、摘要或审计包生成
+
+3. edge_inference
+   tier=EDGE
+   purpose=执行中等至高复杂度推理
+\end{verbatim}
+
+将阶段计划作为数据结构而非隐藏在条件分支中，带来三个直接收益：第一，调度决策可以被完整记录与重放；第二，安全预处理能够与主推理解耦；第三，节点、执行器和前端都能读取同一份跨层执行说明。
+
+\paragraph{4.2 执行器注册表：从决策到真实推理后端}
+
+\texttt{ExecutorRegistry} 按 \texttt{ResourceTier} 进行统一分发：
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+调度层级 & 执行器 & 调用方式 \\
+\midrule
+\endhead
+DEVICE & \texttt{LocalModelExecutor} & 调用本地 OpenAI-compatible 模型端点；配置缺失或调用失败时保留可观测本地回退 \\
+EDGE & \texttt{EdgeHttpExecutor} & 将 Prompt、系统提示和 allocation 发送给边缘 HTTP 推理服务 \\
+CLOUD & \texttt{OpenAICompatibleCloudExecutor} & 使用项目配置的 OpenAI-compatible 云端客户端处理复杂任务 \\
+\bottomrule
+\end{longtable}
+
+因此，\texttt{\_\_resource\_allocation\_\_} 不是只供界面展示的标签，而是实际执行器选择的依据。边缘服务示例将 Ollama 包装为 HTTP 端点，云端执行器则将主推理请求提交给 OpenAI-compatible 服务；三层结果统一返回 \texttt{InferenceResult}，便于上层图运行时和质量模块使用。
+
+\paragraph{4.3 云端复杂子任务与边侧回退}
+
+资源画像规定 CLOUD 可承载 EXTREME 复杂度。公开任务被识别为 HIGH/EXTREME 后，候选顺序自动调整为 CLOUD、EDGE、DEVICE；在云端可用时，云执行器获得该节点的实际推理请求。若云端状态为 429 限流或其他异常，调度器会从候选集中剔除该层，优先选择 EDGE。
+
+\texttt{ResilientInferenceRunner} 将这一过程封装为闭环：每次执行前重新调用调度器；若执行器返回可重试失败，Runner 将 tier、错误和尝试记录写入结果，再调用 \texttt{MutableResourceMonitor.record\_failure}；下一次 \texttt{scheduler.acquire} 读取更新后的状态并重新选择资源。对于``云端第一次限流、第二次执行''这一典型场景，已验证的路径是 CLOUD → EDGE，而不是在同一失效云端盲目重试。
+
+\begin{quote}
+【图片占位：图 4 云端复杂任务的失败重调度序列图。Public+High 任务先选择 CLOUD；云执行器返回 429；MutableResourceMonitor 标记 rate\_limited；第二次 acquire 选择 EDGE；EdgeExecutor 返回成功。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{5. 图运行时接入与可观测调度闭环}
+
+\paragraph{5.1 Hook 生命周期中的调度主链路}
+
+端—边—云调度被接入统一 Hook 生命周期，而不是要求每个 Agent 手动调用调度 API。节点运行前，HookManager 从节点 metadata、项目级 scheduling rules 和当前 GraphState 构造 \texttt{ResourceRequest}，然后执行：
+
+\begin{verbatim}
+acquire_resource(node context)
+    → scheduler.acquire(ResourceRequest)
+    → Task Gate / Policy / Monitor / Placement
+    → ModelSplitPlan
+    → security preflight when trusted_redaction is present
+    → __resource_allocation__ / __redaction__ / __audit_pack__
+    → node invocation
+\end{verbatim}
+
+节点完成后释放资源句柄；推理节点可直接读取 allocation 并通过 ExecutorRegistry 发送请求。由此，调度、安全与执行均围绕同一份 \texttt{NodeContext} 和 \texttt{GraphState} 流转，不会形成彼此独立的旁路模块。
+
+\paragraph{5.2 SchedulingTrace：让每次决策可回放}
+
+开启 trace 时，调度器为每次 allocation 生成 \texttt{SchedulingTrace}，其中包含：
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}@{}}
+\toprule
+字段 & 记录内容 \\
+\midrule
+\endhead
+\texttt{heuristic\_profile} & 基于本地规则得到的基线任务画像 \\
+\texttt{gate\_profile} & 当前 Gate 实际给出的画像 \\
+\texttt{final\_profile} & 用于决策的最终画像 \\
+\texttt{decision} & tier、endpoint、model split、复核标记和选择理由 \\
+\texttt{resource\_status} & 端、边、云的可用性、限流、错误率、负载、队列和延迟快照 \\
+\texttt{policy\_hits} & 如 \texttt{sensitive\_data}、\texttt{kept\_in\_trusted\_workspace}、\texttt{cloud\_for\_high\_complexity}、\texttt{cloud\_rate\_limited} \\
+\bottomrule
+\end{longtable}
+
+这使系统能够回答四个关键问题：任务被判定为什么画像；当前有哪些资源可用；为什么优先或避开某个层级；最终哪些安全和推理阶段实际进入计划。相比仅记录``cloud=true''的简单路由日志，Trace 为论文实验、线上排障和答辩演示提供了完整因果链。
+
+\begin{quote}
+【图片占位：图 5 SchedulingTrace 可视化示例。展示一条任务从 heuristic\_profile、gate\_profile、resource\_status 到 decision 和 policy\_hits 的结构化 JSON/前端卡片，突出 \texttt{cloud\_for\_high\_complexity} 与 \texttt{kept\_in\_trusted\_workspace} 两类策略命中。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{6. 核心算法与复杂度}
+
+\begin{verbatim}
+Algorithm 1  TIDE-Placement Adaptive Cross-tier Scheduling
+Input : resource request q, resource profiles R, runtime status Ω
+Output: allocation a and inference-stage split plan Π
+
+1  P ← TaskGate(q)                                  // realtime, sensitivity, complexity
+2  Ω ← ResourceMonitor.snapshot(R)
+3  C ← ordered candidates from P.realtime, P.complexity and q.preference
+4  C ← remove unavailable or rate-limited resources
+5  C ← sort C by error rate, load, queue depth, latency and cost
+6  x ← first candidate that supports P.complexity
+7  if P is sensitive and x is untrusted then
+8      y ← best trusted candidate in C
+9      if y exists then x ← y; reason ← keep_in_trusted_workspace
+10     else mark requires_human_review
+11 end if
+12 Π ← [local_gate]
+13 if P is sensitive then Π.append(trusted_redaction)
+14 Π.append(local_inference | edge_inference | cloud_inference according to x)
+15 a ← ResourceAllocation(x, Π, P, Ω, reason)
+16 return a
+\end{verbatim}
+
+\begin{verbatim}
+Algorithm 2  Feedback-driven Resilient Inference
+1  for attempt = 1 to max_attempts do
+2      a ← Scheduler.acquire(request)
+3      result ← ExecutorRegistry.run(prompt, allocation=a)
+4      record attempt, allocation and result
+5      if result.success then return result
+6      MutableResourceMonitor.record_failure(a.tier, result.error)
+7      if not result.retryable then break
+8  end for
+9  return last result with complete attempts
+\end{verbatim}
+
+设资源层级数为 \(T=3\)，每层资源状态字段为常数规模。任务画像构建主要与输入长度 \(L\) 相关；候选排序成本为 \(O(T\log T)\)，在三层资源设置下为有界常数；阶段计划生成与安全预处理判定为 \(O(1)\)。因此，单节点的调度附加开销近似为：
+
+\[
+O(L)+O(T\log T)\approx O(L).
+\]
+
+失败重调度最多执行 \texttt{max\_attempts} 次，默认上界为 3。该设计把复杂资源决策放到一次有界的节点前置过程，避免在任务执行中无控制地探测或反复切换后端。
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{7. 验证场景与结果边界}
+
+当前调度与执行回归测试已在 Lang\_Task 环境中完成，\texttt{tests/test\_scheduling.py} 与 \texttt{tests/test\_execution.py} 共 \textbf{21 passed}。测试覆盖的是可运行机制路径，而非硬件性能排名：
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+验证场景 & 已覆盖的预期行为 \\
+\midrule
+\endhead
+公开高复杂任务 & 选择 CLOUD，并生成 \texttt{cloud\_inference} 阶段 \\
+敏感高复杂任务 & 优先选择可信 EDGE，并生成脱敏阶段 \\
+边侧不可用的敏感任务 & 保持可信域，回退 DEVICE \\
+仅云端可用的敏感任务 & 标记 \texttt{requires\_human\_review} 与外部传输原因 \\
+云端限流 & CLOUD 从候选集中剔除，任务回退 EDGE \\
+Cloud 可重试失败 & Runner 写回 monitor 后重新调度至 EDGE \\
+Hook 图集成 & 节点 state 获得 \texttt{\_\_resource\_allocation\_\_} \\
+执行器分发 & Registry 按 DEVICE/EDGE/CLOUD tier 调用对应 executor \\
+脱敏审计 & 包含 \texttt{trusted\_redaction} 的计划生成 \texttt{\_\_redaction\_\_} 与 \texttt{\_\_audit\_pack\_\_} \\
+\bottomrule
+\end{longtable}
+
+这些验证表明，任务画像、可信域、资源选择、推理阶段计划、执行器分发和失败反馈已经连成同一条实际调用链。论文中不应将默认资源画像中的 30/90/220 ms 或成本权重解释为实测硬件性能；它们是调度策略使用的初始资源参数。正式资源效率实验应在固定端、边、云设备和真实任务负载下报告 TTFT、生成速度、网络往返、能耗、成本与成功率。
+
+\begin{quote}
+【图片占位：图 6 调度验证矩阵。横轴为公开/敏感、低/高复杂、正常/强实时、资源正常/限流/不可用；纵轴为最终 tier、是否脱敏、是否审计、是否回退。可以把已有 21 项测试覆盖映射到矩阵中。】
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{8. 本章小结}
+
+TIDE-Placement 将端—边—云异构环境从静态后端配置提升为任务状态驱动的可解释调度闭环。系统以 \texttt{TaskProfile} 描述子任务的实时性、敏感度和复杂度，以可信工作区策略限制敏感数据流向，以 ResourceMonitor 感知可用性和异常，以 AdaptiveResourceScheduler 生成跨层推理阶段计划，并通过 HookManager、ExecutorRegistry 与 ResilientInferenceRunner 将决策落实为实际执行和失败重调度。
+
+该机制使公开高复杂任务能够充分利用云端算力，敏感复杂任务优先保留在端/边可信域，强实时任务优先使用近端资源，云端限流或执行失败时自动重新选择可用层级。更重要的是，每次选择均保留任务画像、资源状态、策略命中、阶段计划和安全审计信息，使端—边—云协同不再是不可解释的``模型路由''，而成为可验证、可回放、可恢复的运行时能力。
+
+\subsubsection{附：本章本地证据来源}
+
+\begin{itemize}
+\tightlist
+\item
+  调度架构说明：\texttt{docs/7.13的情况.md}。
+\item
+  路由训练与端边云执行背景：\texttt{docs/7.31边端云MLP+BGE具体实验.md}、\texttt{docs/8.28写实验代码的情况.md}。
+\item
+  调度实现：\texttt{engine/modules/scheduling/}、\texttt{engine/modules/execution/}、\texttt{engine/hooks.py}。
+\item
+  可运行示例：\texttt{examples/edge\_cloud\_scheduler/run.py}、\texttt{examples/edge\_cloud\_scheduler/edge\_ollama\_server.py}。
+\item
+  回归验证：\texttt{tests/test\_scheduling.py}、\texttt{tests/test\_execution.py}（2026-09-09：21 passed）。
+\end{itemize}
+
+\subsection{三项创新机制的统一可观测与评分证据}
+
+为避免将“架构存在”与“任务有效”混为一谈，系统将运行过程拆为可观测事件和可量化指标。Context Ledger、Memory、Capsule、动态团队、质量门、资源分配和检查点都会生成结构化记录；因此可以从同一条运行轨迹中同时检查任务是否持续推进、成员是否按需协作、消息是否被剪枝、上下文是否受控，以及端—边—云资源是否发生回退或重调度。
+
+\figureplaceholder{从运行事件到评分证据的映射}{建议绘制“运行事件—指标—评分点”关系图：节点开始/结束、TODO 更新、成员委派、Handoff、Capsule 剪枝、预算暂停、Checkpoint 恢复、资源选择/回退等事件，分别连向完成度、组织协作、Token/时间、鲁棒性、兼容性和用户体验证据。}
+
+\begin{longtable}{p{0.23\linewidth}p{0.34\linewidth}p{0.33\linewidth}}
+\toprule
+评估维度 & 可直接提取的运行证据 & 论文中应报告的指标或材料 \\
+\midrule
+闭环能力与鲁棒性 & TODO 状态、质量门结果、漂移事件、检查点和恢复轨迹 & 任务完成率、目标保持、约束遵守、恢复成功率、失败类型与恢复路径 \\
+组织协作与低熵通信 & 成员筛选、Delegation、Handoff、Fallback、Capsule delivery/prune 事件 & 活跃成员数、临时边数、消息数、剪枝率、重复率、关键字段保真度 \\
+上下文与资源效率 & Context Tokens、检索/写入时间、端边云 allocation、执行尝试记录 & 输入 Token、总时间、检索时间、模型调用次数、回退次数、资源层级分布 \\
+兼容性与扩展性 & 模型连接、AUTO 槽位、工具/Skill/知识/记忆绑定、工作流节点库 & 已测试模型连接类型、可挂载资产、可用节点类型和跨场景复用说明 \\
+\bottomrule
+\end{longtable}
+
+该表仅定义取证框架，不用作虚构性能数据。已有实验结果继续在各机制小节中按其真实样本、后端类型和指标定义报告；尚未完成的跨场景通信和真实资源效率实验将在后续综合评估中以待补充表格呈现。
+
+\section{平台介绍与使用方法}
+
+\subsection{1. 平台定位与使用主线}
+
+本平台以 AgentForge 智能体运行平台为用户界面，以图运行时、模型连接、工具调用、知识与记忆、Skill 生命周期和运行观测为后端能力底座。它的使用目标不是单独配置某个模型，而是将``应用构建—能力挂载—在线调试—运行观测—发布迭代''组织为一条可管理的业务闭环。
+
+对普通使用者而言，推荐按以下顺序操作：先配置可用模型，再准备工具、知识库、记忆库和 Skill 等能力资产；随后创建智能体应用或工作流应用，在编辑器中完成挂载和编排；最后通过测试会话或任务运行验证结果，并在确认后发布版本。平台会将模型、工具、审批、知识检索、规划、路由和节点运行等过程保留为结构化事件，便于查看与回溯。
+
+\begin{verbatim}
+登录平台
+  → 配置模型连接
+  → 准备工具 / Skill / 知识库 / 记忆库
+  → 创建 Agent 或工作流应用
+  → 配置与调试
+  → 查看运行过程与审批结果
+  → 发布版本并持续迭代
+\end{verbatim}
+
+\begin{quote}
+【图片占位：图 1 平台首页或快速开始页面截图。建议截取左侧导航和``创建应用''入口，用于展示平台主要功能模块。】
+\end{quote}
+
+\subsection{2. 平台首页与导航}
+
+用户登录后可从``快速开始''进入模板化创建流程，也可直接使用``应用管理''创建应用。当前用户主导航围绕应用、任务、组件、数据和模型资源组织，主要入口如下。
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+模块 & 主要作用 & 推荐使用时机 \\
+\midrule
+\endhead
+应用管理 & 创建、筛选、编辑、调试和发布智能体或工作流应用 & 开始一个新任务或维护已有应用 \\
+任务中心 & 按状态、任务 ID 或输入内容检索异步任务 & 快速定位历史任务和结果 \\
+Skill 管理 & 安装市场 Skill、编写个人 Skill、校验和发布 & 需要复用稳定流程时 \\
+MCP 广场 & 浏览并安装平台提供的 MCP 模板 & 快速接入标准能力时 \\
+MCP 管理 & 管理内置工具、MCP 服务和脚本工具 & 接入或测试实际工具时 \\
+记忆库 & 管理长期资料、记忆规则和检索 & 需要跨会话保留偏好或项目结论时 \\
+知识库 & 导入文件、建立检索索引并测试命中效果 & 需要让应用依据企业资料回答时 \\
+模型连接 & 配置并测试端、边、云模型服务，设置 AUTO 槽位 & 创建应用前的首要准备步骤 \\
+\bottomrule
+\end{longtable}
+
+平台还保留总览、可视化编排、运行中心、底层工作流、技能治理和连接设置等管理能力，供开发、运维和深度调试使用；普通用户的日常操作通常从应用管理和任务中心开始即可。
+
+\begin{quote}
+【图片占位：图 2 左侧导航与应用管理页面截图。建议同时展示应用筛选、状态筛选和``创建应用''按钮。】
+\end{quote}
+
+\subsection{3. 配置端—边—云模型连接}
+
+模型连接页面用于登记实际可调用的模型服务，包括连接名称、提供商、Base URL、模型 ID、认证信息和启用状态。新增或修改连接后，应先执行``测试''；只有测试成功且连接处于启用状态，平台才允许其参与应用运行。
+
+模型无需在创建时固定归属某一层。测试完成后，用户可将连接分配给 AUTO 的 DEVICE、EDGE 或 CLOUD 槽位。应用或节点选择 \texttt{AUTO} 时，后端根据任务实时性、敏感度、复杂度和资源状态选择本轮使用的层级；若调用失败，运行记录会保留实际执行层、回退信息和尝试链路。若选择一个具体模型连接 ID，则该节点按固定连接调用。
+
+建议先完成以下配置：
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  创建端侧、边侧和云侧模型连接；
+\item
+  分别完成连接测试；
+\item
+  按需要设置 AUTO 默认槽位；
+\item
+  回到应用编辑器选择固定模型或 AUTO。
+\end{enumerate}
+
+\begin{quote}
+【图片占位：图 3 模型连接页面截图。建议展示连接列表、测试状态、AUTO 调度槽位，以及``添加模型''弹窗。】
+\end{quote}
+
+\subsection{4. 准备可复用能力资产}
+
+\subsubsection{4.1 工具与 MCP 服务}
+
+MCP 管理将三类能力统一登记为工具：后端白名单内置工具、远程 MCP HTTP 服务和受控脚本工具。用户可填写名称、说明、连接地址或脚本内容、风险等级和启用状态，并通过``测试''验证接入。工具说明会参与模型的工具选择，但是否真正执行还受后端适配器、工具健康状态和风险策略约束。
+
+当高风险工具被应用调用时，运行过程会产生审批事件，界面提供``批准''与``拒绝''操作；审批决定和工具结果都会写入运行记录。因此，平台将``可发现的工具能力''和``可执行的受控操作''分开管理。
+
+MCP 广场提供平台维护的模板化条目，适合快速安装；需要实际地址或凭据的外部服务，则可在 MCP 管理中自定义接入。凭据只记录环境变量引用，不在界面中回显明文。
+
+\begin{quote}
+【图片占位：图 4 MCP 广场或 MCP 管理页面截图。建议展示内置工具、MCP 服务、脚本工具三种类型，以及工具测试按钮。】
+\end{quote}
+
+\subsubsection{4.2 Skill 管理与复用}
+
+Skill 管理分为 Skill 市场、我的 Skill 和已安装三个视图。市场中的平台 Skill 可安装到个人库；用户可新建或导入自己的 Skill，填写名称、分类、适用场景、关键词、说明和 Markdown 内容；通过校验后可发布为可挂载版本。已发布 Skill 的后续编辑会形成新版本草稿，不会直接覆盖线上版本。
+
+页面还提供检索命中测试：输入任务描述后，可查看候选 Skill 的语义、规则、上下文和可选重排得分，以及该 Skill 是否会被注入当前任务。该设计使 Skill 从静态说明文档变成可测试、可发布、可回滚的流程资产。
+
+\begin{quote}
+【图片占位：图 5 Skill 管理页面截图。建议展示市场/我的/已安装标签、Skill 卡片和检索命中测试面板。】
+\end{quote}
+
+\subsubsection{4.3 知识库}
+
+知识库用于集中导入可检索资料并绑定到应用或工作流。创建向导分为基础信息、数据来源、索引与检索、确认创建四步，支持 TXT、Markdown、HTML、PDF、DOCX、XLSX、CSV 和 JSON 等文件格式。创建后可在详情页分别管理文档、切片、检索配置、命中测试和调用日志。
+
+知识库配置包含切片策略、切片长度、重叠长度、检索模式、Top-K 和相似度阈值。用户修改切片参数后，需要对已有文档执行重新解析，平台才会据此重建切片和索引。命中测试可以直接输入问题查看来源文档、片段内容与得分，用于在正式挂载前验证资料质量。
+
+\begin{quote}
+【图片占位：图 6 知识库创建向导或知识库详情页截图。建议展示上传文件、切片策略、检索模式和命中测试结果。】
+\end{quote}
+
+\subsubsection{4.4 记忆库}
+
+记忆库用于保存跨运行的稳定信息。用户可以新建记忆库，将其作为应用主库或只读参考库绑定，并在库内分别管理记忆规则、记忆详情和记忆检索。记忆规则可描述应当提取什么信息、允许哪些来源、采用合并/替换/追加何种更新方式以及保留时长；记忆详情页支持按 WORKING、TASK、PROJECT、GLOBAL 四个作用域查询、人工写入、删除或将 PROJECT 级内容提升至 GLOBAL。
+
+主库负责保存当前应用可持续积累的项目记忆，参考库用于提供只读上下文。这样既能复用历史资料，也能避免不同应用在同一记忆空间中相互污染。
+
+\begin{quote}
+【图片占位：图 7 记忆库页面截图。建议展示记忆规则、四级作用域筛选、人工写入和检索测试。】
+\end{quote}
+
+\subsection{5. 创建与配置智能体应用}
+
+在应用管理中点击``创建应用''后，可选择``智能体应用''或``工作流应用''。智能体应用面向开放式任务：模型根据系统提示词、可用工具、Skill、知识与记忆完成规划和执行；工作流应用面向可视化、可测试的确定性业务流程。创建完成后，平台根据类型进入对应编辑器。
+
+智能体编辑器的主要配置内容如下。
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+配置区域 & 使用方法与作用 \\
+\midrule
+\endhead
+基本信息 & 填写名称、描述和头像，方便在应用管理中区分业务用途 \\
+系统提示词 & 定义角色、任务边界和回答风格；可建立变量并在提示词中以 \texttt{\$\{variable\}} 形式引用 \\
+模型选择 & 选择一个固定模型连接，或使用 AUTO 交由端—边—云调度决定执行位置 \\
+工具 & 从已登记工具中选择应用可调用的能力；代码工具还可绑定本地工作区 \\
+Skill & 从已安装或已发布 Skill 中选择可复用流程，运行时按任务匹配注入 \\
+知识库 & 挂载已建立索引的资料库，为问答与检索节点提供来源内容 \\
+记忆库 & 选择一个主库和若干参考库，决定长期信息的读写边界 \\
+调试变量 & 为提示词变量填写本次测试值，不影响正式配置 \\
+\bottomrule
+\end{longtable}
+
+用户可以先保存草稿，再在右侧测试会话中输入任务。测试过程会流式展示计划、节点、工具、审批、知识检索和最终回答；若存在高风险工具调用，用户可在会话中完成批准或拒绝。完成验证后，点击发布生成可运行版本；版本抽屉可查看并激活历史发布版本，运行观测抽屉可回看当前应用的任务、模型和工具事件。
+
+\begin{quote}
+【图片占位：图 8 智能体应用编辑器截图。建议展示系统提示词、模型、工具/Skill/知识/记忆绑定区域。】
+\end{quote}
+
+\begin{quote}
+【图片占位：图 9 智能体测试会话截图。建议展示流式过程、工具审批、最终回答及运行观测入口。】
+\end{quote}
+
+\subsection{6. 创建与编排工作流应用}
+
+工作流编辑器通过画布、节点库、属性面板、测试抽屉、检查清单、运行观测和版本管理，将复杂任务拆为可配置节点与连线。用户从节点库拖入节点、连接输入输出、配置属性，再通过检查清单发现缺失模型、工具、知识库或结构配置。
+
+当前节点库覆盖以下类别。
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+分类 & 节点 & 主要用途 \\
+\midrule
+\endhead
+基础 & 开始、结束、大模型、知识库 & 接收输入、调用模型、检索资料和输出结果 \\
+工具 & 工具 & 调用已挂载的内置/MCP/脚本工具 \\
+智能体 & 智能体、智能体团队 & 执行自主任务，或按候选成员池进行动态委派 \\
+逻辑 & 条件判断、意图分类、防漂移检查、脚本、变量赋值 & 分支、分类、约束检查、数据处理和状态更新 \\
+流程控制 & 循环、批处理 & 顺序重复执行子流程，或受控并行处理输入数组 \\
+高级编排 & 任务规划器、结果汇聚器、质量门、目标检查器、故障恢复器 & 规划 TODO、综合结果、质量返工、目标判断和恢复边界 \\
+\bottomrule
+\end{longtable}
+
+一个典型工作流可按``开始 → 知识库/工具 → 智能体或大模型 → 条件/质量门 → 汇聚 → 结束''搭建。需要多智能体协作时，可使用智能体团队节点建立候选成员池，并在运行期根据任务语义、资源、能力和质量反馈产生动态委派、Handoff 或替代成员。需要保证结果质量时，可使用任务规划器、质量门和结果汇聚器形成``规划—执行—检查—返工/完成''的闭环。
+
+工作流保存后，可在测试抽屉中输入问题，实时查看节点状态、当前执行节点、工具审批和最终回答。发布前应先查看检查清单，确认模型已测试、工具已挂载、知识库已选择、条件路径完整且循环/批处理参数合理；发布后的版本可在版本管理中切换，运行观测可查看每个节点的耗时、模型、工具和路由依据。
+
+\begin{quote}
+【图片占位：图 10 工作流编辑器整体截图。建议展示节点库、画布、节点属性面板、检查清单和发布按钮。】
+\end{quote}
+
+\begin{quote}
+【图片占位：图 11 工作流测试与运行观测截图。建议展示节点执行状态、审批事件、模型/工具信息和路由依据。】
+\end{quote}
+
+\subsection{7. 任务中心、运行中心与结果回溯}
+
+任务中心以列表形式集中展示异步运行，可按状态或任务 ID 搜索，并快速进入某条任务详情。运行中心提供更完整的过程视图：用户可选择已保存工作流并提交 JSON 任务输入，查看节点开始/结束、条件路由、工具结果、审批、知识检索、时态事实更新、最终总结和输出内容；对于运行中的任务，还可执行协作式停止、重新加载或查看错误信息。
+
+运行记录不仅保存最终答案，还保存模型和执行器、工具调用、事件时间、运行耗时与失败信息。因此，平台支持从``结果是否符合预期''进一步追溯到``由哪个节点、模型、工具和路由过程产生''。这一能力也为论文中的动态协作、低熵通信、上下文治理和端—边—云调度提供了演示入口。
+
+\begin{quote}
+【图片占位：图 12 任务中心或运行中心截图。建议展示任务列表、状态筛选、完整事件时间线和最终总结。】
+\end{quote}
+
+\subsection{8. 发布、版本与安全操作}
+
+应用编辑采用``草稿—发布—版本激活''机制。日常保存只更新草稿，不会不断产生无意义版本；点击发布时，平台执行模型、图结构和资源校验，并生成可回溯的发布快照；选择历史版本则激活对应发布版本，便于恢复稳定配置。
+
+平台对高风险工具调用设置显式审批。用户应在测试或运行过程中核对工具名称、风险级别、参数和预期影响，再选择批准或拒绝。模型连接、工具、Skill、知识与记忆等资源均以独立资产管理，删除或停用前应先检查是否仍被应用引用，以避免影响已发布版本。
+
+\begin{quote}
+【图片占位：图 13 发布与版本管理截图。建议展示草稿状态、发布按钮、版本列表和历史版本激活操作。】
+\end{quote}
+
+\subsection{9. 多任务场景演示预留}
+
+以下两处用于后续补充平台在不同真实业务场景中的完整操作示例。每个示例建议至少说明：任务目标、选择的应用类型、挂载模型、工具/Skill/知识/记忆资源、关键工作流节点或提示词、运行过程和最终结果。
+
+\subsubsection{场景一：［待补充的多任务场景名称］}
+
+\begin{quote}
+【图片占位：图 14 场景一的应用配置与运行过程截图。后续补充任务目标、编排方式、模型与资源挂载、关键过程和结果。】
+\end{quote}
+
+【待补充：此处填写场景一的详细实现例子。】
+
+\subsubsection{场景二：［待补充的多任务场景名称］}
+
+\begin{quote}
+【图片占位：图 15 场景二的应用配置与运行过程截图。后续补充任务目标、编排方式、模型与资源挂载、关键过程和结果。】
+\end{quote}
+
+【待补充：此处填写场景二的详细实现例子。】
+
+\subsection{10. 本章小结}
+
+平台通过应用编辑器把模型、工具、Skill、知识库和记忆库组合为可执行应用，通过工作流画布将复杂任务拆解为可检查的节点和控制路径，通过测试会话、任务中心和运行观测展示真实执行过程，并以审批、版本和审计机制保障操作可控。用户既可以快速使用模板搭建单智能体应用，也可以通过节点编排、智能体团队、质量门和恢复器构建多任务协作流程。后续两个场景示例将进一步展示该平台如何在具体业务任务中完成资源挂载、流程配置与结果交付。
+
+\subsection{附：本章平台功能的实现依据}
+
+\begin{itemize}
+\tightlist
+\item
+  前端主导航与页面路由：\texttt{long\_task\_1\_Fronted/src/App.tsx}。
+\item
+  应用创建与应用卡片：\texttt{long\_task\_1\_Fronted/src/AppCenter.tsx}。
+\item
+  智能体编辑、调试、观测和版本：\texttt{long\_task\_1\_Fronted/src/AgentEditor.tsx}、\texttt{ApplicationDrawers.tsx}。
+\item
+  工作流画布、节点、测试和观测：\texttt{long\_task\_1\_Fronted/src/WorkflowEditor.tsx}。
+\item
+  模型连接、工具、知识库、Skill 和记忆：\texttt{ModelConnectionPanel.tsx}、\texttt{ToolsPage.tsx}、\texttt{KnowledgePages.tsx}、\texttt{BailianPages.tsx}。
+\item
+  运行事件呈现：\texttt{RunConsole.tsx}、\texttt{RunActivity.tsx}。
+\end{itemize}
+
+\section{多任务场景演示、应用价值与综合评估}
+
+\subsection{演示与评估原则}
+
+本章用于将前述机制从“模块级设计”落实为“完整任务级证据”。案例选择应遵循三个原则：第一，两个案例应来自不同业务领域，并同时包含多个阶段、至少一种外部能力和可检查交付物；第二，案例描述必须保留用户目标、资源挂载、执行过程和最终结果，避免只展示静态工作流画布；第三，所有定量结果必须来自保存的运行记录或实验输出，并注明样本数、模型、任务版本和统计口径。
+
+每个案例均采用统一的任务卡片：业务痛点、任务目标、应用类型、模型与资源配置、协作与执行过程、异常/质量处理、最终交付物和可观察指标。这样可以同时证明系统具备完整闭环、清晰组织协作和跨场景组合能力，而不是仅能运行单一演示。
+
+\subsection{场景一：\textbf{待补充}跨领域长程任务}
+
+\textbf{待补充说明：} 此处后续填写场景一名称。推荐选择需要“资料检索/工具调用 + 多步骤分析/生成 + 结果校验”的任务，例如企业办公协同、项目资料研究、客户服务流程或软件工程交付。场景名称确定后，应将下表中的方括号内容替换为真实配置。
+
+\begin{longtable}{p{0.24\linewidth}p{0.65\linewidth}}
+\toprule
+项目 & 场景一待填写内容 \\
+\midrule
+业务痛点 & 【待补充：该业务中人工处理慢、跨系统信息分散或易遗漏的具体问题】 \\
+任务目标与交付物 & 【待补充：用户输入、最终产物、验收条件】 \\
+应用类型 & 【待补充：智能体应用 / 工作流应用；选择理由】 \\
+模型与资源位置 & 【待补充：固定模型或 AUTO；端/边/云实际选用情况】 \\
+挂载能力 & 【待补充：工具、MCP、Skill、知识库、记忆库、工作区】 \\
+协作与流程 & 【待补充：主要节点、Agent 角色、动态团队/Handoff、质量门或恢复器】 \\
+运行结果 & 【待补充：最终交付物摘要、关键事件、任务状态、运行编号】 \\
+\bottomrule
+\end{longtable}
+
+\figureplaceholder{场景一的配置与运行证据}{建议制作组合图：左侧为应用或工作流配置截图，中间为资源挂载/节点或团队结构截图，右侧为任务运行时间线和最终交付物截图。截图中应能看见模型、工具或知识资源、关键节点状态以及最终输出。}
+
+\textbf{场景一分析写法（待替换方括号内容）：} 本场景中，系统以【任务目标】为起点，将【关键步骤】拆解为可执行阶段；其中【角色/节点】负责【职责】，并通过【工具或知识库】获得外部证据。若执行过程中出现【待补充：如工具审批、资料缺失、任务返工、资源回退等事件】，系统通过【对应机制】进行处理，最终生成【交付物】。该案例主要证明平台在【业务领域一】中能够将规划、执行、验证和结果回收组成连续闭环。
+
+\subsection{场景二：\textbf{待补充}跨领域长程任务}
+
+\textbf{待补充说明：} 场景二应与场景一在业务目标和能力组合上明显不同，建议至少改变其中两项：任务领域、工具类型、知识来源、协作结构、端边云资源策略或最终交付物形式。这样可证明平台具备跨领域迁移与能力组合潜力。
+
+\begin{longtable}{p{0.24\linewidth}p{0.65\linewidth}}
+\toprule
+项目 & 场景二待填写内容 \\
+\midrule
+业务痛点 & 【待补充：第二个领域中的具体人工流程或协作问题】 \\
+任务目标与交付物 & 【待补充：用户输入、最终产物、验收条件】 \\
+应用类型 & 【待补充：智能体应用 / 工作流应用；选择理由】 \\
+模型与资源位置 & 【待补充：固定模型或 AUTO；端/边/云实际选用情况】 \\
+挂载能力 & 【待补充：工具、MCP、Skill、知识库、记忆库、工作区】 \\
+协作与流程 & 【待补充：主要节点、Agent 角色、动态团队/Handoff、质量门或恢复器】 \\
+运行结果 & 【待补充：最终交付物摘要、关键事件、任务状态、运行编号】 \\
+\bottomrule
+\end{longtable}
+
+\figureplaceholder{场景二的配置与运行证据}{建议制作组合图：左侧展示与场景一不同的应用配置或工作流，中央展示运行时的节点/团队/资源事件，右侧展示最终交付物与用户可见结果。建议突出至少一种与场景一不同的资源挂载或协作策略。}
+
+\textbf{场景二分析写法（待替换方括号内容）：} 针对【业务领域二】的【任务痛点】，系统组合了【能力资产】并采用【编排或协作策略】。与场景一相比，本任务在【领域、工具、知识来源或交付物】上具有明显差异；系统仍能通过【上下文/拓扑/调度机制】保持任务目标、控制执行过程并输出【最终结果】。该案例用于证明系统并非针对单一脚本或单一行业规则设计，而能够复用通用运行时能力完成异构任务。
+
+\subsection{场景覆盖、用户体验与应用价值}
+
+两个案例完成后，应在本节补充一张跨场景对比表，将技术能力与业务价值逐项对应。该表不应只列“使用了哪些模块”，还应说明每项模块为用户减少了何种操作负担、为业务降低了何种信息处理或协同成本。
+
+\begin{longtable}{p{0.20\linewidth}p{0.23\linewidth}p{0.23\linewidth}p{0.23\linewidth}}
+\toprule
+维度 & 场景一 & 场景二 & 价值说明 \\
+\midrule
+业务领域与用户角色 & 【待补充】 & 【待补充】 & 说明两个案例为何属于不同领域，及其面向的具体用户 \\
+任务跨度与关键步骤 & 【待补充】 & 【待补充】 & 列出阶段数、外部系统数、关键验收点或异常处理点 \\
+用户操作方式 & 【待补充】 & 【待补充】 & 说明用户如何通过可视化配置、测试与运行观测完成任务 \\
+数字劳动力价值 & 【待补充】 & 【待补充】 & 说明减少重复检索、跨系统切换、人工整理或返工的机制 \\
+可复用资产 & 【待补充】 & 【待补充】 & 列出可迁移的 Skill、知识库、记忆规则或工作流组件 \\
+\bottomrule
+\end{longtable}
+
+从应用价值角度看，平台的作用不应被表述为未经验证的经济收益，而应清晰说明其价值形成机制：通过知识检索和记忆减少重复查找，通过工具和工作流降低多系统操作成本，通过动态团队和质量门减少多角色协作中的遗漏，通过可视化编辑、审批和运行观测降低用户理解与控制复杂任务的门槛。若后续获得真实试用数据，可进一步补充人时、任务周期、返工次数、人工步骤数或满意度等指标，并明确其采集方法和样本范围。
+
+\figureplaceholder{平台用户旅程与应用价值路径}{建议绘制用户从模型/能力配置、创建应用、测试与审批、查看运行结果、发布版本到复用 Skill/知识/记忆的流程；在每一步标注降低的用户操作成本和可积累的资产。}
+
+\section{综合实验与系统评估}
+
+\subsection{评估目标与报告规范}
+
+综合实验将评分维度拆解为四类：闭环与鲁棒性、通信与上下文资源效率、端—边—云资源效率、兼容性与可扩展性。所有正式表格应包含方法、任务集、样本数、模型/资源配置、指标定义和数据来源；一次性建库、缓存预热或人工准备时间应与在线执行时间分开报告。对于确定性机制评测、诊断集和真实 LLM 端到端任务，必须分别标注，不能将三类结果混为同一成功率。
+
+\subsection{闭环能力、执行成功率与鲁棒性}
+
+该实验用于验证系统是否能够在多步任务、约束变化、成员失败、工具异常、预算压力和中断恢复条件下持续推进。建议对每条任务保存目标、TODO、事件序列、节点状态、失败类型、恢复动作、最终交付物和验收结果；并与无恢复、静态流程或仅检索基线进行对比。
+
+\begin{longtable}{p{0.20\linewidth}p{0.13\linewidth}p{0.13\linewidth}p{0.13\linewidth}p{0.13\linewidth}p{0.13\linewidth}}
+\toprule
+方法 & 样本数 & 任务完成率 & 目标/约束保持 & 恢复成功率 & 平均步骤数 \\
+\midrule
+静态或无治理基线 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 \\
+仅记忆/仅上下文对照 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 \\
+TIDE-Swarm 完整系统 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 \\
+\bottomrule
+\end{longtable}
+
+\textbf{结果分析模板：} 若完整系统在任务完成、约束保持和恢复成功率上优于对照，则应结合具体运行轨迹解释原因：Context Ledger 负责恢复任务骨架，动态团队负责在成员失败或能力缺口时重组选人，质量门和恢复器负责将异常转化为可追踪的返工或替代路径。若某类任务失败，应按“证据召回不足、工具不可用、模型生成错误、验收条件过严或资源不可用”分类报告，而不是仅给出总体失败率。
+
+\subsection{上下文与低熵通信的资源效率}
+
+该实验将 Token 和时间拆为上下文组织、记忆检索、通信传输和端到端执行四部分。上下文部分可使用已有 LongMemEval/LoCoMo 结果中的可见上下文、QA token、检索时间、写入时间和总时间；通信部分应在同一任务、同一成员池和同一模型条件下比较自由文本全连接、静态稀疏通信、仅 Capsule 与 TIDE-Mesh 完整方法。
+
+\begin{longtable}{p{0.19\linewidth}p{0.11\linewidth}p{0.12\linewidth}p{0.12\linewidth}p{0.12\linewidth}p{0.12\linewidth}p{0.12\linewidth}}
+\toprule
+方法 & 任务完成/QA & 平均上下文 Token & 通信 Token & 平均时间 & 活跃边密度 & 消息剪枝率 \\
+\midrule
+Full Context / 自由通信 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 0 \\
+静态稀疏或 Memory Only & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 \\
+TIDE-Mesh + Context Governance & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 & 【待补】 \\
+\bottomrule
+\end{longtable}
+
+\textbf{结果分析模板：} 完整方法的优势应从两个维度解释。其一，Ledger、分层检索和按需归档展开减少无关历史进入模型窗口，因此可降低平均上下文 Token；其二，动态稀疏边、接收者条件化贡献门控和 StateDelta 减少无价值消息沿协作图扩散，因此可降低通信载荷与重复率。报告时必须同时观察任务质量：若 Token 降低但 Evidence Recall、关键字段保真度或任务完成率明显下降，则不能将其视为有效压缩。
+
+\figureplaceholder{资源效率对比图}{待补充正式实验后绘制两张图：左图为不同方法的平均上下文/通信 Token 与平均时间；右图为任务完成或 QA 指标与 Token 成本的帕累托关系。图注必须写清在线时间是否排除建库、缓存和人工准备时间。}
+
+\subsection{端—边—云资源效率、兼容性与扩展性}
+
+该实验用于验证资源放置是否同时满足任务需求与安全边界。测试任务应至少覆盖强实时公开任务、公开高复杂任务、敏感高复杂任务、云端限流和边缘不可用五类条件；每条任务记录最终 tier、实际 tier、模型、时延、回退次数、是否脱敏和是否触发审计。模型兼容性则通过已测试的 DEVICE、EDGE、CLOUD 连接以及固定模型/AUTO 模式分别报告。
+
+\begin{longtable}{p{0.19\linewidth}p{0.15\linewidth}p{0.13\linewidth}p{0.13\linewidth}p{0.13\linewidth}p{0.13\linewidth}}
+\toprule
+任务类型 & 预期策略 & 实际 tier & 平均端到端时间 & 回退率 & 安全处理 \\
+\midrule
+强实时公开任务 & DEVICE 优先 & 【待补】 & 【待补】 & 【待补】 & 无或按任务需求 \\
+公开高复杂任务 & CLOUD 优先 & 【待补】 & 【待补】 & 【待补】 & 无 \\
+敏感高复杂任务 & 可信 EDGE/DEVICE 优先 & 【待补】 & 【待补】 & 【待补】 & 脱敏/审计 \\
+云端限流或故障任务 & 回退 EDGE/DEVICE & 【待补】 & 【待补】 & 【待补】 & 记录资源异常 \\
+\bottomrule
+\end{longtable}
+
+\textbf{结果分析模板：} 当公开高复杂任务稳定选择 CLOUD、敏感任务保留在可信 DEVICE/EDGE、云端异常后能够回退时，可说明调度器并非固定选择某个模型，而是将实时性、复杂度、敏感度和资源状态纳入同一决策。对于兼容性，应说明模型连接和 ExecutorRegistry 对不同 OpenAI-compatible 本地、边缘和云端服务的统一接入方式，以及工作流节点、工具、Skill、知识库和记忆库的可组合性；不应仅凭接口数量宣称实际性能优势。
+
+\subsection{综合评估结论与待补材料清单}
+
+完成上述实验和案例后，本节应以“任务质量—资源成本—运行鲁棒性—跨场景复用”四条证据链总结系统表现。建议答辩时展示以下材料：两个跨领域任务的完整运行录像或连续截图、至少一条动态团队重构轨迹、至少一条工具审批或恢复轨迹、上下文/通信 Token 对比图、端边云回退记录，以及平台的可视化配置与运行观测界面。这样，论文中的架构、算法、平台和实验能够相互印证。
+
+\begin{itemize}
+\item \textbf{待补充图像：} 核心闭环图、组织协作图、低熵通信对比图、两个场景组合图、资源效率图、用户旅程图。
+\item \textbf{待补充实验：} 两个跨领域长程任务、通信消融、真实端边云时延/Token/回退记录、用户体验或人时评估。
+\item \textbf{待补充运行材料：} 每项正式实验的配置、数据版本、样本数、模型版本、随机种子、原始输出目录和逐任务轨迹。
+\end{itemize}
+
+\end{document}
+
