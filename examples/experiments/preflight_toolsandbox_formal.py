@@ -29,6 +29,16 @@ def main() -> None:
     parser.add_argument("--expected-runs", type=int, default=360)
     args = parser.parse_args()
     rows = [json.loads(x) for x in args.dataset.read_text(encoding="utf-8").splitlines() if x.strip()]
+    manifest_path = args.dataset.with_name("manifest.json")
+    if not manifest_path.exists():
+        raise SystemExit("FAIL: frozen dataset manifest missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    actual_dataset_hash = sha256(args.dataset)
+    if manifest.get("tasks_sha256") != actual_dataset_hash:
+        raise SystemExit(
+            "FAIL: dataset hash differs from manifest; regenerate the frozen dataset "
+            "or explicitly version the changed task set"
+        )
     ids = [row["id"] for row in rows]
     families = [row["family"] for row in rows]
     if len(ids) != len(set(ids)) or len(families) != len(set(families)):
@@ -53,7 +63,7 @@ def main() -> None:
             if formal_families & set(skill.source_families):
                 raise SystemExit(f"FAIL: formal family leaked into {skill.skill_id}")
     report = {
-        "status": "PASS", "dataset_sha256": sha256(args.dataset),
+        "status": "PASS", "dataset_sha256": actual_dataset_hash,
         "formal_tasks": len(formal), "trials": args.trials,
         "methods": list(METHODS), "expected_runs": args.expected_runs,
         "formal_groups": dict(Counter(row["primary_group"] for row in formal)),

@@ -513,7 +513,17 @@ class WorkflowNodeRuntimeFactory:
             reasons = "；".join(f"{item['member'].name}：{'、'.join(item['excluded_reasons'])}" for item in assessments)
             raise RuntimeError(f"动态团队没有满足资源条件的成员（{reasons}）")
         ranked = sorted(viable, key=lambda item: item["score"], reverse=True)
-        selected = ranked[: max(1, min(len(ranked), requested, max_parallel))]
+        # ``fixed_sparse`` is deliberately an experiment-only baseline.  It
+        # keeps canvas membership and a pre-declared member subset fixed while
+        # leaving the normal Team implementation intact for all production
+        # modes.  It lets topology experiments distinguish fixed sparse
+        # collaboration from TODO-conditioned selection.
+        fixed_ids = [str(item) for item in delegation.get("fixed_member_ids") or []]
+        if mode == "fixed_sparse":
+            fixed = [item for item in assessments if item["member"].id in fixed_ids]
+            selected = fixed[:max_parallel] or ranked[: max(1, min(len(ranked), requested, max_parallel))]
+        else:
+            selected = ranked[: max(1, min(len(ranked), requested, max_parallel))]
         events: list[Dict[str, Any]] = [
             {"type": "team_started", "team": team.name, "team_id": team.id, "member_count": len(enabled), "eligible_member_count": len(viable), "mode": mode},
             {"type": "candidate_filtered", "team": team.name, "candidates": [self._assessment_event(item) for item in assessments]},
@@ -536,6 +546,15 @@ class WorkflowNodeRuntimeFactory:
                 update = await self(member_for_run).invoke(child_state) or {}
                 output = update.get("input", update.get(member.name, update))
                 handoff = _extract_handoff(update, output)
+                experiment_event = _topology_experiment_event(
+                    config, state, member, update, output
+                )
+                if experiment_event and experiment_event["kind"] == "handoff":
+                    handoff = experiment_event["handoff"]
+                    events.append({"type": "topology_experiment_event", "team": team.name, "node": member.name, "member_id": member.id, "event": experiment_event["audit"]})
+                if experiment_event and experiment_event["kind"] == "failure":
+                    events.append({"type": "topology_experiment_event", "team": team.name, "node": member.name, "member_id": member.id, "event": experiment_event["audit"]})
+                    raise RuntimeError(experiment_event["audit"]["reason"])
                 events.append({"type": "team_member_completed", "team": team.name, "node": member.name, "member_id": member.id, "parent_node_id": team.id, "latency_ms": round((time.perf_counter() - started) * 1000, 1)})
                 events.append({"type": "goal_checked", "team": team.name, "node": member.name, "member_id": member.id, "complete": not bool(handoff), "reason": "handoff_requested" if handoff else "member_reported_completion"})
                 return {"member_id": member.id, "member": member.name, "status": "succeeded", "output": output, "update": update, "handoff": handoff}
@@ -848,6 +867,57 @@ def _routing_weights(routing: Dict[str, Any]) -> Dict[str, float]:
         weights.update({"semantic_similarity": .28, "prompt_task_match": .10, "historical_success": .10, "cost": .13, "latency": .12, "failure_risk": .08})
     weights.update({str(k): float(v) for k, v in (routing.get("weights") or {}).items() if str(k) in weights})
     return weights
+
+
+def _topology_experiment_event(
+    team_config: Dict[str, Any], state: Dict[str, Any], member: AgentSpec,
+    update: Dict[str, Any], output: Any,
+) -> Dict[str, Any] | None:
+    """Apply an explicitly labelled topology experiment event after real work.
+
+    This is not a production recovery policy and is inert unless both the
+    Team config and run state contain the same ``experimental_event_plan``.
+    It is useful for paired experiments: an LLM first performs its normal
+    inference/tool call, then a controlled capability-gap or failure event is
+    injected so every method sees the same trigger.  The returned audit data
+    is deliberately marked ``injected`` for result filtering and reporting.
+    """
+    configured = team_config.get("experimental_event_plan")
+    active = state.get("experimental_event_plan")
+    if not isinstance(configured, dict) or not isinstance(active, dict):
+        return None
+    if configured.get("id") != active.get("id"):
+        return None
+    if str(active.get("source_member_id") or "") != member.id:
+        return None
+    calls = [item for item in update.get("__runtime_tool_calls__") or [] if isinstance(item, dict)]
+    require_tool = bool(active.get("require_successful_tool_call", True))
+    if require_tool and not any(item.get("status") == "succeeded" for item in calls):
+        return None
+    kind = str(active.get("kind") or "")
+    audit = {
+        "id": str(active.get("id") or ""), "kind": kind, "injected": True,
+        "source_member_id": member.id,
+        "tool_call_count": len(calls),
+        "successful_tool_call_count": sum(1 for item in calls if item.get("status") == "succeeded"),
+        "reason": str(active.get("reason") or "controlled topology experiment event"),
+    }
+    if kind == "handoff":
+        return {
+            "kind": "handoff", "audit": audit,
+            "handoff": {
+                "status": "needs_handoff",
+                "remaining_task": str(active.get("remaining_task") or output or ""),
+                "required_capabilities": [str(value) for value in active.get("required_capabilities") or []],
+                "reason": audit["reason"],
+                "context_summary": str(output or "")[:1200],
+                "experimental_event_id": audit["id"],
+                "injected": True,
+            },
+        }
+    if kind == "failure_after_tool":
+        return {"kind": "failure", "audit": audit}
+    return None
 
 
 def _handoff_contract(system_prompt: str) -> str:

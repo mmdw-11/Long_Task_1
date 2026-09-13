@@ -247,11 +247,18 @@ def select_tasks(source_root: Path) -> tuple[list[ToolSandboxTask], dict[str, An
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    """Hash JSONL content canonically, independent of checkout line endings.
+
+    The frozen manifest is shared between Windows and Unix runners.  Hashing
+    raw bytes made the same task rows appear to have different identities when
+    Git converted LF/CRLF.  JSONL is deliberately serialized as one compact
+    JSON object per LF-terminated line, so this normalization is lossless.
+    """
+    text = path.read_text(encoding="utf-8")
+    normalized = "\n".join(text.splitlines())
+    if normalized:
+        normalized += "\n"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def write_dataset(source_root: Path, output_root: Path) -> dict[str, Any]:

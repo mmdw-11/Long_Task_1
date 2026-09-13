@@ -42,14 +42,17 @@ class AdvancedLearnedTaskGate(TaskGate):
         threshold: float = 0.5,
         fallback: Optional[TaskGate] = None,
         router_name: str = "advanced",
+        strict: bool = False,
     ) -> None:
         self.model = model
         self.threshold = threshold
         self.fallback = fallback or HeuristicTaskGate()
         self.router_name = router_name
+        self.strict = strict
 
     def evaluate(self, request: ResourceRequest) -> TaskProfile:
         text = _collect_request_text(request)
+        safety_profile = self.fallback.evaluate(request)
         try:
             probs = self.model.predict_proba(text)
             if any(label not in (0, 1) for label in probs):
@@ -63,11 +66,20 @@ class AdvancedLearnedTaskGate(TaskGate):
                 score=score,
                 request=request,
                 router_name=self.router_name,
+                safety_profile=safety_profile,
             )
-        except Exception:
-            profile = self.fallback.evaluate(request)
+        except Exception as exc:
+            if self.strict:
+                raise RouterUnavailableError(
+                    f"{self.router_name} router prediction failed: {exc}"
+                ) from exc
+            profile = safety_profile
             profile.metadata = {**profile.metadata, "gate": f"{self.router_name}_fallback"}
             return profile
+
+
+class RouterUnavailableError(RuntimeError):
+    """Raised when strict routing cannot produce a learned decision."""
 
 
 def resolve_router_backend(explicit_backend: Optional[str] = None) -> str:
@@ -125,6 +137,7 @@ def load_production_gate(
     threshold: float = 0.35,
     fallback: Optional[TaskGate] = None,
     backend: Optional[str] = None,
+    strict: bool = False,
 ) -> TaskGate:
     fallback = fallback or HeuristicTaskGate()
     inferred_backend = infer_router_backend_from_path(router_path) if router_path else None
@@ -144,6 +157,7 @@ def load_production_gate(
                 threshold=threshold,
                 fallback=fallback,
                 router_name=resolved_backend,
+                strict=strict,
             )
         if resolved_backend == "bge_m3":
             model = EmbeddingClassifierRouter(resolved_path)
@@ -152,9 +166,14 @@ def load_production_gate(
                 threshold=threshold,
                 fallback=fallback,
                 router_name=resolved_backend,
+                strict=strict,
             )
         return fallback
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise RouterUnavailableError(
+                f"unable to load {resolved_backend} router from {resolved_path}: {exc}"
+            ) from exc
         if resolved_backend != "nb" and LEGACY_DEFAULT_ROUTER_PATH.exists():
             try:
                 model = BinaryTextRouterModel.load(LEGACY_DEFAULT_ROUTER_PATH)
@@ -183,21 +202,29 @@ def _profile_from_label(
     score: float,
     request: ResourceRequest,
     router_name: str,
+    safety_profile: TaskProfile,
 ) -> TaskProfile:
     human_approved = bool(
         request.metadata.get("human_approved")
         or request.state.get("human_approved")
         or request.state.get("cloud_audit_approved")
     )
-    task_type = str(request.metadata.get("task_type") or "general")
+    task_type = str(request.metadata.get("task_type") or safety_profile.task_type)
+    shared = {
+        "realtime": safety_profile.realtime,
+        "sensitivity": safety_profile.sensitivity,
+        "task_type": task_type,
+        "requires_trusted_workspace": safety_profile.requires_trusted_workspace,
+        "human_approved": human_approved,
+    }
     if label == 2:
         return TaskProfile(
-            realtime=RealtimeRequirement.NORMAL,
-            sensitivity=SensitivityLevel.INTERNAL,
+            realtime=shared["realtime"],
+            sensitivity=shared["sensitivity"],
             complexity=TaskComplexity.HIGH,
-            task_type=task_type,
-            requires_trusted_workspace=bool(request.metadata.get("requires_trusted_workspace")),
-            human_approved=human_approved,
+            task_type=shared["task_type"],
+            requires_trusted_workspace=shared["requires_trusted_workspace"],
+            human_approved=shared["human_approved"],
             metadata={
                 "node": request.node,
                 "router": "learned",
@@ -209,12 +236,12 @@ def _profile_from_label(
         )
     if label == 1:
         return TaskProfile(
-            realtime=RealtimeRequirement.NORMAL,
-            sensitivity=SensitivityLevel.INTERNAL,
+            realtime=shared["realtime"],
+            sensitivity=shared["sensitivity"],
             complexity=TaskComplexity.HIGH,
-            task_type=task_type,
-            requires_trusted_workspace=bool(request.metadata.get("requires_trusted_workspace")),
-            human_approved=human_approved,
+            task_type=shared["task_type"],
+            requires_trusted_workspace=shared["requires_trusted_workspace"],
+            human_approved=shared["human_approved"],
             metadata={
                 "node": request.node,
                 "router": "learned",
@@ -225,12 +252,12 @@ def _profile_from_label(
             },
         )
     return TaskProfile(
-        realtime=RealtimeRequirement.INTERACTIVE,
-        sensitivity=SensitivityLevel.INTERNAL,
+        realtime=shared["realtime"],
+        sensitivity=shared["sensitivity"],
         complexity=TaskComplexity.LOW,
-        task_type=task_type,
-        requires_trusted_workspace=False,
-        human_approved=human_approved,
+        task_type=shared["task_type"],
+        requires_trusted_workspace=shared["requires_trusted_workspace"],
+        human_approved=shared["human_approved"],
         metadata={
             "node": request.node,
             "router": "learned",

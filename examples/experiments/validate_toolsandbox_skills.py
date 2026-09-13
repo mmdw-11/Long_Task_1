@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 from engine.experiments.toolsandbox_runtime import load_tasks, run_task, save_results
-from engine.experiments.toolsandbox_skills import parse_skill, retrieve_skills
+from engine.experiments.toolsandbox_skills import BGEPolicyRetriever, parse_skill, retrieve_skills
 
 
 def mean(rows, field):
@@ -34,17 +34,17 @@ def paired_non_regression(baseline, candidate, reward_tolerance):
     for task_id in sorted(base):
         b, c = base[task_id], cand[task_id]
         applied = bool(c.get("skill_injections"))
-        effective_reward = c["reward"] if applied else b["reward"]
-        effective_minefield = c["minefield_similarity"] if applied else b["minefield_similarity"]
         details.append({
             "task_id": task_id,
             "baseline_reward": b["reward"], "candidate_reward": c["reward"],
             "baseline_minefield": b["minefield_similarity"],
             "candidate_minefield": c["minefield_similarity"],
             "skill_applied": applied,
-            "reward_delta": effective_reward - b["reward"],
-            "reward_non_regression": effective_reward + reward_tolerance >= b["reward"],
-            "minefield_non_regression": effective_minefield <= b["minefield_similarity"] + 1e-12,
+            # A candidate that was not actually injected supplies no evidence
+            # of non-regression.  Never substitute the baseline score here.
+            "reward_delta": c["reward"] - b["reward"] if applied else None,
+            "reward_non_regression": applied and c["reward"] + reward_tolerance >= b["reward"],
+            "minefield_non_regression": applied and c["minefield_similarity"] <= b["minefield_similarity"] + 1e-12,
         })
     return details
 
@@ -81,9 +81,11 @@ def main() -> None:
         paths = [path for path in paths if path.stem in set(args.candidates)]
     for path in paths:
         skill = parse_skill(json.loads(path.read_text(encoding="utf-8")))
+        retriever = BGEPolicyRetriever([skill])
         applicable_tasks = [
             task for task in tasks
-            if retrieve_skills([skill], task["id"].replace("_", " "), max_chars=args.skill_budget_chars)[1][0]["accepted"]
+            if retrieve_skills([skill], task["id"].replace("_", " "), max_chars=args.skill_budget_chars,
+                               bge_retriever=retriever)[1][0]["accepted"]
         ]
         candidate_rows = [run_task(task, "ours_full", 0, args.output_root / skill.skill_id, model,
                                    skill_root=args.skill_root, skill_budget_chars=args.skill_budget_chars,

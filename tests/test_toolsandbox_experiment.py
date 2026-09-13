@@ -5,7 +5,7 @@ import pytest
 
 from engine.experiments.toolsandbox_data import primary_group, scenario_family
 from engine.experiments.toolsandbox_runtime import stable_role_seed, summarize
-from engine.experiments.toolsandbox_skills import AUTO_VALIDATED_SKILL, ToolSandboxSkill, retrieve_skills, validate_skill
+from engine.experiments.toolsandbox_skills import AUTO_VALIDATED_SKILL, BGEPolicyRetriever, ToolSandboxSkill, retrieve_skills, validate_skill
 
 
 def test_family_normalization_and_priority():
@@ -114,6 +114,24 @@ def test_single_strong_domain_anchor_retrieves_skill():
     text, trace = retrieve_skills([ToolSandboxSkill(**payload)], "turn on wifi", max_chars=6000)
     assert text
     assert trace[0]["accepted"]
+
+
+def test_bge_retrieval_records_backend_and_uses_real_embedding_interface():
+    class TinyEmbedder:
+        def embed(self, text):
+            return [1.0, 0.0] if "wifi" in text else [0.0, 1.0]
+    payload = {
+        "skill_id": "device", "name": "Device", "version": 1,
+        "source_type": "successful_train_trajectories", "source_trajectory_keys": ["train/x"],
+        "source_families": ["wifi"], "applicable_when": ["enable wifi service"],
+        "not_applicable_when": [], "required_tools": ["set_wifi_status"], "required_slots": [],
+        "preconditions": [], "ordered_steps": [], "canonicalization_rules": [], "clarification_rules": [],
+        "abstention_rules": [], "recovery_paths": [], "safety_rules": [], "success_checks": [],
+    }
+    skill = ToolSandboxSkill(**payload)
+    _, trace = retrieve_skills([skill], "turn on wifi", max_chars=6000,
+                               bge_retriever=BGEPolicyRetriever([skill], embedder=TinyEmbedder()))
+    assert trace[0]["retrieval_backend"] == "bge_m3"
 
 
 def test_strict_validation_uses_paired_non_regression():

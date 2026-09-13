@@ -1,0 +1,2 @@
+{"case_id":"smoke-json-001","dataset":"agentroute-cn","stratum":"light","input":"只输出 JSON：{\"label\":\"A\"}","system_prompt":"严格按用户要求输出。","evaluator_type":"json_schema","reference":["label"]}
+{"case_id":"smoke-exact-001","dataset":"agentroute-cn","stratum":"medium","input":"只输出字母 B，不要解释。","system_prompt":"严格按用户要求输出。","evaluator_type":"exact_match","reference":"B"}

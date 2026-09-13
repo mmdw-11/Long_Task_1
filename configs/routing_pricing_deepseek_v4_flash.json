@@ -1,0 +1,6 @@
+{
+  "deepseek-v4-flash": {
+    "input_per_million_cny": 1.5,
+    "output_per_million_cny": 4.5
+  }
+}

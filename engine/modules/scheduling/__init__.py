@@ -65,6 +65,7 @@ from .monitor import (
 )
 from .policy import TrustedWorkspacePolicy
 from .production import (
+    RouterUnavailableError,
     desired_router_path,
     load_production_gate,
     resolve_router_path,
@@ -123,6 +124,7 @@ __all__ = [
     "load_production_gate",
     "desired_router_path",
     "router_artifact_status",
+    "RouterUnavailableError",
     "train_router",
     "train_bge_mlp_router",
     "train_bge_router",

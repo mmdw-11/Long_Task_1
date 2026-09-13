@@ -15,7 +15,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, cast
 
-from .toolsandbox_skills import METHODS, ToolSandboxSkill, load_skill_library, retrieve_skills
+from .toolsandbox_skills import BGEPolicyRetriever, METHODS, ToolSandboxSkill, load_skill_library, retrieve_skills
 
 _SCENARIO_CACHE: dict[str, Any] | None = None
 
@@ -130,19 +130,34 @@ def stable_role_seed(task_id: str, trial: int, role: str) -> int:
 
 
 def make_roles(skills: list[ToolSandboxSkill], model: str, skill_budget_chars: int,
-               *, agent_seed: int, user_seed: int):
+               *, agent_seed: int, user_seed: int, retrieval_backend: str = "bge_m3"):
     from openai import NOT_GIVEN, OpenAI
     from tool_sandbox.common.execution_context import RoleType
     from tool_sandbox.roles.execution_environment import ExecutionEnvironment
     from tool_sandbox.roles.openai_api_agent import OpenAIAPIAgent
     from tool_sandbox.roles.openai_api_user import OpenAIAPIUser
 
-    if model.startswith("deepseek-"):
+    if model.startswith("deepseek-") and os.environ.get("DEEPSEEK_API_KEY"):
         api_key = os.environ["DEEPSEEK_API_KEY"]
         base_url = "https://api.deepseek.com"
-    else:
+        endpoint_kind = "deepseek_direct"
+    elif os.environ.get("OPENAI_BASE_URL") and os.environ.get("OPENAI_API_KEY"):
+        # Project terminology calls this the cloud connection.  It is an
+        # OpenAI-compatible endpoint and is preferred over any local/edge
+        # fallback for the experiment.
         api_key = os.environ["OPENAI_API_KEY"]
         base_url = os.environ["OPENAI_BASE_URL"].strip().rstrip("/")
+        endpoint_kind = "cloud_openai_compatible"
+    elif os.environ.get("EDGE_OLLAMA_BASE_URL") and os.environ.get("EDGE_OLLAMA_API_KEY"):
+        api_key = os.environ["EDGE_OLLAMA_API_KEY"]
+        base_url = os.environ["EDGE_OLLAMA_BASE_URL"].strip().rstrip("/")
+        endpoint_kind = "edge_openai_compatible"
+    else:
+        raise RuntimeError("no DeepSeek, cloud, or edge OpenAI-compatible model connection is configured")
+
+    bge_retriever = BGEPolicyRetriever(skills) if skills and retrieval_backend == "bge_m3" else None
+    if skills and retrieval_backend != "bge_m3":
+        raise ValueError("ToolSandbox skill experiments require retrieval_backend='bge_m3'")
 
     class DeepSeekAgent(OpenAIAPIAgent):
         model_name = model
@@ -160,6 +175,7 @@ def make_roles(skills: list[ToolSandboxSkill], model: str, skill_budget_chars: i
                 self.anchor_query = query
             skill_text, trace = retrieve_skills(
                 skills, query, max_chars=skill_budget_chars, anchor_query=self.anchor_query,
+                bge_retriever=bge_retriever,
             )
             self.retrieval_events.append({"call": self.calls + 1, "query": query[-2000:], "candidates": trace, "injected_chars": len(skill_text)})
             if skill_text:
@@ -225,7 +241,7 @@ def run_task(task: dict[str, Any], method: str, trial: int, output_root: Path, m
            "initial_state_hash": initial_state_hash(scenario), "skill_library_size": len(skills),
            "skill_library_versions": {skill.skill_id: skill.version for skill in skills},
            "skill_budget_chars": skill_budget_chars, "agent_seed": agent_seed, "user_seed": user_seed,
-           "model": model}
+           "model": model, "endpoint_kind": "configured_in_make_roles"}
     try:
         artifact_name = key.replace("/", "__")
         result = scenario.play_and_evaluate(roles, output_root, artifact_name)

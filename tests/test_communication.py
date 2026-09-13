@@ -53,3 +53,40 @@ def test_expired_capsule_is_never_delivered():
     envelopes, events = manager.route(capsule, candidates=["b"])
     assert envelopes == []
     assert events[-1]["decision"]["reasons"] == ["expired"]
+
+
+def test_novel_claim_is_preserved_despite_sparse_optional_fields():
+    manager = CommunicationManager(CommunicationPolicy(min_contribution=.99, novelty_threshold=.70))
+    first, _ = manager.route(MessageCapsule(sender="a", recipients=["b"], goal="release", claim="[ERR-1] date is wrong"), candidates=["b"])
+    second, events = manager.route(MessageCapsule(sender="c", recipients=["b"], goal="release", claim="[ALT-1] version is independent"), candidates=["b"])
+    assert first and second
+    assert events[-1]["decision"]["reasons"] == ["novel_claim_protected"]
+
+
+def test_state_delta_excludes_previous_capsule_envelope():
+    manager = CommunicationManager()
+    state = {"goal": "ship", "capsule": MessageCapsule(sender="a", claim="nested"), "messages": [{"content": "old"}]}
+    delta = manager.diff_state("a", state)
+    assert "capsule" not in delta.changed
+    assert "messages" not in delta.changed
+    assert "goal" not in delta.changed  # goal is already a first-class Capsule field
+
+
+def test_conflicting_fact_values_are_delivered_and_audited():
+    manager = CommunicationManager()
+    wrong = MessageCapsule(sender="a", recipients=["b"], claim_id="wrong", fact_key="release_date", claim="2026-08-01", evidence=[EvidenceRef(content="unverified", confidence=.1)])
+    correct = MessageCapsule(sender="c", recipients=["b"], claim_id="evidence", fact_key="release_date", kind="evidence", claim="2026-09-01", evidence=[EvidenceRef(content="official", confidence=.95)])
+    first, _ = manager.route(wrong, candidates=["b"])
+    second, events = manager.route(correct, candidates=["b"])
+    assert first and second
+    assert any(event["type"] == "capsule_conflict_detected" for event in events)
+    assert second[0].capsule.metadata["conflict"] is True
+
+
+def test_prompt_view_excludes_audit_and_state_delta_fields():
+    capsule = MessageCapsule(sender="a", claim_id="c1", fact_key="release_date", claim="2026-09-01", state_delta=None)
+    prompt = capsule.to_prompt_dict()
+    assert prompt["claim"] == "2026-09-01"
+    assert "state_delta" not in prompt
+    assert "provenance" not in prompt
+    assert "digest" not in prompt

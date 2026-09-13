@@ -31,6 +31,11 @@ class CommunicationPolicy:
     broadcast_when_unresolved: bool = True
     preserve_constraints: bool = True
     preserve_conflicts: bool = True
+    # A non-redundant claim is an information-bearing unit.  Do not discard it
+    # merely because its optional evidence/metadata fields are sparse; send it
+    # as a clearly labelled low-confidence capsule and let the receiver decide.
+    preserve_novel_claims: bool = True
+    novelty_threshold: float = 0.70
 
 
 class CommunicationManager:
@@ -57,14 +62,24 @@ class CommunicationManager:
             capsule.next_action = str(update.get("next_action") or "")
             capsule.constraint_delta = dict(update.get("constraint_delta") or {})
         capsule.recipients = list(capsule.recipients or recipients or [])
-        capsule.state_delta = self.diff_state(sender, state)
+        capsule.state_delta = self.diff_state(sender, state, update=update)
         capsule.state_revision = capsule.state_delta.revision
         capsule.refresh_digest(); self.metrics["created"] += 1
         return capsule
 
-    def diff_state(self, sender: str, state: Dict[str, Any]) -> StateDelta:
+    def diff_state(self, sender: str, state: Dict[str, Any], *, update: Optional[Dict[str, Any]] = None) -> StateDelta:
         prior = self._snapshots.get(sender, {})
-        visible = {k: v for k, v in state.items() if not k.startswith("__") and k != "messages"}
+        # ``capsule`` is an explicit output protocol field, but is not business
+        # state.  Persisting it in StateDelta makes the previous envelope nest
+        # inside the next one, inflates token pressure, and defeats the point of
+        # a bounded communication channel.
+        # State deltas are opt-in-by-output: transporting the entire shared
+        # graph state turns a compact Capsule back into a hidden full-history
+        # channel.  Fields already represented by Capsule itself (claim,
+        # evidence, goal) and runtime bookkeeping never cross this boundary.
+        source = update if isinstance(update, dict) else state
+        excluded = {"messages", "capsule", "input", "run_id", "task_id", "trace_id", "goal", "original_goal", "citations", "retrieval_metadata", sender}
+        visible = {k: v for k, v in source.items() if not k.startswith("__") and k not in excluded}
         changed = {k: v for k, v in visible.items() if prior.get(k) != v}
         removed = [k for k in prior if k not in visible]
         base = self._revisions.get(sender, 0); revision = base + 1
@@ -78,6 +93,10 @@ class CommunicationManager:
         events: List[Dict[str, Any]] = [{"type": "capsule_created", "capsule": capsule.to_dict()}]
         envelopes: List[CapsuleEnvelope] = []
         for recipient in resolved:
+            conflict = self._detect_conflict(capsule, recipient)
+            if conflict:
+                capsule = copy.deepcopy(capsule)
+                capsule.metadata = {**capsule.metadata, "conflict": True, "conflicts_with": conflict}
             decision = self.evaluate(capsule, recipient=recipient, role=(roles or {}).get(recipient, ""))
             if decision.action == "prune":
                 self.metrics["pruned"] += 1; events.append({"type": "capsule_pruned", "recipient": recipient, "digest": capsule.digest, "decision": decision.to_dict()}); continue
@@ -91,13 +110,15 @@ class CommunicationManager:
             self._mailboxes.setdefault(recipient, []).append(envelope); self._seen.setdefault(recipient, set()).add(delivered.digest)
             self.metrics["delivered"] += 1; self.metrics["delivered_tokens"] += rough_tokens(delivered.to_dict())
             events.append({"type": "capsule_delivered", "recipient": recipient, "capsule": delivered.to_dict(), "decision": decision.to_dict()})
+            if conflict:
+                events.append({"type": "capsule_conflict_detected", "recipient": recipient, "capsule": delivered.to_dict(), "conflicts_with": conflict})
             if delivered.state_delta and (delivered.state_delta.changed or delivered.state_delta.removed): events.append({"type": "state_delta", "sender": delivered.sender, "recipient": recipient, "delta": delivered.state_delta.to_dict()})
             envelopes.append(envelope)
         return envelopes, events
 
     def evaluate(self, capsule: MessageCapsule, *, recipient: str, role: str = "") -> CapsuleDecision:
         if capsule.is_expired(self.clock()): return CapsuleDecision("prune", 0.0, ["expired"], {"freshness": 0.0})
-        text = " ".join([capsule.goal, capsule.subtask, capsule.claim, capsule.next_action])
+        text = self._capsule_text(capsule)
         relevance = _overlap(capsule.goal + " " + capsule.subtask, capsule.claim + " " + role)
         duplicate = max((_similarity(text, self._capsule_text(e.capsule)) for e in self._mailboxes.get(recipient, [])), default=0.0)
         info = 1.0 - duplicate
@@ -109,8 +130,20 @@ class CommunicationManager:
         score = self.policy.task_relevance_weight*relevance + self.policy.information_gain_weight*info + self.policy.evidence_quality_weight*evidence + self.policy.role_fit_weight*role_fit + self.policy.freshness_weight*freshness - self.policy.redundancy_weight*duplicate - self.policy.budget_pressure_weight*pressure
         protected = bool(capsule.constraint_delta and self.policy.preserve_constraints) or bool(capsule.metadata.get("conflict") and self.policy.preserve_conflicts)
         redundant = duplicate >= self.policy.redundancy_threshold
-        action = "deliver" if protected or (not redundant and score >= self.policy.min_contribution) else "prune"
-        reasons = (["protected_semantics"] if protected else []) + (["redundant"] if redundant and not protected else []) + (["low_contribution"] if action == "prune" and not redundant else []) + (["contribution_threshold_met"] if action == "deliver" and not protected else [])
+        known_fact_keys = {envelope.capsule.fact_key for envelope in self._mailboxes.get(recipient, []) if envelope.capsule.fact_key}
+        # A distinct fact slot is semantically novel even if prose shares much
+        # of its surrounding wording with an earlier message.
+        novel_claim = bool(capsule.claim.strip()) and ((bool(capsule.fact_key) and capsule.fact_key not in known_fact_keys) or duplicate < self.policy.novelty_threshold)
+        if protected:
+            action, reasons = "deliver", ["protected_semantics"]
+        elif redundant:
+            action, reasons = "prune", ["redundant"]
+        elif self.policy.preserve_novel_claims and novel_claim:
+            action, reasons = "deliver", ["novel_claim_protected"]
+        elif score >= self.policy.min_contribution:
+            action, reasons = "deliver", ["contribution_threshold_met"]
+        else:
+            action, reasons = "prune", ["low_contribution"]
         return CapsuleDecision(action, round(score, 6), reasons, {k: round(v, 6) for k, v in c.items()})
 
     def receive(self, recipient: str, *, consume: bool = False) -> List[CapsuleEnvelope]:
@@ -120,7 +153,12 @@ class CommunicationManager:
 
     def inject(self, state: Dict[str, Any], recipient: str) -> None:
         items = self.receive(recipient)
-        state[CAPSULE_CONTEXT_KEY] = [x.to_dict() for x in items]
+        # The model receives the compact semantic protocol; the full envelope
+        # remains available in events/checkpoints for reproducibility.
+        state[CAPSULE_CONTEXT_KEY] = [
+            {"capsule": item.capsule.to_prompt_dict(), "decision": item.decision.to_dict()}
+            for item in items
+        ]
 
     def snapshot(self) -> Dict[str, Any]:
         return {"schema_version": 1, "revisions": dict(self._revisions), "seen_digests": {k: sorted(v) for k, v in self._seen.items()}, "metrics": dict(self.metrics)}
@@ -134,7 +172,33 @@ class CommunicationManager:
         self.metrics.update({k: int(v) for k, v in (snapshot.get("metrics") or {}).items() if k in self.metrics})
 
     @staticmethod
-    def _capsule_text(c: MessageCapsule) -> str: return " ".join([c.goal, c.subtask, c.claim, c.next_action])
+    def _capsule_text(c: MessageCapsule) -> str:
+        # ``subtask`` commonly defaults to the sender node name.  Including
+        # it makes two otherwise identical relays look artificially distinct
+        # solely because they came from different agents, weakening duplicate
+        # suppression at a fan-in recipient.  Goal/claim/next-action are the
+        # recipient-relevant semantic payload for redundancy comparison.
+        return " ".join([c.goal, c.claim, c.next_action])
+
+    def _detect_conflict(self, capsule: MessageCapsule, recipient: str) -> Dict[str, Any] | None:
+        """Mark contradictory fact values; never hide either side of a conflict."""
+        if not capsule.fact_key or not capsule.claim.strip():
+            return None
+        incoming = _normalized_claim(capsule.claim)
+        for envelope in self._mailboxes.get(recipient, []):
+            existing = envelope.capsule
+            if existing.fact_key != capsule.fact_key or not existing.claim.strip():
+                continue
+            if _normalized_claim(existing.claim) == incoming:
+                continue
+            return {
+                "fact_key": capsule.fact_key,
+                "existing_claim_id": existing.claim_id,
+                "existing_sender": existing.sender,
+                "existing_confidence": _confidence(existing),
+                "incoming_confidence": _confidence(capsule),
+            }
+        return None
 
 
 def _tokens(text: str) -> set[str]: return set(re.findall(r"[\w\u4e00-\u9fff]+", text.lower()))
@@ -144,3 +208,13 @@ def _similarity(a: str, b: str) -> float:
 def _overlap(a: str, b: str) -> float:
     x, y = _tokens(a), _tokens(b)
     return len(x & y) / len(x) if x else (0.5 if y else 0.0)
+
+
+def _normalized_claim(value: str) -> str:
+    return " ".join(sorted(_tokens(value)))
+
+
+def _confidence(capsule: MessageCapsule) -> float:
+    if capsule.evidence:
+        return max(max(0.0, min(1.0, float(item.confidence))) for item in capsule.evidence)
+    return max(0.0, min(1.0, 1.0 - float(capsule.uncertainty)))

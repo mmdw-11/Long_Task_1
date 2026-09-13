@@ -11,6 +11,15 @@ python-dotenv>=1.0.0
 # 安装后可使用 BGEM3EmbeddingModel 替代默认的 HashingEmbeddingModel
 FlagEmbedding>=1.2.0
 
+# 本地 BGE-M3 端—边—云路由：SentenceTransformer 编码 + MLP 分类器。
+# 调度器默认加载该路由；依赖缺失时才会安全回退到启发式 Gate。
+numpy==1.26.4
+sentence-transformers==3.3.1
+transformers==4.46.3
+huggingface-hub>=0.26.0,<1.0
+peft==0.13.2
+scikit-learn==1.6.1
+
 # travel_planner 示例的 Web 工具
 # ddgs：DuckDuckGo 搜索库，用于 web_search 工具
 # playwright：真实浏览器，用于 browse_webpage 工具
