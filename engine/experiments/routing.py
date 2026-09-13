@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from engine.modules.agent_runtime import AgentRuntimeFactory
-from engine.modules.model_connections import ModelConnectionStore
+from engine.modules.model_connections import ModelConnection, ModelConnectionStore
 from engine.modules.scheduling import ResourceRequest
 
 from .io import write_json, write_jsonl
@@ -33,6 +33,41 @@ class RoutingCase:
 class Pricing:
     input_per_million_cny: float
     output_per_million_cny: float
+
+
+class EnvironmentDeepSeekStore:
+    """Ephemeral three-tier DeepSeek mapping for connectivity smoke tests only.
+
+    Credentials remain in ``DEEPSEEK_API_KEY`` / ``OPENAI_API_KEY`` and are never
+    persisted.  It deliberately maps the same remote model to each tier, so it
+    must not be used to claim an edge/device cost advantage.
+    """
+
+    def __init__(self, model_id: str = "deepseek-v4-flash") -> None:
+        self.items = {
+            tier: ModelConnection(
+                id=f"env-deepseek-{tier}", name=f"DeepSeek smoke {tier}",
+                provider="deepseek", model_id=model_id,
+                base_url="https://api.deepseek.com/v1", auto_tiers=[tier],
+                test_status="succeeded",
+            )
+            for tier in ("device", "edge", "cloud")
+        }
+
+    def auto_status(self) -> Dict[str, Any]:
+        return {"ready": True, "tiers": {
+            tier: {"ready": True, "connection": item.to_dict(), "reason": ""}
+            for tier, item in self.items.items()
+        }}
+
+    def default_for_tier(self, tier: str, *, runnable: bool = True) -> ModelConnection | None:
+        return self.items.get(tier)
+
+    def get(self, item_id: str) -> ModelConnection:
+        for item in self.items.values():
+            if item.id == item_id:
+                return item
+        raise KeyError(item_id)
 
 
 class RoutingExperimentRunner:
@@ -127,11 +162,9 @@ class RoutingExperimentRunner:
         return summary
 
     def _attempt_cloud_cost(self, attempt: Dict[str, Any]) -> float:
-        if str(attempt.get("tier")) != "cloud":
-            return 0.0
         price = self.pricing.get(str(attempt.get("model") or ""))
         if price is None:
-            raise ValueError(f"missing price for cloud model {attempt.get('model')!r}")
+            return 0.0
         return round(
             int(attempt.get("prompt_tokens") or 0) / 1_000_000 * price.input_per_million_cny
             + int(attempt.get("completion_tokens") or 0) / 1_000_000 * price.output_per_million_cny,

@@ -13,7 +13,11 @@ FlagEmbedding>=1.2.0
 
 # 本地 BGE-M3 端—边—云路由：SentenceTransformer 编码 + MLP 分类器。
 # 调度器默认加载该路由；依赖缺失时才会安全回退到启发式 Gate。
-sentence-transformers>=3.0.0
+numpy==1.26.4
+sentence-transformers==3.3.1
+transformers==4.46.3
+huggingface-hub>=0.26.0,<1.0
+peft==0.13.2
 scikit-learn==1.6.1
 
 # travel_planner 示例的 Web 工具

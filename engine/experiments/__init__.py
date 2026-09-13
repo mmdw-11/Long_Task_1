@@ -27,7 +27,7 @@ from .long_task import (
 from .reports import ExperimentReport, save_report
 from .skills import SKILL_METHODS, SkillExperimentConfig, run_skill_experiment
 from .workflow import WorkflowExperimentConfig, run_workflow_experiment
-from .routing import Pricing, RoutingCase, RoutingExperimentRunner, load_routing_cases, summarize_routing_rows
+from .routing import EnvironmentDeepSeekStore, Pricing, RoutingCase, RoutingExperimentRunner, load_routing_cases, summarize_routing_rows
 from .tau_data import load_tau_tasks, prepare_tau_dataset
 from .types import TauToolTask
 
@@ -60,6 +60,7 @@ __all__ = [
     "load_tau_tasks",
     "prepare_tau_dataset",
     "Pricing",
+    "EnvironmentDeepSeekStore",
     "RoutingCase",
     "RoutingExperimentRunner",
     "load_routing_cases",

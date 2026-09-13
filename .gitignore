@@ -5,6 +5,7 @@
 # 环境与密钥
 .env
 .venv/
+.venv-routing/
 .venv-tau/
 venv/
 
