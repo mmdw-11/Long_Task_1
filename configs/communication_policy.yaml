@@ -11,3 +11,5 @@ budget_pressure_weight: 0.10
 broadcast_when_unresolved: true
 preserve_constraints: true
 preserve_conflicts: true
+preserve_novel_claims: true
+novelty_threshold: 0.70

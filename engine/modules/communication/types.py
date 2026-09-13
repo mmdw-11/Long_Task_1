@@ -68,6 +68,11 @@ class StateDelta:
 class MessageCapsule:
     sender: str
     recipients: List[str] = field(default_factory=list)
+    # Stable semantic identity makes deduplication and conflict detection
+    # operate on a fact/claim rather than incidental wording.
+    claim_id: str = ""
+    fact_key: str = ""
+    kind: str = "claim"  # claim | evidence | constraint | conflict | summary
     goal: str = ""
     subtask: str = ""
     claim: str = ""
@@ -111,6 +116,29 @@ class MessageCapsule:
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         return data
+
+    def to_prompt_dict(self) -> Dict[str, Any]:
+        """Return the bounded semantic view shown to a receiving LLM.
+
+        Audit fields (digest, full StateDelta, trace IDs and internal budgets)
+        remain in persisted events but are not useful reasoning context.
+        """
+        evidence = [
+            {"source": item.source or item.uri, "confidence": round(float(item.confidence), 3)}
+            for item in self.evidence[:3]
+        ]
+        payload: Dict[str, Any] = {
+            "fact_key": self.fact_key,
+            "claim_id": self.claim_id,
+            "kind": self.kind,
+            "claim": self.claim,
+            "confidence": round(max([item.confidence for item in self.evidence] or [1.0 - self.uncertainty]), 3),
+        }
+        if evidence: payload["evidence"] = evidence
+        if self.next_action: payload["next_action"] = self.next_action
+        if self.metadata.get("conflict"):
+            payload["conflict"] = self.metadata.get("conflicts_with") or True
+        return {key: value for key, value in payload.items() if value not in ("", [], {}, None)}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MessageCapsule":

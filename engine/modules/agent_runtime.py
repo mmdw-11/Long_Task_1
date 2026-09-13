@@ -872,7 +872,14 @@ class AgentRuntimeFactory:
             from openai import OpenAI
             api_key = connection_api_key(connection) or "not-needed"
             response = chat_completion(OpenAI(api_key=api_key or "not-needed", base_url=connection.base_url, timeout=60, max_retries=0).chat.completions.create, model=connection.model_id,messages=[{"role":"system","content":system_prompt or "Answer concisely and accurately."},{"role":"user","content":prompt}],temperature=0)
-            return InferenceResult(text=response.choices[0].message.content or "",executor="ModelConnectionExecutor",endpoint=connection.base_url,model=connection.model_id,metadata={"provider":connection.provider,"connection_id":connection.id})
+            usage = getattr(response, "usage", None)
+            metadata = {"provider":connection.provider,"connection_id":connection.id}
+            if usage is not None:
+                for source_key, target_key in (("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"), ("total_tokens", "total_tokens")):
+                    value = getattr(usage, source_key, None)
+                    if value is not None:
+                        metadata[target_key] = int(value)
+            return InferenceResult(text=response.choices[0].message.content or "",executor="ModelConnectionExecutor",endpoint=connection.base_url,model=connection.model_id,metadata=metadata)
         except Exception as exc:
             return InferenceResult(text="",executor="ModelConnectionExecutor",endpoint="",success=False,error=str(exc),retryable=False)
 

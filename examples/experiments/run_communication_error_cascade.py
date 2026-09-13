@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from engine.experiments.communication_error_cascade import (  # noqa: E402
-    METHODS, build_dataset, dataset_manifest, load_dataset, run_case,
+    METHODS, SUBSETS, build_dataset, dataset_manifest, load_dataset, run_case,
     save_result, summarize,
 )
 from engine.experiments.io import write_json, write_jsonl  # noqa: E402
@@ -53,13 +53,15 @@ def bootstrap_env_connection(root: Path) -> str:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Real-LLM error cascade experiment; LocalEcho is rejected.")
-    parser.add_argument("--dataset", default="examples/experiments/sample_data/communication_error_cascade_100.jsonl")
-    parser.add_argument("--output-dir", default="runs/experiments/communication_error_cascade")
+    parser.add_argument("--dataset", default="examples/experiments/sample_data/communication_low_entropy_100_v3.jsonl")
+    parser.add_argument("--output-dir", default="runs/experiments/communication_low_entropy_v3")
     parser.add_argument("--model-connection", default="", help="Tested ModelConnectionStore ID.")
     parser.add_argument("--models-root", default="", help="Directory containing model connection records.")
     parser.add_argument("--bootstrap-from-env", action="store_true")
     parser.add_argument("--generate-dataset", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="Use only first N frozen cases (0 means all 100).")
+    parser.add_argument("--subsets", nargs="+", choices=list(SUBSETS), default=[], help="Run selected strata only.")
+    parser.add_argument("--per-subset", type=int, default=0, help="Cap selected strata to N cases each (requires --subsets).")
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     args = parser.parse_args()
 
@@ -78,7 +80,13 @@ async def main() -> None:
         raise SystemExit("必须同时提供 --model-connection 与 --models-root，或显式使用 --bootstrap-from-env；禁止回退模型。")
 
     rows = load_dataset(dataset_path)
-    if args.limit:
+    if args.subsets:
+        selected = []
+        for subset in args.subsets:
+            candidates = [row for row in rows if row["subset"] == subset]
+            selected.extend(candidates[:max(1, args.per_subset)] if args.per_subset else candidates)
+        rows = selected
+    elif args.limit:
         rows = rows[:max(1, args.limit)]
     manifest = dataset_manifest(load_dataset(dataset_path))
     write_json(output / "manifest.json", {**manifest, "selected_cases": len(rows), "methods": args.methods, "model_connection": args.model_connection})
@@ -99,4 +107,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
