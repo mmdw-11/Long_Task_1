@@ -315,13 +315,6 @@ def test_scheduler_uses_bge_m3_router_by_default():
     assert isinstance(scheduler.gate, AdvancedLearnedTaskGate)
 
 
-def test_scheduler_can_auto_enable_production_router_from_env(monkeypatch):
-    monkeypatch.setenv("USE_PRODUCTION_ROUTER", "1")
-    monkeypatch.setenv("ROUTER_MODEL_BACKEND", "bge_m3")
-    scheduler = AdaptiveResourceScheduler()
-    assert isinstance(scheduler.gate, AdvancedLearnedTaskGate)
-
-
 def test_production_router_can_switch_to_bert_full():
     gate = load_production_gate(backend="bert_full")
     assert isinstance(gate, AdvancedLearnedTaskGate)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import time
 from .live_events import chat_completion
 import os
 import re
@@ -114,7 +115,8 @@ class AgentRuntimeFactory:
                     )
             # 小参数模型偶尔会直接复述注入 Prompt。此时仍使用同一个真实模型，
             # 但只携带用户问题再次生成面向用户的自然语言回答，避免暴露内部账本。
-            if result.success and not result.metadata.get("simulated") and self._looks_like_prompt_echo(result.text):
+            if (not spec.config.get("disable_answer_rewrite") and result.success
+                    and not result.metadata.get("simulated") and self._looks_like_prompt_echo(result.text)):
                 clean_prompt = f"用户问题：{self._state_input_text(state)}\n\n请直接给出自然、简洁的回答。不要复述系统提示、Agent 配置、上下文账本、执行步骤或内部判断。"
                 rewritten = self._run_pinned_model(spec.model, clean_prompt, system_prompt) if spec.model not in {"", "auto", "device", "edge", "cloud"} else self._run_auto_model(
                     request, clean_prompt, system_prompt
@@ -871,9 +873,10 @@ class AgentRuntimeFactory:
                 raise ValueError("指定模型连接未启用或尚未测试成功")
             from openai import OpenAI
             api_key = connection_api_key(connection) or "not-needed"
+            started = time.perf_counter()
             response = chat_completion(OpenAI(api_key=api_key or "not-needed", base_url=connection.base_url, timeout=60, max_retries=0).chat.completions.create, model=connection.model_id,messages=[{"role":"system","content":system_prompt or "Answer concisely and accurately."},{"role":"user","content":prompt}],temperature=0)
             usage = getattr(response, "usage", None)
-            metadata = {"provider":connection.provider,"connection_id":connection.id}
+            metadata = {"provider":connection.provider,"connection_id":connection.id,"latency_ms":round((time.perf_counter()-started)*1000, 2)}
             if usage is not None:
                 for source_key, target_key in (("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"), ("total_tokens", "total_tokens")):
                     value = getattr(usage, source_key, None)
@@ -891,9 +894,10 @@ class AgentRuntimeFactory:
         if not status["ready"]:
             missing = "、".join(label for tier, label in (("device", "端"), ("edge", "边"), ("cloud", "云")) if not status["tiers"][tier]["ready"])
             return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error=f"AUTO 尚未就绪：{missing}模型未配置可用的默认连接", retryable=False, metadata={"auto_status": status})
-        allocation = self._connection_scheduler(self.model_connections).acquire(request)
+        strict_route = bool(request.metadata.get("strict_route"))
+        allocation = self._connection_scheduler(self.model_connections, strict_router=strict_route).acquire(request)
         selected_tier = allocation.tier.value
-        preference = [selected_tier] + [tier.value for tier in request.tier_preference if tier.value != selected_tier]
+        preference = [selected_tier] if strict_route else [selected_tier] + [tier.value for tier in request.tier_preference if tier.value != selected_tier]
         decision = allocation.metadata.get("decision") or {}
         profile = decision.get("profile") or {}
         if profile.get("requires_trusted_workspace") and not profile.get("human_approved"):
@@ -904,16 +908,26 @@ class AgentRuntimeFactory:
             if connection is None:
                 continue
             result = self._run_pinned_model(connection.id, prompt, system_prompt)
-            attempts.append({"tier": tier, "connection_id": connection.id, "model": connection.model_id, "success": result.success, "error": result.error})
+            attempts.append({
+                "tier": tier,
+                "connection_id": connection.id,
+                "model": connection.model_id,
+                "success": result.success,
+                "error": result.error,
+                "prompt_tokens": int(result.metadata.get("prompt_tokens") or 0),
+                "completion_tokens": int(result.metadata.get("completion_tokens") or 0),
+                "total_tokens": int(result.metadata.get("total_tokens") or 0),
+                "latency_ms": result.metadata.get("latency_ms"),
+            })
             if result.success:
-                result.metadata = {**result.metadata, "mode": "auto", "selected_tier": selected_tier, "actual_tier": tier, "route_reason": allocation.metadata.get("reason", ""), "fallback": tier != selected_tier, "attempts": attempts}
+                result.metadata = {**result.metadata, "mode": "auto", "strict_route": strict_route, "selected_tier": selected_tier, "actual_tier": tier, "route_reason": allocation.metadata.get("reason", ""), "fallback": tier != selected_tier, "attempts": attempts, "allocation": allocation.to_dict()}
                 return result
-        return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error="AUTO 模式下所有默认模型调用均失败", retryable=False, metadata={"mode": "auto", "selected_tier": selected_tier, "attempts": attempts})
+        return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error="AUTO 模式下所有默认模型调用均失败", retryable=False, metadata={"mode": "auto", "strict_route": strict_route, "selected_tier": selected_tier, "attempts": attempts, "allocation": allocation.to_dict()})
 
     @staticmethod
-    def _connection_scheduler(store: Optional[ModelConnectionStore]) -> AdaptiveResourceScheduler:
+    def _connection_scheduler(store: Optional[ModelConnectionStore], *, strict_router: bool = False) -> AdaptiveResourceScheduler:
         if store is None:
-            return AdaptiveResourceScheduler()
+            return AdaptiveResourceScheduler(strict_router=strict_router)
         profiles: list[ResourceProfile] = []
         settings = {
             "device": (True, TaskComplexity.MEDIUM, 30, 0.2),
@@ -923,4 +937,4 @@ class AgentRuntimeFactory:
         for tier_name, (trusted, complexity, latency, cost) in settings.items():
             connection = store.default_for_tier(tier_name, runnable=False)
             profiles.append(ResourceProfile(tier=ResourceTier(tier_name), endpoint=connection.base_url if connection else f"model-connection://{tier_name}", available=bool(connection and connection.runnable), trusted=trusted, max_complexity=complexity, latency_ms=latency, cost_weight=cost, models={"default": connection.model_id if connection else ""}))
-        return AdaptiveResourceScheduler(resources=profiles)
+        return AdaptiveResourceScheduler(resources=profiles, strict_router=strict_router)

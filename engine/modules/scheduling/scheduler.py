@@ -39,18 +39,17 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         enable_trace: bool = True,
         router_path: Optional[str] = None,
         learned_threshold: float = 0.35,
-        use_production_router: bool = True,
+        strict_router: bool = False,
     ) -> None:
         if gate is not None:
             self.gate = gate
-        elif use_production_router or router_path or _env_use_production_router():
+        else:
             self.gate = load_production_gate(
                 router_path=router_path,
                 threshold=learned_threshold,
                 fallback=HeuristicTaskGate(),
+                strict=strict_router,
             )
-        else:
-            self.gate = HeuristicTaskGate()
         self.trace_gate = trace_gate or HeuristicTaskGate()
         self.monitor = monitor or NoOpResourceMonitor()
         self.trusted_policy = trusted_policy or TrustedWorkspacePolicy()
@@ -341,11 +340,6 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         queue = status.queue_depth if status and status.queue_depth is not None else 0
         error_rate = status.error_rate if status else 0.0
         return (error_rate, load, queue, latency, resource.cost_weight)
-
-
-def _env_use_production_router() -> bool:
-    value = str(os.environ.get("USE_PRODUCTION_ROUTER", "")).strip().lower()
-    return value in {"1", "true", "yes", "on"}
 
 
 def _coerce_route_tier(value: object) -> Optional[ResourceTier]:
