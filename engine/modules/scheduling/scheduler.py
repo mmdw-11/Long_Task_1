@@ -39,7 +39,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         enable_trace: bool = True,
         router_path: Optional[str] = None,
         learned_threshold: float = 0.35,
-        use_production_router: bool = False,
+        use_production_router: bool = True,
     ) -> None:
         if gate is not None:
             self.gate = gate

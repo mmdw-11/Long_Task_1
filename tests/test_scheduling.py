@@ -309,6 +309,12 @@ def test_production_router_defaults_to_bge_m3_backend():
     assert path.name in {"final_bge_m3_contrastive_epoch12", "final_bge_m3_mlp"}
 
 
+def test_scheduler_uses_bge_m3_router_by_default():
+    scheduler = AdaptiveResourceScheduler()
+
+    assert isinstance(scheduler.gate, AdvancedLearnedTaskGate)
+
+
 def test_scheduler_can_auto_enable_production_router_from_env(monkeypatch):
     monkeypatch.setenv("USE_PRODUCTION_ROUTER", "1")
     monkeypatch.setenv("ROUTER_MODEL_BACKEND", "bge_m3")
