@@ -120,6 +120,17 @@ class EmbeddingClassifierRouter:
             self._classifier = pickle.load(fh)
 
         encoder_name = str(self._config["model_name"])
+        # Training summaries may contain the trainer's absolute local path.
+        # A checked-in classifier must remain deployable on another machine, so
+        # prefer an explicitly configured BGE-M3 directory when that path is
+        # unavailable there.
+        if not Path(encoder_name).exists():
+            configured_bge = os.environ.get("BGE_M3_MODEL_PATH", "").strip()
+            if configured_bge and Path(configured_bge).exists():
+                encoder_name = configured_bge
+            else:
+                from engine.modules.bge_local import resolve_bge_m3_model_path
+                encoder_name = resolve_bge_m3_model_path(encoder_name)
         from sentence_transformers import SentenceTransformer
 
         self._encoder = SentenceTransformer(encoder_name, local_files_only=True)

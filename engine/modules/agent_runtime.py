@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from ..hooks import MEMORY_CONTEXT_TEXT_KEY
 from ..modules.context import CONTEXT_INJECTION_TEXT_KEY
-from ..modules.execution import ExecutorRegistry, InferenceResult, ResilientInferenceRunner
+from ..modules.execution import EdgeHttpExecutor, ExecutorRegistry, InferenceRequest, InferenceResult, ResilientInferenceRunner
 from ..modules.model_connections import ModelConnectionStore, connection_api_key
 from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
@@ -871,6 +871,16 @@ class AgentRuntimeFactory:
             connection = self.model_connections.get(connection_id)
             if not connection.runnable:
                 raise ValueError("指定模型连接未启用或尚未测试成功")
+            if connection.provider == "edge-http":
+                started = time.perf_counter()
+                result = EdgeHttpExecutor().run(InferenceRequest(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    allocation={"tier": "edge", "endpoint": connection.base_url},
+                ))
+                result.model = connection.model_id
+                result.metadata = {**result.metadata, "connection_id": connection.id, "provider": connection.provider, "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+                return result
             from openai import OpenAI
             api_key = connection_api_key(connection) or "not-needed"
             started = time.perf_counter()

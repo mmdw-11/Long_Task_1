@@ -1,0 +1,9 @@
+FROM ./qwen2.5-3b-instruct-q4_k_m.gguf
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+PARAMETER stop <|im_end|>
+PARAMETER temperature 0.7
