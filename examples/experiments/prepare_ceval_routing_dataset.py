@@ -9,6 +9,7 @@ import json
 import random
 import urllib.parse
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 
@@ -68,22 +69,46 @@ def _load_local_buckets(source: Path, seed: int) -> list[tuple[str, list[dict[st
 def _load_api_buckets(seed: int, count: int) -> list[tuple[str, list[dict[str, str]]]]:
     dataset = "ceval/ceval-exam"
     splits_url = "https://datasets-server.huggingface.co/splits?dataset=" + urllib.parse.quote(dataset, safe="")
-    with urllib.request.urlopen(splits_url, timeout=30) as response:
-        splits = json.loads(response.read().decode("utf-8")).get("splits") or []
+    try:
+        with urllib.request.urlopen(splits_url, timeout=30) as response:
+            splits = json.loads(response.read().decode("utf-8")).get("splits") or []
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return _load_hf_library(seed, count)
     subjects = sorted({str(item["config"]) for item in splits if item.get("split") == "val"})
     random.Random(seed).shuffle(subjects)
     subjects = subjects[:min(len(subjects), count)]
     buckets = []
     for subject in subjects:
         query = urllib.parse.urlencode({"dataset": dataset, "config": subject, "split": "val", "offset": 0, "length": 100})
-        with urllib.request.urlopen("https://datasets-server.huggingface.co/rows?" + query, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen("https://datasets-server.huggingface.co/rows?" + query, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            return _load_hf_library(seed, count)
         rows = [dict(item.get("row") or {}) for item in payload.get("rows") or []]
         random.Random(f"{seed}:{subject}").shuffle(rows)
         if rows:
             buckets.append((subject, rows))
     if not buckets:
         raise RuntimeError("C-Eval dataset server returned no validation rows")
+    return buckets
+
+
+def _load_hf_library(seed: int, count: int) -> list[tuple[str, list[dict[str, str]]]]:
+    """Fallback to the official `datasets` loader when datasets-server rate-limits."""
+    from datasets import get_dataset_config_names, load_dataset
+    subjects = get_dataset_config_names("ceval/ceval-exam")
+    random.Random(seed).shuffle(subjects)
+    buckets = []
+    available = 0
+    for subject in subjects[:min(len(subjects), count)]:
+        rows = [dict(row) for row in load_dataset("ceval/ceval-exam", subject, split="val")]
+        random.Random(f"{seed}:{subject}").shuffle(rows)
+        if rows:
+            buckets.append((subject, rows))
+            available += len(rows)
+            if available >= count:
+                break
     return buckets
 
 

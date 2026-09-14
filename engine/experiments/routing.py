@@ -35,23 +35,29 @@ class Pricing:
     output_per_million_cny: float
 
 
-class EnvironmentDeepSeekStore:
-    """Ephemeral three-tier DeepSeek mapping for connectivity smoke tests only.
+class EnvironmentRoutingStore:
+    """Ephemeral tier mapping from the project's .env for routing experiments.
 
     Credentials remain in ``DEEPSEEK_API_KEY`` / ``OPENAI_API_KEY`` and are never
     persisted.  It deliberately maps the same remote model to each tier, so it
     must not be used to claim an edge/device cost advantage.
     """
 
-    def __init__(self, model_id: str = "deepseek-v4-flash") -> None:
+    def __init__(self, *, device_model: str, device_url: str, edge_model: str,
+                 edge_url: str, cloud_model: str, cloud_url: str) -> None:
+        values = {
+            "device": (device_model, device_url, "ollama"),
+            "edge": (edge_model, edge_url, "ollama" if "11434" in edge_url and edge_url.rstrip("/").endswith("/v1") else "edge-http"),
+            "cloud": (cloud_model, cloud_url, "deepseek"),
+        }
         self.items = {
             tier: ModelConnection(
-                id=f"env-deepseek-{tier}", name=f"DeepSeek smoke {tier}",
-                provider="deepseek", model_id=model_id,
-                base_url="https://api.deepseek.com/v1", auto_tiers=[tier],
+                id=f"env-routing-{tier}", name=f".env {tier} model",
+                provider=provider, model_id=model_id,
+                base_url=base_url.rstrip("/"), auto_tiers=[tier],
                 test_status="succeeded",
             )
-            for tier in ("device", "edge", "cloud")
+            for tier, (model_id, base_url, provider) in values.items()
         }
 
     def auto_status(self) -> Dict[str, Any]:
@@ -68,6 +74,33 @@ class EnvironmentDeepSeekStore:
             if item.id == item_id:
                 return item
         raise KeyError(item_id)
+
+    @classmethod
+    def from_dotenv(cls) -> "EnvironmentRoutingStore":
+        import os
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        device_url = os.environ.get("DEVICE_BASE_URL") or os.environ.get("DEVICE_ENDPOINT") or "http://127.0.0.1:11434/v1"
+        edge_ollama_url = os.environ.get("EDGE_OLLAMA_BASE_URL")
+        edge_url = edge_ollama_url or os.environ.get("EDGE_ENDPOINT") or os.environ.get("EDGE_BASE_URL") or "http://127.0.0.1:8001/infer"
+        cloud_url = os.environ.get("OPENAI_BASE_URL") or "https://api.deepseek.com/v1"
+        cloud_url = cloud_url.rstrip("/")
+        if not cloud_url.endswith("/v1"):
+            cloud_url += "/v1"
+        return cls(
+            device_model=os.environ.get("DEVICE_MODEL") or "",
+            device_url=device_url,
+            edge_model=os.environ.get("EDGE_MODEL") or "",
+            edge_url=edge_url,
+            cloud_model=os.environ.get("OPENAI_MODEL") or "deepseek-v4-flash",
+            cloud_url=cloud_url,
+        )
+
+
+EnvironmentDeepSeekStore = EnvironmentRoutingStore
 
 
 class RoutingExperimentRunner:
@@ -138,14 +171,8 @@ class RoutingExperimentRunner:
         return row, attempt_rows
 
     def run(self, cases: Iterable[RoutingCase], output_dir: str | Path, *, manifest: Dict[str, Any]) -> Dict[str, Any]:
-        rows: List[Dict[str, Any]] = []
-        attempts: List[Dict[str, Any]] = []
-        for case in cases:
-            for arm in ("all_cloud", "strict_auto"):
-                row, call_rows = self.run_case(case, arm)
-                rows.append(row)
-                attempts.extend(call_rows)
         root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
         write_json(root / "manifest.json", {
             **manifest,
             "auto_status": self.connections.auto_status(),
@@ -154,6 +181,20 @@ class RoutingExperimentRunner:
                 for model, price in self.pricing.items()
             },
         })
+        rows: List[Dict[str, Any]] = []
+        attempts: List[Dict[str, Any]] = []
+        completed = 0
+        for case in cases:
+            for arm in ("all_cloud", "strict_auto"):
+                row, call_rows = self.run_case(case, arm)
+                rows.append(row)
+                attempts.extend(call_rows)
+                completed += 1
+                # Persist after every arm so a long run is inspectable and resumable for diagnosis.
+                write_jsonl(root / "rows.jsonl", rows)
+                write_jsonl(root / "attempts.jsonl", attempts)
+                print(json.dumps({"progress": completed, "total": "unknown", "case_id": case.case_id,
+                                  "arm": arm, "success": bool(row.get("success"))}, ensure_ascii=False), flush=True)
         write_jsonl(root / "rows.jsonl", rows)
         write_jsonl(root / "attempts.jsonl", attempts)
         summary = summarize_routing_rows(rows)
