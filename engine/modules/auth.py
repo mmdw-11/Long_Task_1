@@ -150,7 +150,9 @@ class AuthStore:
             row = self._conn.execute("SELECT id FROM users WHERE email=?", (email.strip().lower(),)).fetchone()
         if row is None:
             return None
-        token = secrets.token_urlsafe(32)
+        # A short numeric code is easier to enter on the reset screen. Only
+        # its SHA-256 digest is persisted, exactly as with session tokens.
+        token = f"{secrets.randbelow(1_000_000):06d}"
         now = _now()
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM password_resets WHERE user_id=? OR expires_at<=?", (row["id"], _iso(now)))

@@ -45,3 +45,22 @@ def test_duplicate_registration_and_generic_forgot_response(tmp_path, monkeypatc
     response = client.post("/api/auth/forgot-password", json={"email": "missing@example.com"})
     assert response.status_code == 200
     assert "reset_token" not in response.json()
+
+
+def test_forgot_password_delivers_a_numeric_code_by_email(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.test")
+    monkeypatch.setenv("SMTP_FROM", "noreply@example.test")
+    monkeypatch.setenv("AUTH_EXPOSE_RESET_TOKEN", "0")
+    delivered = []
+    monkeypatch.setattr("engine.server.app.send_password_reset_code", lambda email, code: delivered.append((email, code)))
+    client = TestClient(create_app(auth_store=AuthStore(tmp_path / "auth.sqlite3"), auth_required=True))
+    client.post("/api/auth/register", json={"email": "user@example.com", "name": "User", "password": "password-123"})
+
+    response = client.post("/api/auth/forgot-password", json={"email": "user@example.com"})
+
+    assert response.status_code == 200
+    assert delivered[0][0] == "user@example.com"
+    assert delivered[0][1].isdigit() and len(delivered[0][1]) == 6
+    assert "reset_token" not in response.json()
+    assert client.post("/api/auth/reset-password", json={"token": delivered[0][1], "password": "new-password-456"}).status_code == 200

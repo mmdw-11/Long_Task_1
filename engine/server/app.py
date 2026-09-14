@@ -53,6 +53,7 @@ except Exception as exc:  # pragma: no cover - 取决于运行环境
 from ..constants import END
 from ..modules.agent_runtime import AgentRuntimeFactory
 from ..modules.auth import AuthStore
+from ..modules.email_service import EmailDeliveryError, send_password_reset_code, smtp_is_configured
 from ..modules.conversations import ConversationStore, MemoryAuditStore, SENSITIVE_PATTERN, build_conversation_context, durable_memory_candidates
 from ..modules.context import ContextPolicy
 from ..modules.context.todo import TodoManager
@@ -1070,10 +1071,18 @@ def create_app(
     @app.post("/api/auth/forgot-password")
     def forgot_password(req: ForgotPasswordReq) -> Dict[str, Any]:
         token = auth.create_password_reset(req.email)
-        payload: Dict[str, Any] = {"message": "如果该邮箱已注册，重置说明将被发送"}
-        # 本地开发没有邮件服务时返回一次性令牌；生产环境必须关闭并由邮件适配器投递。
-        if token and os.environ.get("AUTH_EXPOSE_RESET_TOKEN", "1") == "1":
+        payload: Dict[str, Any] = {"message": "如果该邮箱已注册，验证码将发送至该邮箱"}
+        if token and smtp_is_configured():
+            try:
+                send_password_reset_code(req.email.strip().lower(), token)
+            except EmailDeliveryError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # Keep the original offline-development flow for existing local tests.
+        # Deployments must turn this off and configure SMTP instead.
+        elif token and os.environ.get("AUTH_EXPOSE_RESET_TOKEN", "1") == "1":
             payload["reset_token"] = token
+        elif token:
+            raise HTTPException(status_code=503, detail="邮件服务尚未配置，请联系管理员")
         return payload
 
     @app.post("/api/auth/reset-password")
