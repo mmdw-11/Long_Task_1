@@ -8,7 +8,9 @@ def main() -> None:
 
     uvicorn.run(
         "engine.server.app:app",
-        host="127.0.0.1",
+        # Bind all container interfaces.  On a local non-Docker run this is
+        # also useful when testing from another device on the same network.
+        host="0.0.0.0",
         port=8000,
         reload=False,
     )

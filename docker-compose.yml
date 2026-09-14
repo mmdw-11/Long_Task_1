@@ -1,0 +1,48 @@
+name: agentforge
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # All mutable platform data lives in the mounted volume below.
+      AUTH_DB_PATH: /app/runs/auth/users.sqlite3
+      AGENTFORGE_PUBLIC_BASE_URL: ${AGENTFORGE_PUBLIC_BASE_URL:-http://localhost:8080}
+      # Deployment does not consume the developer's .env model configuration.
+      # Users add their own model connections and API keys in the web console.
+      AUTH_REQUIRED: "1"
+      AUTH_EXPOSE_RESET_TOKEN: "0"
+      AGENT_GRAPH_LOAD_DOTENV: "0"
+      # Use packaged local BGE-M3 and trained classifier; no Hugging Face
+      # download is attempted by the submitted system.
+      BGE_M3_MODEL_PATH: /app/model_assets/bge-m3
+      HF_HOME: /app/model_assets/huggingface-cache
+      SKILL_EMBEDDING_MODEL: bge-m3
+      ROUTER_MODEL_BACKEND: bge_m3
+      ROUTER_MODEL_PATH: /app/model_assets/bge-router
+    volumes:
+      - agentforge_data:/app/runs
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/status', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 10
+      start_period: 25s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../long_task_1_Fronted
+      dockerfile: Dockerfile
+    ports:
+      - "${AGENTFORGE_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  agentforge_data:

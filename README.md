@@ -71,18 +71,59 @@ pip install -e ".[test]"         # 运行测试
 pip install -e ".[examples]"     # travel_planner 示例工具（DuckDuckGo + Playwright）
 ```
 
+## Docker 部署（推荐）
+
+本项目的后端目录 `long_task_1` 与前端目录 `long_task_1_Fronted` 必须保持同级。Docker Compose 会同时启动二者：浏览器访问前端，前端再在容器内部安全转发 `/api` 请求给后端。因此评委只需安装 Docker Desktop，无需安装 Python、Node.js 或手动配置依赖。
+
+首次部署：
+
+```bash
+# 在本目录（含 docker-compose.yml）执行
+python scripts/verify_deployment_assets.py
+docker compose up --build -d
+```
+
+启动完成后打开 `http://localhost:8080`。首次使用请注册账号、登录，然后在“模型连接”页面填写自己申请的模型服务地址、模型名和 API Key；通过连接测试后，即可把该模型分配给智能体或 AUTO 的端、边、云层级。Docker 不会读取开发者本机 `.env` 中的模型设置，评委也不需要安装 Ollama、下载端边云模型或填写开发者的 API Key。
+
+若 8080 已被占用，可复制 `.env.docker.example` 为 `.env` 后修改 `AGENTFORGE_PORT`；该文件只含端口等部署参数，不包含模型密钥。可用以下命令确认运行状态：
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+停止服务但保留所有工作流、账号、运行记录和上传资料：
+
+```bash
+docker compose down
+```
+
+代码更新后的发布方式：
+
+```bash
+docker compose up --build -d
+```
+
+数据存放于 Docker 命名卷 `agentforge_agentforge_data`，不会随着普通的重建或停止而删除。只有执行 `docker compose down -v` 才会删除该数据，比赛演示时不要使用该命令。
+
+### BGE-M3 与路由模型
+
+比赛镜像会打包项目中已训练的 BGE-M3 编码器与分类路由器（约 2.3 GB），并在容器内固定使用它们；服务启动与评委演示不访问 Hugging Face，也不要求另行下载 BGE-M3。Docker 构建上下文只选择 `runs/router_learning/final_bge_m3_contrastive_smoke/encoder` 和 `router` 两个已验证目录，不会误把其余约 27 GB 的实验中间产物装入镜像。
+
+这两个目录受 `.gitignore` 保护，因此最终比赛压缩包必须包含它们；不能只交付不含 Git LFS／模型资产的代码克隆。构建前运行 `python scripts/verify_deployment_assets.py` 可确认资产齐全。
+
 安装 Playwright 后还需执行：
 ```bash
 python -m playwright install chromium
 ```
 
-### 配置模型（.env）
+### 开发／实验时的命令行模型配置（非 Docker 部署）
 
 ```bash
 cp .env.example .env    # 然后编辑 .env 填入你的 key
 ```
 
-`.env` 字段：
+下面 `.env` 字段仅供本地开发、实验脚本或旧命令行示例使用；Docker 评委环境不读取这些模型字段，正式演示请在前端“模型连接”中填写。
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
