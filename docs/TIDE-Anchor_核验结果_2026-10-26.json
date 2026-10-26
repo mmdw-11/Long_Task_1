@@ -1,0 +1,44 @@
+{
+  "existing_tests": {
+    "passed": 61,
+    "deselected": 1,
+    "deselected_test": "test_bge_m3_embedding_model_produces_vectors"
+  },
+  "goal_preservation": {
+    "input_chars": 675,
+    "stored_chars": 600,
+    "tail_preserved": false
+  },
+  "budget_after_injection": {
+    "initial_estimated_tokens": 21,
+    "configured_limit": 100,
+    "executed": true,
+    "node_state_estimated_tokens": 6651,
+    "injected_memory_chars": 6162,
+    "run_status": null,
+    "note": "Node-state estimates are not provider token usage."
+  },
+  "paused_latest_checkpoint": {
+    "run_status": "budget_paused",
+    "checkpoint_status": "completed",
+    "frontier": [],
+    "checkpoint_id": "final"
+  },
+  "planned_subtask_error_path": {
+    "exception": "NameError",
+    "message": "name 'evaluation' is not defined"
+  },
+  "repository_policy_defaults": {
+    "max_context_tokens": 0,
+    "semantic_drift_mode": "llm",
+    "todo_update_mode": "suggest"
+  },
+  "v12_dataset": {
+    "rows": 100,
+    "unique_ids": 100,
+    "source_trajectories": 10,
+    "gold_evidence_count": {"1": 4, "2": 96},
+    "sha256": "c102dd765d0eb054a3bb0bab90c99b3b12b50b9278644ab09edfb84d5d7b6414",
+    "referenced_v12_result_directory_present": false
+  }
+}
