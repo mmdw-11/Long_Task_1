@@ -1,0 +1,1797 @@
+{
+  "audit_date": "2026-10-26",
+  "scope": "Current workspace files only; missing files do not prove experiments were never run.",
+  "summary_files": [
+    {
+      "summary_path": "runs/experiments/long_task/full_context/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.471667,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.83,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 864.12,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.004863
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task/memory_only/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.138333,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.83,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 33.99,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 18.827095
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task/ours_full/summary.json",
+      "total": 100,
+      "passed": 83,
+      "pass_rate": 0.83,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.971667,
+        "avg_final_task_success": 0.83,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.83,
+        "avg_drift_detected": 1.0,
+        "avg_drift_rate": 0.0,
+        "avg_repeated_step_rate": 0.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 1.0,
+        "avg_tokens": 143.28,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 151.571362
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task/plain/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.0,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 7.0,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.001473
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_complex_v6_ten_stage/full_context/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.428333,
+        "avg_final_task_success": 0.0,
+        "avg_basic_task_readiness": 0.02,
+        "avg_disturbance_handling_score": 0.016667,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.52,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.95,
+        "avg_pause_correctness": 0.05,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 20166.42,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 13.0,
+        "avg_planned_steps": 10.0,
+        "avg_repeated_stall_steps": 3.0,
+        "avg_execution_ms": 5.317773
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "planned_steps",
+        "recovery_success",
+        "repeated_stall_steps",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_complex_v6_ten_stage/memory_only/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.525,
+        "avg_final_task_success": 0.0,
+        "avg_basic_task_readiness": 0.15,
+        "avg_disturbance_handling_score": 0.333333,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.15,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 180.42,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 13.0,
+        "avg_planned_steps": 10.0,
+        "avg_repeated_stall_steps": 3.0,
+        "avg_execution_ms": 1576.704373
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "planned_steps",
+        "recovery_success",
+        "repeated_stall_steps",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_complex_v6_ten_stage/ours_full/summary.json",
+      "total": 100,
+      "passed": 15,
+      "pass_rate": 0.15,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.858333,
+        "avg_final_task_success": 0.15,
+        "avg_basic_task_readiness": 0.15,
+        "avg_disturbance_handling_score": 1.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.15,
+        "avg_drift_detected": 1.0,
+        "avg_drift_rate": 0.0,
+        "avg_repeated_step_rate": 0.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 1.0,
+        "avg_tokens": 247.65,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 13.0,
+        "avg_planned_steps": 10.0,
+        "avg_repeated_stall_steps": 3.0,
+        "avg_execution_ms": 1994.262833
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "planned_steps",
+        "recovery_success",
+        "repeated_stall_steps",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_complex_v6_ten_stage/plain/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.5,
+        "avg_final_task_success": 0.0,
+        "avg_basic_task_readiness": 0.0,
+        "avg_disturbance_handling_score": 0.333333,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 51.0,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 13.0,
+        "avg_planned_steps": 10.0,
+        "avg_repeated_stall_steps": 3.0,
+        "avg_execution_ms": 0.052474
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "planned_steps",
+        "recovery_success",
+        "repeated_stall_steps",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v4/full_context/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.42,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.52,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.95,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 20148.42,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 4.174425
+      },
+      "first_row_metric_keys": [
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v4/memory_only/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.025,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.15,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 136.65,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 1360.658224
+      },
+      "first_row_metric_keys": [
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v4/ours_full/summary.json",
+      "total": 100,
+      "passed": 15,
+      "pass_rate": 0.15,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.858333,
+        "avg_final_task_success": 0.15,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.15,
+        "avg_drift_detected": 1.0,
+        "avg_drift_rate": 0.0,
+        "avg_repeated_step_rate": 0.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 1.0,
+        "avg_tokens": 245.95,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 1595.32264
+      },
+      "first_row_metric_keys": [
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v4/plain/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.0,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 7.0,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.04474
+      },
+      "first_row_metric_keys": [
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v5_layered/full_context/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.428333,
+        "avg_final_task_success": 0.0,
+        "avg_basic_task_readiness": 0.02,
+        "avg_disturbance_handling_score": 0.016667,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.52,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.95,
+        "avg_pause_correctness": 0.05,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 20148.42,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 4.525108
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v5_layered/memory_only/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.525,
+        "avg_final_task_success": 0.0,
+        "avg_basic_task_readiness": 0.15,
+        "avg_disturbance_handling_score": 0.333333,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.15,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 162.42,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 1666.445467
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v5_layered/ours_full/summary.json",
+      "total": 100,
+      "passed": 15,
+      "pass_rate": 0.15,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.858333,
+        "avg_final_task_success": 0.15,
+        "avg_basic_task_readiness": 0.15,
+        "avg_disturbance_handling_score": 1.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.15,
+        "avg_drift_detected": 1.0,
+        "avg_drift_rate": 0.0,
+        "avg_repeated_step_rate": 0.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 1.0,
+        "avg_tokens": 245.95,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 1904.826245
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_history_v5_layered/plain/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.5,
+        "avg_final_task_success": 0.0,
+        "avg_basic_task_readiness": 0.0,
+        "avg_disturbance_handling_score": 0.333333,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 33.0,
+        "avg_history_tokens": 20115.0,
+        "avg_budget_limit": 14336.0,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 0.046003
+      },
+      "first_row_metric_keys": [
+        "basic_task_readiness",
+        "budget_limit",
+        "budget_violation",
+        "constraint_compliance",
+        "disturbance_handling_score",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "history_tokens",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v2/full_context/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.495,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.97,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 864.12,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.403892
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v2/memory_only/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.161667,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.97,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 33.99,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 21.689634
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v2/ours_full/summary.json",
+      "total": 100,
+      "passed": 97,
+      "pass_rate": 0.97,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.995,
+        "avg_final_task_success": 0.97,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 0.97,
+        "avg_drift_detected": 1.0,
+        "avg_drift_rate": 0.0,
+        "avg_repeated_step_rate": 0.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 1.0,
+        "avg_tokens": 143.28,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 182.655717
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v2/plain/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.0,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 7.0,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.031249
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v3/full_context/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.5,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 1.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 862.56,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.347051
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v3/memory_only/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.166667,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 1.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 33.91,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 17.382474
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v3/ours_full/summary.json",
+      "total": 100,
+      "passed": 100,
+      "pass_rate": 1.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_final_task_success": 1.0,
+        "avg_goal_retention": 1.0,
+        "avg_constraint_compliance": 1.0,
+        "avg_memory_use_accuracy": 1.0,
+        "avg_drift_detected": 1.0,
+        "avg_drift_rate": 0.0,
+        "avg_repeated_step_rate": 0.0,
+        "avg_budget_violation": 0.0,
+        "avg_pause_correctness": 1.0,
+        "avg_recovery_success": 1.0,
+        "avg_tokens": 143.2,
+        "avg_steps": 3.0,
+        "avg_execution_ms": 182.19763
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/long_task_normalized_v3/plain/summary.json",
+      "total": 100,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "row_count": 100,
+      "unique_ids": 100,
+      "evaluator_scope": "deterministic backend mechanism evaluation; not LLM QA",
+      "metadata_keys": [
+        "components",
+        "evaluator_scope",
+        "method"
+      ],
+      "metrics": {
+        "avg_score": 0.0,
+        "avg_final_task_success": 0.0,
+        "avg_goal_retention": 0.0,
+        "avg_constraint_compliance": 0.0,
+        "avg_memory_use_accuracy": 0.0,
+        "avg_drift_detected": 0.0,
+        "avg_drift_rate": 1.0,
+        "avg_repeated_step_rate": 1.0,
+        "avg_budget_violation": 1.0,
+        "avg_pause_correctness": 0.0,
+        "avg_recovery_success": 0.0,
+        "avg_tokens": 7.0,
+        "avg_steps": 0.0,
+        "avg_execution_ms": 0.011002
+      },
+      "first_row_metric_keys": [
+        "budget_violation",
+        "constraint_compliance",
+        "drift_detected",
+        "drift_rate",
+        "execution_ms",
+        "final_task_success",
+        "goal_retention",
+        "memory_use_accuracy",
+        "pause_correctness",
+        "recovery_success",
+        "repeated_step_rate",
+        "steps",
+        "tokens"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_hashing/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 3.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_hashing/longmemeval/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 3.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_final_topk_1/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 1,
+      "pass_rate": 0.5,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 0.5,
+        "avg_hit": 0.5,
+        "avg_rank": 0.5,
+        "avg_mrr": 0.5,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_final_topk_10/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 3.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_final_topk_3/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 2.5
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_final_topk_5/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 3.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_stability_1/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_stability_2/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_stability_3/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_stability_4/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_stability_5/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_topk_1/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 1,
+      "pass_rate": 0.5,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 0.5,
+        "avg_hit": 0.5,
+        "avg_rank": 0.5,
+        "avg_mrr": 0.5,
+        "avg_retrieved": 1.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_topk_10/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 3.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_topk_3/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 2.5
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    },
+    {
+      "summary_path": "runs/experiments/memory_locomo_topk_5/locomo/engine/summary.json",
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "row_count": 2,
+      "unique_ids": 2,
+      "evaluator_scope": null,
+      "metadata_keys": [
+        "backend",
+        "llm_judge_enabled",
+        "previous_rows",
+        "resumed",
+        "scope",
+        "seconds",
+        "top_k"
+      ],
+      "metrics": {
+        "avg_score": 1.0,
+        "avg_hit": 1.0,
+        "avg_rank": 1.0,
+        "avg_mrr": 1.0,
+        "avg_retrieved": 3.0
+      },
+      "first_row_metric_keys": [
+        "hit",
+        "mrr",
+        "rank",
+        "retrieved"
+      ]
+    }
+  ],
+  "datasets": [
+    {
+      "path": "data/processed/locomo_directfact_anchor_30_v7.jsonl",
+      "rows": 30,
+      "unique_ids": 30,
+      "source_trajectories": 10,
+      "question_categories": {
+        "1": 7,
+        "2": 7,
+        "3": 7,
+        "4": 7,
+        "5": 2
+      },
+      "sha256": "aa1f00cef2157105ec6ad84f6a6db77831d8005eaeddfe08b16222e25b659679"
+    },
+    {
+      "path": "data/processed/locomo_directfact_hybrid12_25_v9.jsonl",
+      "rows": 25,
+      "unique_ids": 25,
+      "source_trajectories": 9,
+      "question_categories": {
+        "1": 6,
+        "2": 6,
+        "3": 6,
+        "4": 5,
+        "5": 2
+      },
+      "sha256": "6364e6d9b1c3fcbe2d54867a1c15c5320231a4a8a36032b4dd04d693ffed20af"
+    },
+    {
+      "path": "data/processed/locomo_directfact_hybrid20_24_v12.jsonl",
+      "rows": 24,
+      "unique_ids": 24,
+      "source_trajectories": 8,
+      "question_categories": {
+        "1": 6,
+        "2": 6,
+        "3": 5,
+        "4": 5,
+        "5": 2
+      },
+      "sha256": "9d2a894afe80e8bab011d241f2344213393a55ff93da5f246d6dde0124800f1d"
+    },
+    {
+      "path": "data/processed/locomo_memory_eval20_bge_v1.jsonl",
+      "rows": 20,
+      "unique_ids": 20,
+      "source_trajectories": 8,
+      "question_categories": {
+        "1": 5,
+        "2": 5,
+        "3": 4,
+        "4": 4,
+        "5": 2
+      },
+      "sha256": "0c8593e83a68b53806455e709dbe0a942573c5b76b3a6ffd407632d59f5c0217"
+    },
+    {
+      "path": "data/processed/locomo_multiturn_gold_100_v12.jsonl",
+      "rows": 100,
+      "unique_ids": 100,
+      "source_trajectories": 10,
+      "question_categories": {
+        "1": 100
+      },
+      "sha256": "c102dd765d0eb054a3bb0bab90c99b3b12b50b9278644ab09edfb84d5d7b6414"
+    },
+    {
+      "path": "data/processed/locomo_multiturn_gold_24_v10.jsonl",
+      "rows": 24,
+      "unique_ids": 24,
+      "source_trajectories": 8,
+      "question_categories": {
+        "1": 24
+      },
+      "sha256": "838c5abebeb197af111061351ae8319aa9b32c3210d2c9deab6329a832e139d0"
+    },
+    {
+      "path": "data/processed/locomo_multiturn_gold_24_v11.jsonl",
+      "rows": 24,
+      "unique_ids": 24,
+      "source_trajectories": 8,
+      "question_categories": {
+        "1": 24
+      },
+      "sha256": "838c5abebeb197af111061351ae8319aa9b32c3210d2c9deab6329a832e139d0"
+    },
+    {
+      "path": "data/processed/locomo_state_100.jsonl",
+      "rows": 100,
+      "unique_ids": 100,
+      "source_trajectories": 10,
+      "question_categories": {
+        "unknown": 100
+      },
+      "sha256": "3fa786a5c335e8dadeb38364122f53ea2a2c1bb1b39534106f0b94d826c40a7d"
+    },
+    {
+      "path": "data/processed/locomo_state_100_complex_v6.jsonl",
+      "rows": 100,
+      "unique_ids": 100,
+      "source_trajectories": 10,
+      "question_categories": {
+        "unknown": 100
+      },
+      "sha256": "96d7a7468bde905986b7c1679f031964089aaeb9eaaf55d1de981c74aec6d33a"
+    },
+    {
+      "path": "data/processed/locomo_state_100_history_v4.jsonl",
+      "rows": 100,
+      "unique_ids": 100,
+      "source_trajectories": 10,
+      "question_categories": {
+        "unknown": 100
+      },
+      "sha256": "641b58bde48c6808bc2e1ce998e4d8468abb38c449b9ce089181210b4ac60f27"
+    },
+    {
+      "path": "data/processed/locomo_state_100_normalized_v3.jsonl",
+      "rows": 100,
+      "unique_ids": 100,
+      "source_trajectories": 10,
+      "question_categories": {
+        "unknown": 100
+      },
+      "sha256": "fdac2f5156daa78d479a76164059c1f32f96a2864f73eef7bc23bd9cb19b5819"
+    }
+  ],
+  "referenced_paths": [
+    {
+      "path": "runs/experiments/long_task_multiturn_bge_100_v12",
+      "exists": false
+    },
+    {
+      "path": "runs/experiments/long_task_directfact_hybrid20_bge_v12",
+      "exists": false
+    },
+    {
+      "path": "runs/experiments/memory_final10",
+      "exists": false
+    },
+    {
+      "path": "data/raw/longmemeval/longmemeval_s.json",
+      "exists": false
+    },
+    {
+      "path": "data/processed/longmemeval_final_10.jsonl",
+      "exists": false
+    }
+  ]
+}
