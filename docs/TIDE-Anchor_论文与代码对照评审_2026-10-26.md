@@ -26,7 +26,7 @@
 
 **二、实际执行链路**
 
-入口可从 [orchestrator.py:299](/D:/Pro/Agent-Graph/Long_Task_1/engine/orchestrator.py:299) 的 set_context_policy 开始理解：它建立账本、预算控制器、注入器和漂移检测器；set_memory 另外配置记忆后端；构图时由 _build_hook_manager 将这些组件交给 HookManager。
+入口可从 [orchestrator.py:299](D:/Pro/Agent-Graph/Long_Task_1/engine/orchestrator.py:299) 的 set_context_policy 开始理解：它建立账本、预算控制器、注入器和漂移检测器；set_memory 另外配置记忆后端；构图时由 _build_hook_manager 将这些组件交给 HookManager。
 
 ~~~mermaid
 flowchart TD
@@ -45,7 +45,7 @@ flowchart TD
     G --> S
 ~~~
 
-上述顺序的直接依据是 [hooks.py:230](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:230)、[hooks.py:595](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:595)、[hooks.py:279](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:279) 和 [graph.py:330](/D:/Pro/Agent-Graph/Long_Task_1/engine/graph.py:330)。
+上述顺序的直接依据是 [hooks.py:230](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:230)、[hooks.py:595](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:595)、[hooks.py:279](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:279) 和 [graph.py:330](D:/Pro/Agent-Graph/Long_Task_1/engine/graph.py:330)。
 
 论文的 C_s=A(L_s)⊕I_s⊕E_s⊕O_s 可以保留为逻辑组成式。它不应被解释为所有适配器都采用相同的消息顺序，也不代表最终请求只含这四部分。实际 AgentRuntime 还可能加入短期会话、技能、知识库内容及上游消息。
 
@@ -53,9 +53,9 @@ flowchart TD
 
 **1. 预算检查约束的是共享状态估计值，尚未形成最终 Prompt 的硬保证。**
 
-[budget.py:54](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/budget.py:54) 对输入对象序列化后估算用量，核心近似为字符数除以 4；max_context_tokens≤0 时不限制。论文给出的有效输入预算公式与代码一致。
+[budget.py:54](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/budget.py:54) 对输入对象序列化后估算用量，核心近似为字符数除以 4；max_context_tokens≤0 时不限制。论文给出的有效输入预算公式与代码一致。
 
-但 [hooks.py:235](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:235) 在步骤开始时检查状态；[hooks.py:244](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:244) 随后才为节点唤醒记忆并生成账本注入块；[agent_runtime.py:346](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/agent_runtime.py:346) 更晚才构造真实模型输入。当前没有统一的最终请求预算闸门。
+但 [hooks.py:235](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:235) 在步骤开始时检查状态；[hooks.py:244](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:244) 随后才为节点唤醒记忆并生成账本注入块；[agent_runtime.py:346](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/agent_runtime.py:346) 更晚才构造真实模型输入。当前没有统一的最终请求预算闸门。
 
 补充示例将预算设为 100，初始状态估计为 21；注入 6,162 字符的记忆后，节点仍执行成功。节点可见状态的估计值变为 6,651。后者包含结构化记忆等额外字段，不能当成实际模型输入 token 数，但该示例确实证明了注入后没有再执行同一预算检查。
 
@@ -67,7 +67,7 @@ flowchart TD
 
 **2. “已验证事实”目前主要表示通过了配置的节点输出评价。**
 
-[ledger.py:154](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:154) 将压缩后的输出摘要作为一个 ContextFact 写入，verified 来自节点评价结果。默认 [evaluation.py:57](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/evaluation.py:57) 主要检查必要字段、必要文件及父级确认，没有通用的外部事实核验。没有配置额外条件的合法字典输出通常可以通过。
+[ledger.py:154](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:154) 将压缩后的输出摘要作为一个 ContextFact 写入，verified 来自节点评价结果。默认 [evaluation.py:57](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/evaluation.py:57) 主要检查必要字段、必要文件及父级确认，没有通用的外部事实核验。没有配置额外条件的合法字典输出通常可以通过。
 
 因此，字段存在、文件存在、节点结果被接受，与某个事实在真实世界中正确，是不同的判断。
 
@@ -79,7 +79,7 @@ flowchart TD
 
 **3. “稳定供给”成立，但原始目标的完整性和动态更新有边界。**
 
-[ledger.py:205](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:205) 从 original_goal/goal/task/input/query 选择初始目标，再调用 _clip。默认 summary_max_chars=600，因此 original_goal 字段并不保证保存完整的原始请求。
+[ledger.py:205](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:205) 从 original_goal/goal/task/input/query 选择初始目标，再调用 _clip。默认 summary_max_chars=600，因此 original_goal 字段并不保证保存完整的原始请求。
 
 补充示例输入 675 字符，在第 650 字符之后放置关键要求，结果账本只保存 600 字符，尾部要求丢失。它与“目标可能较长、关键限制位于末尾”的任务场景直接相关。
 
@@ -89,9 +89,9 @@ flowchart TD
 
 **4. 压缩和归档有实现，但并不自动缩减所有共享历史。**
 
-[compressor.py:81](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/compressor.py:81) 的摘要策略是优先提取 output/result/answer/input 等字段，再截断字段内容。它是确定性的文本压缩，不能直接写成自动理解并保留全部关键语义。
+[compressor.py:81](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/compressor.py:81) 的摘要策略是优先提取 output/result/answer/input 等字段，再截断字段内容。它是确定性的文本压缩，不能直接写成自动理解并保留全部关键语义。
 
-该压缩器为 Ledger 生成摘要和归档，不会直接重写或裁剪原始 GraphState.messages。[agent_runtime.py:380](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/agent_runtime.py:380) 在没有定向 capsule 时，仍可能把共享消息历史加入模型输入。因此，摘要写入账本与所有运行历史都已受控压缩，应分别论述。
+该压缩器为 Ledger 生成摘要和归档，不会直接重写或裁剪原始 GraphState.messages。[agent_runtime.py:380](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/agent_runtime.py:380) 在没有定向 capsule 时，仍可能把共享消息历史加入模型输入。因此，摘要写入账本与所有运行历史都已受控压缩，应分别论述。
 
 可使用：
 
@@ -99,9 +99,9 @@ flowchart TD
 
 **5. 漂移检测提供信号，自动纠偏需要明确控制方。**
 
-[drift.py:188](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/drift.py:188) 检测重复节点、待执行步骤积压、重复摘要、资源引用和文件操作，并可启用 embedding/LLM 目标偏离检查。默认重复摘要判断使用归一化指纹相等，不能将所有规则项都理解成语义模型检测。
+[drift.py:188](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/drift.py:188) 检测重复节点、待执行步骤积压、重复摘要、资源引用和文件操作，并可启用 embedding/LLM 目标偏离检查。默认重复摘要判断使用归一化指纹相等，不能将所有规则项都理解成语义模型检测。
 
-[hooks.py:718](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:718) 将结果写入状态和账本失败摘要，默认不会仅因 drifted=True 就自动暂停或重规划。todo_update_mode=suggest 时，建议写入 open_questions；auto 模式仅应用 insert、replace、cancel、complete、select 等支持动作。
+[hooks.py:718](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:718) 将结果写入状态和账本失败摘要，默认不会仅因 drifted=True 就自动暂停或重规划。todo_update_mode=suggest 时，建议写入 open_questions；auto 模式仅应用 insert、replace、cancel、complete、select 等支持动作。
 
 你当前正文已经写明“具体恢复动作由对应控制流程决定”，这点准确，建议保留。
 
@@ -119,27 +119,27 @@ flowchart TD
 
 | 文件 | 关键对象/入口 | 作用及阅读重点 |
 |---|---|---|
-| [context/_types.py:266](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/_types.py:266) | ContextLedger | 任务状态的数据模型；ContextFact、ToolSummary、TodoItem、TodoEvent、ContextBudget 在同文件定义 |
-| [context/ledger.py:22](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:22) | ContextLedgerStore | 按 run 保存 ledger.json；更新节点进度、摘要、候选事实和失败；同时刷新 MEMORY.md |
-| [context/renderer.py:14](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/renderer.py:14) | render_markdown | 将账本渲染为可审计文档；MEMORY.md 是账本的可读视图，不是另一个独立语义记忆库 |
-| [context/injector.py:90](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/injector.py:90) | ContextInjector.build | 构造面向节点的任务锚点；默认各选最近 8 条 verified/unverified 记录，加入活动/相邻/已完成 TODO |
-| [context/todo.py:11](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/todo.py:11) | TodoManager | 管理待办状态、活动项和修订事件；一次节点成功与一个语义 TODO 完成需要显式关联 |
-| [context/compressor.py:26](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/compressor.py:26) | compress_update | 长输出保存为 raw/run/step_node_hash.json；摘要和 raw_ref 写回账本；默认长度阈值为字符数 |
-| [context/budget.py:33](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/budget.py:33) | ContextBudgetController | 粗略预算估算和允许/暂停决策；它本身不实施自动压缩 |
-| [context/drift.py:142](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/drift.py:142) | DriftDetector | 规则停滞信号及可选目标偏离检测；检测结果还需控制流程消费 |
-| [context/policy.py:17](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/policy.py:17) | ContextPolicy | 读取平坦 YAML/JSON，构造上述组件；应区分策略字段、默认值和实际启用条件 |
-| [memory/_types.py:110](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/_types.py:110) | wakeup_profile | 定义四种唤醒配置，以及作用域、介质、记忆项等结构 |
-| [memory/store.py:53](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/store.py:53) | HybridTieredMemoryStore | 记忆写入路由、SQLite 持久化、跨作用域检索、摘要与归档展开，是记忆主实现 |
-| [memory/embedding.py:19](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/embedding.py:19) | HashingEmbeddingModel / BGEM3EmbeddingModel | 默认是依赖较少的哈希向量；BGE-M3 需要显式配置，不能把默认 dense 等同于 BGE-M3 |
-| [memory/_utils.py:32](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/_utils.py:32) | _sparse_score / _recency_score | 词项覆盖和新近度计算；这里的 sparse 并非 BM25 或 BGE 稀疏向量 |
-| [memory/temporal.py:95](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/temporal.py:95) | TemporalEvidenceMemoryStore | 独立的有效期、事实历史、冲突和证据管理；不能由普通 Recovery 配置自动推导出全部这些能力 |
-| [hooks.py:159](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:159) | HookManager | 将账本、记忆、评价、漂移和恢复接入图生命周期；理解整体执行顺序的首要文件 |
-| [graph.py:296](/D:/Pro/Agent-Graph/Long_Task_1/engine/graph.py:296) | CompiledGraph.astream | 实际推进 step/frontier、调用 Hook、处理暂停、合并节点状态和恢复图检查点 |
-| [adapters.py:89](/D:/Pro/Agent-Graph/Long_Task_1/engine/adapters.py:89) | make_agent_node_func | 对字符串输入拼接锚点、技能和记忆；已有 Msg 等非字符串输入走不同分支 |
-| [agent_runtime.py:346](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/agent_runtime.py:346) | _build_prompt | 平台 Agent 的真实输入装配；检查账本最终是否送入模型时必须读到这里 |
-| [context/checkpoint.py:51](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/checkpoint.py:51) | ContextCheckpointStore | 创建和恢复任务信息及账本关联归档快照 |
-| [engine/checkpoint.py:51](/D:/Pro/Agent-Graph/Long_Task_1/engine/checkpoint.py:51) | GraphCheckpointStore | 保存执行状态与前沿；与 context/checkpoint.py 职责不同 |
-| [experiments/long_task.py:248](/D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:248) | _run_one | 实验专用多轮治理循环；不是生产 Graph+Hook 路径的完整复用 |
+| [context/_types.py:266](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/_types.py:266) | ContextLedger | 任务状态的数据模型；ContextFact、ToolSummary、TodoItem、TodoEvent、ContextBudget 在同文件定义 |
+| [context/ledger.py:22](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:22) | ContextLedgerStore | 按 run 保存 ledger.json；更新节点进度、摘要、候选事实和失败；同时刷新 MEMORY.md |
+| [context/renderer.py:14](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/renderer.py:14) | render_markdown | 将账本渲染为可审计文档；MEMORY.md 是账本的可读视图，不是另一个独立语义记忆库 |
+| [context/injector.py:90](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/injector.py:90) | ContextInjector.build | 构造面向节点的任务锚点；默认各选最近 8 条 verified/unverified 记录，加入活动/相邻/已完成 TODO |
+| [context/todo.py:11](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/todo.py:11) | TodoManager | 管理待办状态、活动项和修订事件；一次节点成功与一个语义 TODO 完成需要显式关联 |
+| [context/compressor.py:26](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/compressor.py:26) | compress_update | 长输出保存为 raw/run/step_node_hash.json；摘要和 raw_ref 写回账本；默认长度阈值为字符数 |
+| [context/budget.py:33](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/budget.py:33) | ContextBudgetController | 粗略预算估算和允许/暂停决策；它本身不实施自动压缩 |
+| [context/drift.py:142](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/drift.py:142) | DriftDetector | 规则停滞信号及可选目标偏离检测；检测结果还需控制流程消费 |
+| [context/policy.py:17](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/policy.py:17) | ContextPolicy | 读取平坦 YAML/JSON，构造上述组件；应区分策略字段、默认值和实际启用条件 |
+| [memory/_types.py:110](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/_types.py:110) | wakeup_profile | 定义四种唤醒配置，以及作用域、介质、记忆项等结构 |
+| [memory/store.py:53](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/store.py:53) | HybridTieredMemoryStore | 记忆写入路由、SQLite 持久化、跨作用域检索、摘要与归档展开，是记忆主实现 |
+| [memory/embedding.py:19](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/embedding.py:19) | HashingEmbeddingModel / BGEM3EmbeddingModel | 默认是依赖较少的哈希向量；BGE-M3 需要显式配置，不能把默认 dense 等同于 BGE-M3 |
+| [memory/_utils.py:32](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/_utils.py:32) | _sparse_score / _recency_score | 词项覆盖和新近度计算；这里的 sparse 并非 BM25 或 BGE 稀疏向量 |
+| [memory/temporal.py:95](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/memory/temporal.py:95) | TemporalEvidenceMemoryStore | 独立的有效期、事实历史、冲突和证据管理；不能由普通 Recovery 配置自动推导出全部这些能力 |
+| [hooks.py:159](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:159) | HookManager | 将账本、记忆、评价、漂移和恢复接入图生命周期；理解整体执行顺序的首要文件 |
+| [graph.py:296](D:/Pro/Agent-Graph/Long_Task_1/engine/graph.py:296) | CompiledGraph.astream | 实际推进 step/frontier、调用 Hook、处理暂停、合并节点状态和恢复图检查点 |
+| [adapters.py:89](D:/Pro/Agent-Graph/Long_Task_1/engine/adapters.py:89) | make_agent_node_func | 对字符串输入拼接锚点、技能和记忆；已有 Msg 等非字符串输入走不同分支 |
+| [agent_runtime.py:346](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/agent_runtime.py:346) | _build_prompt | 平台 Agent 的真实输入装配；检查账本最终是否送入模型时必须读到这里 |
+| [context/checkpoint.py:51](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/checkpoint.py:51) | ContextCheckpointStore | 创建和恢复任务信息及账本关联归档快照 |
+| [engine/checkpoint.py:51](D:/Pro/Agent-Graph/Long_Task_1/engine/checkpoint.py:51) | GraphCheckpointStore | 保存执行状态与前沿；与 context/checkpoint.py 职责不同 |
+| [experiments/long_task.py:248](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:248) | _run_one | 实验专用多轮治理循环；不是生产 Graph+Hook 路径的完整复用 |
 
 推荐阅读顺序：ContextLedger 数据结构 → LedgerStore → Injector → HookManager → Graph → AgentRuntime → MemoryStore → 两种 Checkpoint → 实验驱动。
 
@@ -172,10 +172,10 @@ _read_scopes 收集所选作用域的候选，统一排序后按记忆 ID 去重
 
 | 优先级 | 位置与触发条件 | 观察结果 | 对论文的影响 |
 |---|---|---|---|
-| 高 | [hooks.py:235](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:235)：小状态先通过预算，节点随后注入大量记忆 | 超过原先限制的节点上下文仍可执行 | 不能把步骤级状态检查当成最终请求硬预算保证 |
-| 高 | [graph.py:533](/D:/Pro/Agent-Graph/Long_Task_1/engine/graph.py:533)：因 budget_paused 退出循环且启用了图检查点 | final 检查点仍写 status=completed、frontier=[]，并成为 latest | 默认恢复 latest 会丢失待执行位置；需修正暂停保存语义 |
-| 高 | [hooks.py:378](/D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:378)：带 reasoning subtask 的节点走异常处理 | 引用了函数内未定义的 evaluation，触发 NameError；后续还引用未定义 update | 该组合配置下异常记录和恢复路径会被二次异常打断 |
-| 中 | [ledger.py:216](/D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:216)：目标超过默认字符限制 | 原始目标尾部被截断 | “完整原始目标稳定保存”缺少实现支撑 |
+| 高 | [hooks.py:235](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:235)：小状态先通过预算，节点随后注入大量记忆 | 超过原先限制的节点上下文仍可执行 | 不能把步骤级状态检查当成最终请求硬预算保证 |
+| 高 | [graph.py:533](D:/Pro/Agent-Graph/Long_Task_1/engine/graph.py:533)：因 budget_paused 退出循环且启用了图检查点 | final 检查点仍写 status=completed、frontier=[]，并成为 latest | 默认恢复 latest 会丢失待执行位置；需修正暂停保存语义 |
+| 高 | [hooks.py:378](D:/Pro/Agent-Graph/Long_Task_1/engine/hooks.py:378)：带 reasoning subtask 的节点走异常处理 | 引用了函数内未定义的 evaluation，触发 NameError；后续还引用未定义 update | 该组合配置下异常记录和恢复路径会被二次异常打断 |
+| 中 | [ledger.py:216](D:/Pro/Agent-Graph/Long_Task_1/engine/modules/context/ledger.py:216)：目标超过默认字符限制 | 原始目标尾部被截断 | “完整原始目标稳定保存”缺少实现支撑 |
 
 这些缺陷是在现有测试通过后通过补充最小示例确认的。它们不否定架构分工，但会影响对可靠性和保证范围的表述。本次按分析任务范围未修改这些实现。
 
@@ -189,10 +189,10 @@ c102dd765d0eb054a3bb0bab90c99b3b12b50b9278644ab09edfb84d5d7b6414
 
 更关键的是区分以下实验专用处理和核心运行时：
 
-- [long_task.py:301](/D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:301) 用已知事件中的 proposed_goal 与原始目标的相似度产生漂移防护提示，未完整复用通用 DriftDetector 的实际检测路径。
-- [long_task.py:620](/D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:620) 对已装配的上下文检查预算，并实施轨迹压缩和优先级截断；这些逻辑比核心 Hook 当前的状态级暂停更完整。
-- [long_task.py:258](/D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:258) 在任务开始时检索历史，随后多轮复用；它不能单独证明每节点自适应查询和四级唤醒策略的效果。
-- [long_task.py:399](/D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:399) 将实验 Runtime 写入上下文检查点 metadata；恢复实验状态不等价于验证生产图的 frontier 恢复。
+- [long_task.py:301](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:301) 用已知事件中的 proposed_goal 与原始目标的相似度产生漂移防护提示，未完整复用通用 DriftDetector 的实际检测路径。
+- [long_task.py:620](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:620) 对已装配的上下文检查预算，并实施轨迹压缩和优先级截断；这些逻辑比核心 Hook 当前的状态级暂停更完整。
+- [long_task.py:258](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:258) 在任务开始时检索历史，随后多轮复用；它不能单独证明每节点自适应查询和四级唤醒策略的效果。
+- [long_task.py:399](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:399) 将实验 Runtime 写入上下文检查点 metadata；恢复实验状态不等价于验证生产图的 frontier 恢复。
 - 默认 qa_solver=extractive；只有实际配置 llm，且核验调用及回退记录，才能把一轮实验称为真实 LLM 多轮评测。模型步骤和轨迹裁判异常均有启发式回退，正式报告应给出回退率。
 - 平均上下文采用粗略估算，并排除共享系统提示词；Memory Use Accuracy 在代码中是“证据充分且回答正确”的联合比例，不是以充分证据任务数为分母的条件正确率。
 
