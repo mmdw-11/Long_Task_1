@@ -193,10 +193,12 @@ c102dd765d0eb054a3bb0bab90c99b3b12b50b9278644ab09edfb84d5d7b6414
 - [long_task.py:620](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:620) 对已装配的上下文检查预算，并实施轨迹压缩和优先级截断；这些逻辑比核心 Hook 当前的状态级暂停更完整。
 - [long_task.py:258](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:258) 在任务开始时检索历史，随后多轮复用；它不能单独证明每节点自适应查询和四级唤醒策略的效果。
 - [long_task.py:399](D:/Pro/Agent-Graph/Long_Task_1/engine/experiments/long_task.py:399) 将实验 Runtime 写入上下文检查点 metadata；恢复实验状态不等价于验证生产图的 frontier 恢复。
-- 默认 qa_solver=extractive；只有实际配置 llm，且核验调用及回退记录，才能把一轮实验称为真实 LLM 多轮评测。模型步骤和轨迹裁判异常均有启发式回退，正式报告应给出回退率。
+- LongTaskExperimentConfig 数据类默认 qa_solver=extractive，而 CLI 默认 llm；只有核验实际运行配置、调用及回退记录，才能把一轮实验称为真实 LLM 多轮评测。模型步骤和轨迹裁判异常均有启发式回退，正式报告应给出回退率。
 - 平均上下文采用粗略估算，并排除共享系统提示词；Memory Use Accuracy 在代码中是“证据充分且回答正确”的联合比例，不是以充分证据任务数为分母的条件正确率。
 
-LoCoMo 原始工作评测长对话记忆，包含 QA、事件摘要和多模态对话等任务。当前 v12 为直接事实、带检索锚点的筛选子集，加上固定六轮治理事件，应称“LoCoMo 派生多轮治理评测”，不宜外推到完整 LoCoMo 或任意超长执行链。[LoCoMo 原论文](https://aclanthology.org/2024.acl-long.747/)
+LoCoMo 原始工作评测长对话记忆，包含 QA、事件摘要和多模态对话等任务。[LoCoMo 原论文](https://aclanthology.org/2024.acl-long.747/)
+
+补充更正（2026-10-26 实验核验）：当前 v12 的 100 条全部为 category=1。项目将其称为“直接事实题”，但官方评测代码把 category=1 定义为 multi-hop；因此应称“按证据数量与检索锚点筛选的多跳子集”。先前版本沿用项目命名的“直接事实”表述不准确。加上固定六轮治理事件后，它属于 LoCoMo 派生多轮治理评测，不宜外推到完整 LoCoMo 或任意超长执行链。[官方类别判分代码](https://github.com/snap-research/locomo/blob/main/task_eval/evaluation.py)
 
 建议实验章节至少补齐：模型与运行参数、数据哈希、逐任务原始结果；Ledger/压缩/漂移/检查点消融；真实 Graph+Hook 集成恢复案例；长执行步数和多次中断设置；完整请求 token 统计。由于 100 个问题共享 10 组源对话，置信区间宜考虑按源对话聚类，避免把所有问题视为完全独立样本。
 
