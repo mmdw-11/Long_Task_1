@@ -1,0 +1,647 @@
+% 4.3 TIDE-Placement端边云可信自适应推理调度
+%     4.3.1 问题定义与任务资源画像
+%     4.3.2 实时性、复杂度与敏感性约束建模
+%     4.3.3 可信域约束下的推理位置选择
+%     4.3.4 推理阶段划分与执行器分发
+%     4.3.5 模型切分的实现范围与适配边界
+%     4.3.6 资源监测与失败反馈驱动的重调度
+%     4.3.7 核心算法伪代码与复杂度分析
+
+
+\paragraph{适用范围}
+团队内协作由Supervisor中介，Capsule标准路由覆盖图节点及其真实后继；内部成员级独立Capsule事件可通过进一步下沉运行时节点接口扩展。贡献评分采用文本相似度、置信度和预算等工程信号，其含义为消息筛选依据，互信息与语义正确性需独立评价。512个估算Token是压缩目标，主张、约束及协议字段优先保留时可超过该值；压缩前后用量与父消息摘要标识记录处理过程，字段保真与整体语义保真分别检验。
+
+状态增量描述选定业务输出字段，删除标记作用于该差分视图；完整共享图状态由自身的归并规则维护。通信快照保存版本、已见摘要标识和统计信息，消息队列与差分基准需要结合图状态和业务恢复过程核对，投递的去重与完整性据此验证。时态事实合并和冲突检测适用于已结构化的事实槽位与时间关系，自然语言矛盾的判定需结合证据核验。潜在边数、实际消息数、协议载荷、估算Token和模型实际Token分别统计；对其他通信基线及大规模真实任务的优势以第六章实际对照范围为准。
+
+\section{TIDE-Placement：端边云自适应推理调度}
+\label{sec:tide_placement}
+
+\subsection{设计目标与总体架构}
+
+\paragraph{超长程任务中的资源选择难题}
+
+超长程复杂任务包含实时性、复杂度和数据敏感性不同的子任务。简单确认和即时交互更关注响应速度，长文档分析、代码理解和多维比较需要更强的推理能力，涉及客户数据、内部资料或访问凭证的任务还必须满足可信处理要求。若将全部子任务固定在单一推理位置，便难以同时兼顾推理能力、响应时延、数据安全和资源可用性。
+
+为此，本文设计了
+\textbf{TIDE-Placement（Task-profile-driven Intelligent Deployment and Execution Placement）}
+机制。该机制以图节点为调度单位，根据任务实时性、敏感度和复杂度形成任务画像，并结合可信域策略与资源运行状态，通过BGE-M3+MLP在端侧、边缘侧和云侧候选资源之间进行选择。调度结果进一步转换为资源分配、推理阶段计划和调度轨迹，供安全处理、执行器分发及后续失败恢复使用。
+
+TIDE-Placement围绕“任务画像、资源选择、实际执行和状态反馈”的闭环。如图~\ref{fig:tide-placement-loop}所示，节点执行前由任务画像、可信域约束和资源状态共同形成调度决策；执行结果随后反馈至资源监控模块，影响下一次资源选择。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/TIDE-Placement调度与失败反馈闭环.pdf}
+    \caption{TIDE-Placement调度与失败反馈闭环}
+    \label{fig:tide-placement-loop}
+\end{figure}
+
+该机制的主要特点在于：任务语义、数据安全要求和资源状态在同一决策过程中联合生效；调度输出不仅包含资源层级，还包含安全处理和推理阶段计划；执行失败能够更新资源状态并触发重新决策，从而避免在已失效的固定后端上重复调用。
+
+
+% TIDE-Placement 的核心不是单次``三选一''分类，而是一个可回放的闭环：
+
+% \begin{verbatim}
+% Node Context
+%    ↓
+% Task Profile → Trusted-domain Constraint → Resource Status
+%    ↓
+% Adaptive Placement + Inference-stage Split Plan
+%    ↓
+% Resource Allocation / Redaction / Audit Pack
+%    ↓
+% Device, Edge or Cloud Executor
+%    ↓
+% Execution Feedback → Resource Monitor → Next Placement
+% \end{verbatim}
+
+% \begin{quote}
+% 【图片占位：图 1 TIDE-Placement 端—边—云闭环。左侧为节点输入与元数据；中部依次为 Task Gate、Trusted Workspace Policy、Resource Monitor、Adaptive Scheduler；右侧为 DEVICE/EDGE/CLOUD 执行器；底部画失败反馈回到 Monitor 的闭环。】
+% \end{quote}
+
+% \paragraph{本文中``模型切分''的工程定义}
+
+% 为避免把抽象概念与工程实现混淆，本文将\textbf{模型切分}定义为已落地的``推理阶段切分与跨层放置''：每个子任务至少经过端侧 \texttt{local\_gate}，敏感任务再经过可信端侧 \texttt{trusted\_redaction}，最后按调度结果进入 \texttt{local\_inference}、\texttt{edge\_inference} 或 \texttt{cloud\_inference}。因此，调度结果并非只有一个资源标签，而是一条带阶段名称、执行层级、模型提示和职责说明的 \texttt{ModelSplitStep} 链。
+
+% 典型链路如下：
+
+\paragraph{推理阶段计划的工程定义}
+
+\textbf{本文实现任务级切分（阶段划分与跨层放置），并为更细粒度切分预留统一接口}。每个任务首先经过端侧的
+\texttt{local\_gate}，用于生成任务画像；敏感任务增加
+\texttt{trusted\_redaction}阶段；主推理阶段再根据调度结果放置到
+\texttt{local\_inference}、\texttt{edge\_inference}或
+\texttt{cloud\_inference}。
+
+典型计划如下：
+\begin{verbatim}
+公开高复杂任务：local_gate → cloud_inference
+敏感复杂任务：local_gate → trusted_redaction → edge_inference
+强实时本地任务：local_gate → local_inference
+\end{verbatim}
+
+阶段计划由一组\texttt{ModelSplitStep}描述。每个阶段记录名称、目标层级、模型提示和职责，使任务判断、安全预处理和主推理之间的关系可以被调度器、运行钩子和审计模块共同读取。该接口将阶段职责与执行层级显式关联，为后续扩展模型内部切分保留一致的描述入口。
+
+
+\paragraph{设计目标}
+
+TIDE-Placement的设计目标如表~\ref{tab:placement-objectives}所示。
+
+
+% \begin{longtable}[]{@{}
+%   >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.33}}
+%   >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.33}}
+%   >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.33}}@{}}
+% \toprule
+% 目标 & 已实现机制 & 运行结果 \\
+% \midrule
+% \endhead
+% 子任务级动态放置 & \texttt{TaskProfile} + \texttt{AdaptiveResourceScheduler} & 每个节点获得 DEVICE/EDGE/CLOUD 分配 \\
+% 强实时优先低时延 & HARD 实时性优先 DEVICE → EDGE → CLOUD & 避免高时延层抢占即时任务 \\
+% 高复杂任务利用云能力 & HIGH/EXTREME 复杂度优先 CLOUD → EDGE → DEVICE & 公开复杂任务优先进入云端大模型 \\
+% 敏感数据可信约束 & \texttt{TrustedWorkspacePolicy} + \texttt{trusted\_redaction} & CONFIDENTIAL/SECRET 优先在端/边可信域处理 \\
+% 资源状态感知 & ResourceMonitor 记录可用性、限流、负载、队列和错误率 & 限流或异常资源自动从候选集中剔除 \\
+% 失败后重新选择 & \texttt{ResilientInferenceRunner} 回写 \texttt{MutableResourceMonitor} & 重试时自动规避故障层级 \\
+% 决策可解释 & \texttt{SchedulingTrace}、policy hits、allocation metadata & 可回放``为何选该层、为何发生回退'' \\
+% \bottomrule
+% \end{longtable}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\begin{table}[htbp]
+    \centering
+    \caption{TIDE-Placement设计目标}
+    \label{tab:placement-objectives}
+    \begin{tabularx}{\textwidth}{p{0.22\textwidth}X X}
+        \toprule
+        目标 & 实现机制 & 预期作用 \\
+        \midrule
+        子任务级动态放置
+        & \texttt{TaskProfile}与自适应调度器
+        & 为不同图节点分别选择端、边或云资源 \\
+
+        强实时任务优先
+        & 强实时任务采用端、边、云候选顺序
+        & 优先使用响应路径较短的可用资源 \\
+
+        复杂任务能力匹配
+        & 根据复杂度过滤候选资源
+        & 将公开高复杂任务优先交由高能力资源处理 \\
+
+        敏感数据可信处理
+        & 可信域策略与调用前安全处理
+        & 优先将敏感数据保留在可信资源范围内 \\
+
+        资源状态感知
+        & \texttt{ResourceMonitor}
+        & 根据限流、异常、负载和队列状态调整候选资源 \\
+
+        失败后重新选择
+        & 执行反馈与有限重试
+        & 更新资源状态并重新生成调度决策 \\
+
+        决策可追溯
+        & \texttt{SchedulingTrace}
+        & 保存画像、状态、策略命中和选择原因 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\subsection{异构资源画像与任务画像}
+
+\paragraph{端、边、云的统一资源抽象}
+
+系统使用 \texttt{ResourceProfile} 将三类异构资源映射为统一的能力接口：资源层级、访问端点、可信属性、最大可承载复杂度、延迟、成本权重和模型集合。默认配置如表~\ref{tab:resource-profile}所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{端边云默认资源画像}
+    \label{tab:resource-profile}
+    \begin{tabularx}{\textwidth}{l c c c c X}
+        \toprule
+        层级 & 可信 & 最大复杂度 & 参考时延 & 成本权重 & 主要职责 \\
+        \midrule
+        DEVICE & 是 & MEDIUM & 30\,ms & 0.2
+        & 本地门控、即时响应与可信预处理 \\
+
+        EDGE & 是 & HIGH & 90\,ms & 0.6
+        & 敏感任务及中高复杂度近端推理 \\
+
+        CLOUD & 否 & EXTREME & 220\,ms & 1.0
+        & 公开高复杂任务和高算力推理 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+% 资源画像不是硬编码到节点业务逻辑中。端点和模型可由环境变量配置；\texttt{ExecutorRegistry} 根据调度器写入的 tier 将请求分派给 \texttt{LocalModelExecutor}、\texttt{EdgeHttpExecutor} 或 \texttt{OpenAICompatibleCloudExecutor}。因此，同一工作流节点可在不同运行轮次进入不同执行位置，而节点本身无需维护三套分支代码。
+
+表中的时延和成本权重是调度器的默认配置参数，不代表硬件实测结果。实际部署时，可根据设备、网络和模型服务重新配置资源画像。
+
+资源属性不写入节点业务逻辑。\texttt{ExecutorRegistry}根据调度结果，将任务交给
+\texttt{LocalModelExecutor}、\texttt{EdgeHttpExecutor}或
+\texttt{OpenAICompatibleCloudExecutor}。因此，同一节点可在不同运行轮次使用不同推理资源，而无需维护多套执行分支。
+
+\paragraph{任务画像构建}
+
+TIDE-Placement使用任务画像描述当前节点的资源需求：
+
+\[
+P_t=\langle R_t,S_t,C_t,Type_t,Trust_t,Approval_t\rangle,
+\]
+
+其中，\(R_t\)表示实时性，\(S_t\)表示敏感度，\(C_t\)表示复杂度，
+\(Type_t\)表示任务类型，\(Trust_t\)表示是否要求可信工作区，
+\(Approval_t\)表示外部敏感处理是否已经获得授权。主要画像维度见表~\ref{tab:task-profile}。
+
+\begin{table}[htbp]
+    \centering
+    \caption{任务画像的主要维度}
+    \label{tab:task-profile}
+    \begin{tabularx}{\textwidth}{p{0.18\textwidth}p{0.42\textwidth}X}
+        \toprule
+        维度 & 等级 & 含义 \\
+        \midrule
+        实时性
+        & HARD / INTERACTIVE / NORMAL / BATCH
+        & 从强实时交互到离线批处理 \\
+
+        敏感度
+        & PUBLIC / INTERNAL / CONFIDENTIAL / SECRET
+        & 从公开数据到高敏感凭证数据 \\
+
+        复杂度
+        & LOW / MEDIUM / HIGH / EXTREME
+        & 从轻量处理到高算力复杂推理 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+% \texttt{HeuristicTaskGate} 优先读取节点 metadata 中明确标注的 \texttt{realtime}、\texttt{sensitivity}、\texttt{complexity} 和 \texttt{task\_type}；未标注时，才从当前节点输入、目标、查询、消息、节点描述和系统提示词中推断。规则对``实时、立即、紧急、低延迟''等信号提高实时性，对 token、密钥、身份证、银行卡、客户隐私、内部邮件等信号提高敏感度，对长文、多模态、复杂推理、全量分析和故障恢复等信号提高复杂度。系统也提供 \texttt{OpenAITaskGate}，以结构化 JSON 输出同一任务画像字段；无论画像来源于规则还是模型，后续可信域策略均在本地调度器中统一执行。
+
+% \begin{quote}
+% 【图片占位：图 2 任务画像构建图。输入包括节点 metadata、当前 state、目标、消息、节点描述和系统提示词；输出为实时性、敏感度、复杂度、可信工作区需求和任务类型。图中应强调``显式 metadata 优先，文本推断补充''。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+任务画像优先读取节点元数据中明确设置的
+\texttt{realtime}、\texttt{sensitivity}、\texttt{complexity}和
+\texttt{task\_type}。对于未显式设置的字段，任务门控器再依据节点输入、目标、消息和系统提示进行补充判断。
+
+当前系统既支持规则画像，也支持训练后的路由模型，并在必要时回退至启发式规则。无论画像由何种方式生成，可信域约束均由本地调度策略独立执行，避免安全限制完全依赖模型判断。
+
+\subsection{可信域约束下的自适应资源选择}
+
+\paragraph{候选资源生成}
+
+对于请求 \(q_t\)，调度器先根据任务画像和请求配置生成候选层级顺序：
+
+\[
+Order(P_t)=
+\begin{cases}
+[DEVICE,EDGE,CLOUD],& R_t=HARD\\
+[CLOUD,EDGE,DEVICE],& C_t\in\{HIGH,EXTREME\}\\
+Preference(q_t),& \text{其他情况}.
+\end{cases}
+\]
+
+
+显式路由配置可以改变候选顺序；若无显式配置，则强实时规则优先于复杂度规则。随后，系统排除不可用或被限流的资源，并检查候选资源是否能够承载当前任务复杂度。
+
+资源状态用于同一候选顺序内的辅助比较，其排序依据表示为：
+
+\[
+Rank(x)=
+\langle
+ErrorRate_x,\,
+Load_x,\,
+Queue_x,\,
+Latency_x,\,
+Cost_x
+\rangle .
+\]
+
+因此，调度器优先考虑任务需求和可信约束，再结合错误率、负载、队列、探测时延和成本选择候选资源。若没有资源完全满足复杂度要求，系统可以产生降级选择，并在调度原因中记录该状态。
+
+\paragraph{可信域约束}
+
+默认策略将DEVICE和EDGE配置为可信资源，将CLOUD配置为非可信资源。当任务敏感度达到CONFIDENTIAL或SECRET时，调度器优先选择能够满足复杂度要求的可信候选。
+
+若首选资源不可信，系统首先查找其他可信资源；若不存在完全满足复杂度要求的可信资源，则优先保留可用的可信资源并记录降级原因。当没有可信资源可用时，调度结果标记
+\texttt{requires\_human\_review}，供上层工作流执行暂停、审批或终止等授权控制。
+
+典型调度情况如表~\ref{tab:placement-cases}所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{典型任务画像与资源选择}
+    \label{tab:placement-cases}
+    \begin{tabularx}{\textwidth}{p{0.22\textwidth}p{0.25\textwidth}p{0.20\textwidth}X}
+        \toprule
+        任务画像 & 资源条件 & 调度结果 & 阶段计划 \\
+        \midrule
+        PUBLIC + HIGH
+        & 三层均可用
+        & CLOUD
+        & \texttt{local\_gate} $\rightarrow$ \texttt{cloud\_inference} \\
+
+        CONFIDENTIAL + HIGH
+        & EDGE可用
+        & EDGE
+        & \texttt{local\_gate} $\rightarrow$ \texttt{trusted\_redaction}
+          $\rightarrow$ \texttt{edge\_inference} \\
+
+        CONFIDENTIAL + HIGH
+        & EDGE不可用，DEVICE可用
+        & DEVICE降级执行
+        & \texttt{local\_gate} $\rightarrow$ \texttt{trusted\_redaction}
+          $\rightarrow$ \texttt{local\_inference} \\
+
+        HARD + PUBLIC
+        & DEVICE可用
+        & DEVICE
+        & \texttt{local\_gate} $\rightarrow$ \texttt{local\_inference} \\
+
+        SECRET + HIGH
+        & 仅CLOUD可用
+        & 标记人工复核
+        & 是否外部执行由上层授权策略决定 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\paragraph{调用前安全处理}
+
+% 一旦调度计划包含 \texttt{trusted\_redaction}，HookManager 会在节点执行前收集节点输入、任务、目标、查询和消息等安全载荷，调用敏感数据脱敏器，并生成审计包。脱敏结果写入 \texttt{\_\_redaction\_\_}，审计包写入 \texttt{\_\_audit\_pack\_\_}，同时在 allocation metadata 中保存不含完整载荷的安全摘要。端—边—云调度示例节点在实际构造执行请求时，会优先使用已脱敏 payload 改写 Prompt，并明确要求推理器不得还原敏感值。
+
+% 这种安排把安全处理放在推理位置选择之后、外部执行之前：即使最终需要外部高算力执行，系统也能保留端侧门控、敏感字段扫描、脱敏结果和审计证据，形成可追踪的数据流边界。
+
+% \begin{quote}
+% 【图片占位：图 3 可信域调度与安全数据流。用颜色区分可信 DEVICE/EDGE 与非可信 CLOUD；敏感任务先经过 local\_gate 和 trusted\_redaction，产生 \texttt{\_\_redaction\_\_}、\texttt{\_\_audit\_pack\_\_}，再进入选择的推理层。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+当阶段计划包含\texttt{trusted\_redaction}时，运行钩子会收集节点输入、任务目标、查询和消息等安全载荷，执行敏感信息识别与脱敏，并生成审计记录。脱敏结果写入
+\texttt{\_\_redaction\_\_}，审计信息写入
+\texttt{\_\_audit\_pack\_\_}，资源分配元数据中仅保存必要的安全摘要。
+
+可信域约束下的处理路径如图~\ref{fig:placement-trusted-path}所示。调度器首先判断敏感等级和可信资源可用性；允许继续执行时，安全处理结果经过执行器分发进入所选资源。若可信条件无法满足，则进入人工复核分支。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/可信域约束下的数据处理路径.pdf}
+    \caption{可信域约束下的数据处理路径}
+    \label{fig:placement-trusted-path}
+\end{figure}
+
+本文通过统一的安全处理数据结构连接调度与执行：执行节点按照资源分配和安全处理结果构造请求，端边云示例执行链已完成相应接入。
+
+\subsection{推理阶段切分与执行器分发}
+
+\paragraph{结构化阶段计划}
+
+调度器输出 \texttt{SchedulingDecision}，其中包含目标层级、服务端点、任务画像、阶段计划、人工复核标记和选择原因。运行时将其封装为\texttt{ResourceAllocation}，写入节点状态\texttt{\_\_resource\_allocation\_\_}。
+
+每个 \texttt{ModelSplitStep} 包含：阶段名称、运行层级、模型提示和职责说明。将阶段计划显式表示为数据结构，可以使调度决策被记录和回放，同时为安全预处理、执行器分发和后续扩展提供统一依据。
+
+\paragraph{执行器分发}
+
+\texttt{ExecutorRegistry}按照资源层级选择执行器，如表~\ref{tab:executor-registry}所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{端边云执行器注册关系}
+    \label{tab:executor-registry}
+    \begin{tabularx}{\textwidth}{l p{0.32\textwidth} X}
+        \toprule
+        层级 & 执行器 & 调用方式 \\
+        \midrule
+        DEVICE
+        & \texttt{LocalModelExecutor}
+        & 调用本地兼容模型服务 \\
+
+        EDGE
+        & \texttt{EdgeHttpExecutor}
+        & 将请求和资源分配信息发送至边缘HTTP服务 \\
+
+        CLOUD
+        & \texttt{OpenAICompatible\allowbreak CloudExecutor}
+        & 调用项目配置的云端兼容模型服务 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+资源分配直接决定执行器分发，并同步支撑界面展示。不同执行器统一返回
+\texttt{InferenceResult}，使图运行时可以使用一致的成功状态、错误信息和重试属性处理执行结果。
+
+\paragraph{失败反馈与重新调度}
+
+\texttt{ResilientInferenceRunner}负责连接资源选择和执行反馈。每次执行前，Runner向调度器申请资源；若执行失败且错误允许重试，则记录本次尝试，并将失败层级和错误原因写回
+\texttt{MutableResourceMonitor}。下一次申请读取更新后的资源状态，重新生成调度决策。
+
+图~\ref{fig:placement-reschedule}给出一次公开高复杂任务的示例。任务首次选择CLOUD，云端返回可重试的限流错误后，资源监控模块将CLOUD标记为受限。下一次调度根据新状态选择EDGE并完成执行。该图展示一次反馈重调度路径，替代资源由下一次调度时的可用性、能力与可信条件共同确定。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/云端失败后的反馈重调度时序.pdf}
+    \caption{云端失败后的反馈重调度时序}
+    \label{fig:placement-reschedule}
+\end{figure}
+
+与在固定后端重复调用相比，该机制将失败原因转化为下一轮调度状态，使重试过程能够避开已经限流或异常的资源。这也是TIDE-Placement区别于静态模型路由的重要设计。
+% --------------------------
+
+% \begin{verbatim}
+% 1. local_gate
+%    tier=DEVICE
+%    purpose=评估任务类型、难度与敏感等级
+
+% 2. trusted_redaction
+%    tier=DEVICE
+%    purpose=在可信工作区完成脱敏、摘要或审计包生成
+
+% 3. edge_inference
+%    tier=EDGE
+%    purpose=执行中等至高复杂度推理
+% \end{verbatim}
+
+% 将阶段计划作为数据结构而非隐藏在条件分支中，带来三个直接收益：第一，调度决策可以被完整记录与重放；第二，安全预处理能够与主推理解耦；第三，节点、执行器和前端都能读取同一份跨层执行说明。
+
+% \paragraph{执行器注册表：从决策到真实推理后端}
+
+% \texttt{ExecutorRegistry} 按 \texttt{ResourceTier} 进行统一分发：
+
+% \begin{longtable}[]{@{}lll@{}}
+% \toprule
+% 调度层级 & 执行器 & 调用方式 \\
+% \midrule
+% \endhead
+% DEVICE & \texttt{LocalModelExecutor} & 调用本地 OpenAI-compatible 模型端点；配置缺失或调用失败时保留可观测本地回退 \\
+% EDGE & \texttt{EdgeHttpExecutor} & 将 Prompt、系统提示和 allocation 发送给边缘 HTTP 推理服务 \\
+% CLOUD & \texttt{OpenAICompatibleCloudExecutor} & 使用项目配置的 OpenAI-compatible 云端客户端处理复杂任务 \\
+% \bottomrule
+% \end{longtable}
+
+% 因此，\texttt{\_\_resource\_allocation\_\_} 不是只供界面展示的标签，而是实际执行器选择的依据。边缘服务示例将 Ollama 包装为 HTTP 端点，云端执行器则将主推理请求提交给 OpenAI-compatible 服务；三层结果统一返回 \texttt{InferenceResult}，便于上层图运行时和质量模块使用。
+
+% \paragraph{云端复杂子任务与边侧回退}
+
+% 资源画像规定 CLOUD 可承载 EXTREME 复杂度。公开任务被识别为 HIGH/EXTREME 后，候选顺序自动调整为 CLOUD、EDGE、DEVICE；在云端可用时，云执行器获得该节点的实际推理请求。若云端状态为 429 限流或其他异常，调度器会从候选集中剔除该层，优先选择 EDGE。
+
+% \texttt{ResilientInferenceRunner} 将这一过程封装为闭环：每次执行前重新调用调度器；若执行器返回可重试失败，Runner 将 tier、错误和尝试记录写入结果，再调用 \texttt{MutableResourceMonitor.record\_failure}；下一次 \texttt{scheduler.acquire} 读取更新后的状态并重新选择资源。对于``云端第一次限流、第二次执行''这一典型场景，已验证的路径是 CLOUD → EDGE，而不是在同一失效云端盲目重试。
+
+% \begin{quote}
+% 【图片占位：图 4 云端复杂任务的失败重调度序列图。Public+High 任务先选择 CLOUD；云执行器返回 429；MutableResourceMonitor 标记 rate\_limited；第二次 acquire 选择 EDGE；EdgeExecutor 返回成功。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+% -----------------------
+
+
+\paragraph{图运行时接入}
+
+TIDE-Placement通过统一的Hook生命周期接入图执行过程，无需每个智能体单独调用调度接口。节点执行前，\texttt{HookManager}根据节点元数据、项目调度规则和当前
+\texttt{GraphState}构造资源请求，依次完成任务画像、资源状态读取、可信约束检查、资源选择和安全预处理，并将结果写入节点状态。其主要过程为：
+
+\begin{verbatim}
+NodeContext
+  -> ResourceRequest
+  -> TaskProfile
+  -> ResourceStatus
+  -> SchedulingDecision
+  -> SecurityPreflight
+  -> ResourceAllocation
+  -> ExecutorRegistry
+\end{verbatim}
+
+节点完成后释放资源句柄；推理节点可直接读取 allocation 并通过 ExecutorRegistry 发送请求。由此，调度、安全与执行均围绕同一份 \texttt{NodeContext} 和 \texttt{GraphState} 流转，不会形成彼此独立的旁路模块。
+
+\paragraph{调度轨迹}
+开启调度轨迹时，调度器为每次资源分配生成
+\texttt{SchedulingTrace}。其主要内容见表~\ref{tab:scheduling-trace}。
+
+\begin{table}[htbp]
+    \centering
+    \caption{SchedulingTrace主要字段}
+    \label{tab:scheduling-trace}
+    \begin{tabularx}{\textwidth}{p{0.28\textwidth}X}
+        \toprule
+        字段 & 记录内容 \\
+        \midrule
+        \texttt{heuristic\_profile}
+        & 启发式规则生成的基线任务画像 \\
+
+        \texttt{gate\_profile}
+        & 当前任务门控器生成的画像 \\
+
+        \texttt{final\_profile}
+        & 实际参与调度的最终画像 \\
+
+        \texttt{decision}
+        & 资源层级、端点、阶段计划、复核标记和选择原因 \\
+
+        \texttt{resource\_status}
+        & 各层资源的可用性、限流、错误率、负载、队列和延迟状态 \\
+
+        \texttt{policy\_hits}
+        & 本次决策命中的复杂度、实时性和可信域策略 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+调度轨迹可以解释任务画像如何形成、当时有哪些资源可用，以及哪些策略影响了最终决策。实际使用的推理层级和执行结果以执行记录核对，形成计划与执行相互关联的审计依据。
+
+
+% \begin{quote}
+% 【图片占位：图 5 SchedulingTrace 可视化示例。展示一条任务从 heuristic\_profile、gate\_profile、resource\_status 到 decision 和 policy\_hits 的结构化 JSON/前端卡片，突出 \texttt{cloud\_for\_high\_complexity} 与 \texttt{kept\_in\_trusted\_workspace} 两类策略命中。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsection{核心算法与复杂度分析}
+
+TIDE-Placement的核心调度过程如算法~\ref{alg:tide-placement}所示。
+
+\begin{algorithm}[t]
+    \caption{TIDE-Placement自适应资源调度}
+    \label{alg:tide-placement}
+    \KwIn{资源请求$q$，资源画像集合$\mathcal{R}$}
+    \KwOut{资源分配$a$与阶段计划$\Pi$}
+
+    $P \leftarrow \operatorname{TaskGate}(q)$\;
+    $\Omega \leftarrow \operatorname{ResourceMonitor.snapshot}(\mathcal{R})$\;
+    $C \leftarrow$ 根据显式路由、实时性和复杂度生成候选顺序\;
+    从$C$中移除不可用或被限流的资源\;
+    按能力要求和运行状态选择候选$x$\;
+
+    \If{$P$为敏感任务且$x$不可信}{
+        在$C$中查找可信候选$y$\;
+        \eIf{$y$存在}{
+            $x \leftarrow y$\;
+        }{
+            标记\texttt{requires\_human\_review}\;
+        }
+    }
+
+    $\Pi \leftarrow [\texttt{local\_gate}]$\;
+    \If{$P$为敏感任务}{
+        将\texttt{trusted\_redaction}加入$\Pi$\;
+    }
+    将与$x$对应的主推理阶段加入$\Pi$\;
+    $a \leftarrow \operatorname{ResourceAllocation}(x,P,\Pi,\Omega)$\;
+    \Return{$a,\Pi$}\;
+\end{algorithm}
+
+失败反馈驱动的执行过程如算法~\ref{alg:resilient-inference}所示。
+
+\begin{algorithm}[htbp]
+    \caption{失败反馈驱动的有限重调度}
+    \label{alg:resilient-inference}
+    \KwIn{推理请求$q$，最大尝试次数$K$}
+    \KwOut{推理结果及尝试记录}
+
+    \For{$k\leftarrow1$ \KwTo $K$}{
+        $a \leftarrow \operatorname{Scheduler.acquire}(q)$\;
+        $r \leftarrow \operatorname{ExecutorRegistry.run}(q,a)$\;
+        记录资源分配$a$和执行结果$r$\;
+
+        \If{$r$执行成功}{
+            \Return{$r$}\;
+        }
+
+        $\operatorname{ResourceMonitor.recordFailure}(a.tier,r.error)$\;
+
+        \If{$r$不可重试}{
+            \textbf{break}\;
+        }
+    }
+    \Return{最后一次结果及完整尝试记录}\;
+\end{algorithm}
+
+设资源数量为\(N\)，任务画像构建成本记为\(G(L)\)，其中\(L\)为输入规模。候选过滤的时间复杂度为\(O(N)\)，候选排序为
+\(O(N\log N)\)，阶段计划生成的结构性开销为\(O(1)\)。因此，单次调度的主要复杂度为：
+
+\[
+O\bigl(G(L)+N\log N\bigr).
+\]
+
+当任务画像由本地启发式规则生成时，\(G(L)\)近似为\(O(L)\)；若使用模型门控，则还需计入相应模型调用开销。端、边、云划分为三个逻辑层级，每层可以配置多个资源，资源选择开销随实际候选规模计算。失败重调度最多执行\(K\)次，系统通过有限尝试次数避免无界重试。
+
+\paragraph{验证场景}
+
+当前测试主要验证调度机制的分支行为和模块调用关系，覆盖范围见表~\ref{tab:placement-validation}。
+
+
+\begin{table}[htbp]
+    \centering
+    \caption{TIDE-Placement主要验证场景}
+    \label{tab:placement-validation}
+    \begin{tabularx}{\textwidth}{p{0.34\textwidth}X}
+        \toprule
+        场景 & 验证内容 \\
+        \midrule
+        公开高复杂任务
+        & 优先选择能够承载高复杂度的云侧资源 \\
+
+        敏感高复杂任务
+        & 优先选择可信EDGE并生成安全处理阶段 \\
+
+        边缘侧不可用
+        & 在可信约束下回退至可用DEVICE \\
+
+        无可信候选
+        & 生成需要人工复核的调度标记 \\
+
+        云侧限流
+        & 更新云侧状态，并在下一次调度中避开受限资源 \\
+
+        可重试执行失败
+        & Runner写回失败信息并重新申请资源 \\
+
+        图运行时接入
+        & 节点状态获得资源分配和安全处理结果 \\
+
+        执行器分发
+        & 按DEVICE、EDGE和CLOUD调用相应执行器 \\
+
+        脱敏与审计
+        & 生成脱敏结果和审计记录 \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+上述验证覆盖任务画像、可信域策略、资源选择、执行器分发和失败反馈的可运行链路，为端边云协同部署提供机制依据。
+
+
+% \begin{quote}
+% 【图片占位：图 6 调度验证矩阵。横轴为公开/敏感、低/高复杂、正常/强实时、资源正常/限流/不可用；纵轴为最终 tier、是否脱敏、是否审计、是否回退。可以把已有 21 项测试覆盖映射到矩阵中。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\paragraph{设计贡献}
+
+TIDE-Placement将任务画像、可信域约束和资源运行状态纳入统一的端边云调度过程。系统首先识别子任务的实时性、敏感度和复杂度，再结合资源能力与当前状态选择推理位置，并生成可执行的阶段计划。调用前安全处理限制敏感数据的流动范围，执行反馈则更新资源状态并驱动下一次调度。
+
+该机制的创新主要体现在三个方面：一是以图节点为单位联合处理任务语义、安全约束和资源状态；二是将资源选择扩展为包含安全处理、执行器分发和调度轨迹的结构化决策；三是使执行失败能够进入下一轮资源选择，从而形成可解释、可追溯且能够有限恢复的端边云推理闭环。
+
+% \subsection{本章本地证据来源}
+
+% \begin{itemize}
+% \tightlist
+% \item
+%   调度架构说明：\texttt{docs/7.13的情况.md}。
+% \item
+%   路由训练与端边云执行背景：\texttt{docs/7.31边端云MLP+BGE具体实验.md}、\texttt{docs/8.28写实验代码的情况.md}。
+% \item
+%   调度实现：\texttt{engine/modules/scheduling/}、\texttt{engine/modules/execution/}、\texttt{engine/hooks.py}。
+% \item
+%   可运行示例：\texttt{examples/edge\_cloud\_scheduler/run.py}、\texttt{examples/edge\_cloud\_scheduler/edge\_ollama\_server.py}。
+% \item
+%   回归验证：\texttt{tests/test\_scheduling.py}、\texttt{tests/test\_execution.py}（2026-09-09：21 passed）。
+% \end{itemize}
+

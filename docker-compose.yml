@@ -26,7 +26,9 @@ services:
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/status', timeout=5)"]
+      # OpenAPI is deliberately public; unlike /api/system/status it does not
+      # require an authenticated session, so it is safe for a container probe.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=5)"]
       interval: 15s
       timeout: 8s
       retries: 10

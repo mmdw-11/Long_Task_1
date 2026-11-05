@@ -1,0 +1,26 @@
+% 独立核验入口；正式论文中仍可分别input五个章节文件。
+\documentclass[UTF8,a4paper,12pt,oneside]{ctexbook}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,tabularx,array,graphicx,float}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\CTEXsetup[format={\large\bfseries}]{section}
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{2}
+\setlength{\emergencystretch}{2em}
+\raggedbottom
+\begin{document}
+\setcounter{chapter}{3}
+\input{4.1_TIDE-Anchor.tex}
+\input{4.2_TIDE-Mesh.tex}
+\input{4.3_TIDE-Placement.tex}
+\input{4.4_神经符号协同、动态拓扑与自主恢复闭环.tex}
+\input{4.5_本章小结.tex}
+\begingroup
+\small
+\renewcommand{\baselinestretch}{1.0}\selectfont
+\bibliographystyle{unsrt}
+\bibliography{chapter4_reconstruction_refs}
+\endgroup
+\end{document}

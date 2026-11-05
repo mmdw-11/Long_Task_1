@@ -1,0 +1,91 @@
+% 本文件为论文正文片段：使用 ctexart 时直接 \input{评委部署与使用说明.tex}；
+% 使用 ctexbook/report 时可将 \section 改为 \chapter。
+\section{系统部署与评审使用说明}
+\label{sec:judge-deployment}
+
+为确保评审人员能够在不安装 Python、Node.js、Ollama 或 Hugging Face 模型的条件下复现系统，本项目采用 Docker Compose 封装前端控制台、FastAPI 服务和离线 BGE-M3 路由资产。部署镜像不包含开发者的云端模型密钥；评审人员在系统界面中填入其自行申请且有权限使用的模型服务配置即可完成演示。系统的 BGE-M3 编码器和训练完成的路由分类器随部署资产提供，运行期间不从网络下载模型。
+
+\subsection{交付物与运行条件}
+
+评审压缩包解压后应保持后端目录 \texttt{long\_task\_1} 与前端目录 \texttt{long\_task\_1\_Fronted} 同级，且不得删除表~\ref{tab:judge-assets}列出的离线模型资产。建议在具备至少 8~GB 可用内存和 12~GB 可用磁盘空间的 64 位 Windows、macOS 或 Linux 设备上，使用已启动的 Docker Desktop（或 Docker Engine 与 Compose v2）运行。首次构建需要访问 Docker Hub 以获取 Python、Node.js 和 Nginx 基础镜像；构建完成后的日常启动不需要重新下载 BGE-M3。
+
+\begin{table}[htbp]
+\centering
+\caption{评审压缩包中的关键交付物}
+\label{tab:judge-assets}
+\begin{tabular}{p{0.35\linewidth}p{0.55\linewidth}}
+\toprule
+内容 & 作用 \\
+\midrule
+\texttt{long\_task\_1/docker-compose.yml} & 一键编排后端服务与前端控制台。 \\
+\texttt{long\_task\_1/Dockerfile}、\texttt{requirements-deploy.txt} & 构建包含 Web 服务、BGE-M3 运行依赖及文档解析能力的后端镜像。 \\
+\texttt{long\_task\_1\_Fronted/Dockerfile}、\texttt{nginx.conf} & 构建 React 控制台，并将同源 \texttt{/api} 请求转发到后端。 \\
+\texttt{runs/router\_learning/final\_bge\_m3\_contrastive\_smoke/encoder} & 已训练 BGE-M3 编码器，含 \texttt{model.safetensors} 等离线权重，约 2.13~GiB。 \\
+\texttt{runs/router\_learning/final\_bge\_m3\_contrastive\_smoke/router} & 已训练的端--边--云路由分类器，含 \texttt{classifier.pkl} 和 \texttt{summary.json}。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+上述模型资产默认受 Git 忽略规则保护，因此若以代码仓库方式转交，必须同时附带该模型目录（或通过 Git LFS/独立数据包提供）；仅克隆代码仓库不足以完成离线部署。
+
+\subsection{首次启动步骤}
+
+评审人员在 Docker Desktop 处于运行状态后，进入后端目录 \texttt{long\_task\_1}，依次执行如下命令。Windows PowerShell、macOS Terminal 和 Linux Shell 均可使用相同的 Docker 命令；第一条使用 Python 检查模型资产是否完整。
+
+\begin{verbatim}
+python scripts/verify_deployment_assets.py
+docker compose up --build -d
+docker compose ps
+\end{verbatim}
+
+第一条命令应显示离线模型资产检查通过，并报告 BGE-M3 编码器和路由分类器的大小。第二条命令首次执行时间取决于网络速度和设备性能；待 \texttt{docker compose ps} 显示 \texttt{backend} 为 \texttt{healthy}、\texttt{web} 为 \texttt{running} 后，在浏览器访问 \url{http://localhost:8080}。前端、后端通过容器内部网络通信，评审人员无需访问 \texttt{8000} 端口，也无需另行启动 Python 服务。
+
+如果本机端口 8080 被占用，可在 \texttt{long\_task\_1} 中复制 \texttt{.env.docker.example} 为 \texttt{.env}，并将 \texttt{AGENTFORGE\_PORT} 改为未占用端口，例如 18080；随后访问 \url{http://localhost:18080}。该文件只用于端口和公开地址设置，不保存模型 API Key。
+
+\subsection{账号、模型与功能演示}
+
+首次打开页面后，评审人员可自行注册并登录。随后在左侧导航栏进入``模型连接''，点击``添加模型''，选择服务商预设或``自定义兼容服务''，依次填写连接名称、服务商实际提供的模型 ID、OpenAI 兼容 Base URL 和自己的 API Key，保存后点击``测试''。仅当页面显示``测试成功''时，该连接才可被应用和工作流节点使用；页面不会回显已保存的 API Key。
+
+评审可采用下列任一方式演示模型调用。
+
+\begin{enumerate}
+  \item \textbf{固定模型演示：} 创建 Agent 或工作流节点，在模型下拉框选择一个已测试成功的模型连接，保存后提交任务。该方式只需配置一个可用模型，适合快速体验编排、工具、技能、记忆和运行中心。
+  \item \textbf{端--边--云 AUTO 演示：} 在``模型连接''页面的``自动调度配置''区域，分别为端侧、边侧和云侧选择已测试成功的连接。三个槽位均就绪后，节点模型选择中会启用``AUTO~·~端边云自动调度''。运行时，系统使用镜像内置的 BGE-M3 编码器和分类器进行任务路由，再调用当前层级绑定的用户模型连接。
+\end{enumerate}
+
+建议的最小验收流程为：创建一个固定模型 Agent，提交一段自然语言任务，在``运行中心''查看运行事件和最终输出；随后创建或打开一个工作流，在画布中为节点选择已测试成功的模型并执行。若需核验自动调度，则补全三个 AUTO 槽位后再选择 AUTO 执行。系统会在模型未测试成功、节点未选择模型或 AUTO 三层未就绪时给出界面提示，避免产生无法解释的运行结果。
+
+\subsection{数据保留、更新与故障排查}
+
+平台账户、模型连接、工作流、运行记录和上传资料保存在 Docker 命名卷 \texttt{agentforge\_agentforge\_data} 中。停止系统可执行：
+
+\begin{verbatim}
+docker compose down
+\end{verbatim}
+
+该操作不会删除上述运行数据。代码更新后，在同一目录执行以下命令即可使用新镜像，同时保留已有运行数据：
+
+\begin{verbatim}
+docker compose up --build -d
+\end{verbatim}
+
+除非明确需要清空全部演示数据，否则不得执行 \texttt{docker compose down -v}。表~\ref{tab:judge-troubleshooting}给出常见问题的处理方法。
+
+\begin{table}[htbp]
+\centering
+\caption{常见部署问题与处理方法}
+\label{tab:judge-troubleshooting}
+\begin{tabular}{p{0.32\linewidth}p{0.58\linewidth}}
+\toprule
+现象 & 处理方法 \\
+\midrule
+模型资产校验失败 & 确认压缩包中 \texttt{encoder} 与 \texttt{router} 目录未被遗漏，再重新解压；不要以不含模型资产的纯 Git 克隆替代交付包。 \\
+镜像构建时无法拉取基础镜像 & 检查 Docker Desktop 是否已启动、网络是否可访问 Docker Hub；网络恢复后重复执行 \texttt{docker compose up --build -d}。 \\
+浏览器无法打开页面 & 执行 \texttt{docker compose ps}；若端口冲突，按前述方式修改 \texttt{AGENTFORGE\_PORT}。 \\
+模型连接测试失败 & 核对模型 ID、Base URL（不应包含 \texttt{/chat/completions}）、API Key、账号余额/权限及网络连通性；修改后需再次点击``测试''。 \\
+AUTO 选项未启用 & 端侧、边侧、云侧均须各自绑定一个已启用且测试成功的模型连接；固定模型演示不受该限制。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+该部署方式将环境依赖、离线 BGE-M3 与服务启动过程固化为可复现配置，同时将第三方模型账号与凭据保留给实际评审使用者配置，满足可部署、可启动、可验证和可持续更新的交付要求。
