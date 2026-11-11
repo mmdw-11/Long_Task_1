@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import time
+import uuid
 from typing import Dict, List, Optional
 
 from ._types import (
@@ -23,6 +25,10 @@ from .gate import HeuristicTaskGate, TaskGate
 from .monitor import NoOpResourceMonitor, ResourceMonitor
 from .policy import TrustedWorkspacePolicy
 from .production import load_production_gate
+from .constrained import (
+    BUDGET_KEY, TRAJECTORY_KEY, COSTS, ConstrainedPlacementPolicy,
+    PlacementInfeasible, action_features, budget_for, finite, recalculate_spent,
+)
 
 
 class AdaptiveResourceScheduler(ResourceScheduler):
@@ -40,6 +46,9 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         router_path: Optional[str] = None,
         learned_threshold: float = 0.35,
         strict_router: bool = False,
+        placement_policy: Optional[ConstrainedPlacementPolicy] = None,
+        placement_mode: Optional[str] = None,
+        placement_policy_path: Optional[str] = None,
     ) -> None:
         if gate is not None:
             self.gate = gate
@@ -61,6 +70,18 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         self.allocations: List[ResourceAllocation] = []
         self.traces: List[SchedulingTrace] = []
         self.last_statuses: Dict[ResourceTier, ResourceStatus] = {}
+        self.placement_mode = placement_mode or os.environ.get("PLACEMENT_MODE", "auto")
+        if self.placement_mode not in {"auto", "legacy", "constrained"}:
+            raise ValueError("PLACEMENT_MODE must be auto, legacy or constrained")
+        self.placement_policy = placement_policy
+        self._placement_load_error = ""
+        self._last_placement_context: Dict = {}
+        policy_path = placement_policy_path or os.environ.get("PLACEMENT_POLICY_PATH")
+        if placement_policy is None and policy_path:
+            try:
+                self.placement_policy = ConstrainedPlacementPolicy.load(policy_path)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                self._placement_load_error = type(exc).__name__
 
     @staticmethod
     def default_resources() -> List[ResourceProfile]:
@@ -102,6 +123,7 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         ]
 
     def acquire(self, request: ResourceRequest) -> ResourceAllocation:
+        self._last_placement_context = {}
         self.last_statuses = self.monitor.snapshot(self.resources)
         heuristic_profile = self.trace_gate.evaluate(request)
         profile = self.gate.evaluate(request)
@@ -130,6 +152,13 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         if self.enable_trace:
             allocation.metadata["trace"] = trace.to_dict()
             self.traces.append(trace)
+        if self._last_placement_context:
+            allocation.metadata["placement"] = self._last_placement_context
+            trace.metadata["placement"] = self._last_placement_context
+            if self.enable_trace:
+                allocation.metadata["trace"] = trace.to_dict()
+        elif self._placement_load_error:
+            allocation.metadata["placement_fallback"] = self._placement_load_error
         self.allocations.append(allocation)
         return allocation
 
@@ -144,6 +173,118 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         return bool(profile and profile.available)
 
     def decide(self, request: ResourceRequest, profile: TaskProfile) -> SchedulingDecision:
+        if self.constrained_enabled(request):
+            return self._decide_constrained(request, profile)
+        return self._legacy_decide(request, profile)
+
+    def constrained_enabled(self, request: ResourceRequest) -> bool:
+        mode = request.metadata.get("placement_mode", self.placement_mode)
+        if mode not in {"auto", "legacy", "constrained"}:
+            raise ValueError("unknown placement mode")
+        return mode == "constrained" or (mode == "auto" and self.placement_policy is not None and self.placement_policy.updates > 0)
+
+    def _safe_candidates(self, request, profile):
+        budget = budget_for(request)
+        allowed = request.metadata.get("allowed_tiers")
+        estimates = request.metadata.get("placement_estimates") or {}
+        safe, excluded = [], {}
+        for candidate in self._ordered_candidates(request, profile):
+            reasons = []
+            tier = candidate.tier.value
+            if allowed is not None and tier not in allowed:
+                reasons.append("unauthorized_tier")
+            if not candidate.supports(profile.complexity):
+                reasons.append("insufficient_capability")
+            sensitive = profile.requires_trusted_workspace or self.trusted_policy.is_sensitive(profile.sensitivity)
+            if sensitive and not profile.human_approved and not (candidate.trusted and self.trusted_policy.is_trusted(candidate.tier)):
+                reasons.append("untrusted_workspace")
+            if request.metadata.get("strict_route") and profile.metadata.get("route_tier") and tier != profile.metadata["route_tier"]:
+                reasons.append("strict_route")
+            status = self.last_statuses.get(candidate.tier)
+            estimate = dict(estimates.get(tier) or {})
+            estimate.setdefault("time_ms", status.latency_ms if status and status.latency_ms is not None else candidate.latency_ms)
+            for key, limit in budget["limits"].items():
+                if key not in COSTS:
+                    raise ValueError(f"unknown placement budget: {key}")
+                remaining = finite(limit) - finite(budget["spent"].get(key, 0))
+                if remaining <= 0:
+                    reasons.append(f"{key}_exhausted")
+                elif key == "fee" and ("fee" not in estimate or budget.get("unpriced_call")):
+                    reasons.append("fee_measurement_required")
+                elif key in estimate and (finite(estimate[key]) < 0 or finite(estimate[key]) > remaining):
+                    reasons.append(f"{key}_estimate_exceeds_budget")
+            if reasons:
+                excluded[tier] = reasons
+            else:
+                safe.append(candidate)
+        horizon = int(request.metadata.get("placement_horizon", 128))
+        if horizon < 1 or len(request.state.get(TRAJECTORY_KEY) or []) >= horizon:
+            raise PlacementInfeasible("placement horizon exhausted")
+        if not safe:
+            raise PlacementInfeasible(f"no feasible placement: {excluded}")
+        return safe, excluded, budget
+
+    def _decide_constrained(self, request, profile):
+        safe, excluded, budget = self._safe_candidates(request, profile)
+        features = {candidate.tier.value: action_features(profile, candidate, self.last_statuses.get(candidate.tier), budget) for candidate in safe}
+        model = self.placement_policy
+        sampled = bool(request.metadata.get("placement_sample", False))
+        probabilities = {}
+        reason = "constrained_legacy_fallback"
+        failure = self._placement_load_error
+        if model is not None and (model.updates > 0 or sampled):
+            try:
+                action, probabilities = model.choose(features, sample=sampled)
+                selected = next(candidate for candidate in safe if candidate.tier.value == action)
+                reason = "constrained_actor_critic"
+            except (ValueError, ArithmeticError, StopIteration, RuntimeError, TypeError, KeyError) as exc:
+                failure = type(exc).__name__
+                probabilities = {}
+        if not probabilities:
+            # Same ordering as the previous scheduler, restricted to safe actions.
+            selected = self._select_candidate(safe, profile)
+        self._last_placement_context = {
+            "decision_id": uuid.uuid4().hex,
+            "mode": "constrained", "action": selected.tier.value, "features": features,
+            "probabilities": probabilities, "policy_version": model.version if model is not None else None,
+            "sampled": bool(probabilities) and sampled, "excluded": excluded,
+            "fallback_reason": failure or ("policy_not_trained" if not probabilities else ""),
+            "budget": {"limits": dict(budget["limits"]), "spent": dict(budget["spent"])},
+        }
+        return SchedulingDecision(selected.tier, selected.endpoint, profile, self._model_split(selected.tier, profile), reason=reason)
+
+    def preflight(self, request, allocation):
+        if not allocation.metadata.get("placement"):
+            return
+        self.last_statuses = self.monitor.snapshot(self.resources)
+        safe, _, _ = self._safe_candidates(request, self.gate.evaluate(request))
+        if not any(candidate.tier == allocation.tier and candidate.endpoint == allocation.endpoint for candidate in safe):
+            raise PlacementInfeasible("placement became infeasible before execution")
+
+    def record_outcome(self, request, allocation, result, *, elapsed_ms):
+        context = allocation.metadata.get("placement")
+        if context is None:
+            return
+        budget = budget_for(request)
+        costs = {"time_ms": max(0., finite(elapsed_ms)), "failures": float(not result.success)}
+        fee = result.metadata.get("fee", result.metadata.get("cost"))
+        if fee is not None:
+            costs["fee"] = max(0., finite(fee))
+        elif "fee" in budget["limits"]:
+            budget["unpriced_call"] = True
+        budget.setdefault("base_spent", dict(budget["spent"]))
+        now_ms = time.time() * 1000.
+        budget.setdefault("charges", {})[context["decision_id"]] = {"costs": costs, "interval": [now_ms - costs["time_ms"], now_ms]}
+        recalculate_spent(budget)
+        record = {**context, "costs": costs, "success": result.success, "reward": None,
+                  "costs_complete": "fee" in costs or "fee" not in budget["limits"],
+                  "terminal": False}
+        # Success of the transport is not a semantic quality reward. A trusted
+        # evaluation caller supplies reward and terminal status before training.
+        request.state.setdefault(TRAJECTORY_KEY, []).append(record)
+        result.metadata["placement_feedback"] = record
+
+    def _legacy_decide(self, request: ResourceRequest, profile: TaskProfile) -> SchedulingDecision:
         candidates = self._ordered_candidates(request, profile)
         selected = self._select_candidate(candidates, profile)
         requires_review = self._requires_review(selected.tier, profile)

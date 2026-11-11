@@ -33,6 +33,7 @@ from .failure import (
 )
 from .hooks import ExecutionHook, NodeContext
 from .modules.communication import COMMUNICATION_STATE_KEY
+from .modules.scheduling.constrained import BUDGET_KEY, TRAJECTORY_KEY, merge_budget, merge_trajectory
 from .modules.reasoning import COMPLETED_SUBTASKS_KEY, PLAN_IR_KEY, PLAN_REVISIONS_KEY, PLAN_VALIDATION_KEY
 from .modules.context import (
     CONTEXT_INJECTION_KEY,
@@ -93,6 +94,8 @@ class StateGraph:
 
     def __init__(self, schema: Optional[Dict[str, Reducer]] = None) -> None:
         self.schema: Dict[str, Reducer] = dict(schema or {})
+        self.schema.setdefault(BUDGET_KEY, merge_budget)
+        self.schema.setdefault(TRAJECTORY_KEY, merge_trajectory)
         self.nodes: Dict[str, Node] = {}
         # 静态边：source -> [target, ...]
         self.edges: Dict[str, List[str]] = {}
@@ -319,6 +322,9 @@ class CompiledGraph:
             if not isinstance(checkpoint, GraphCheckpoint):
                 raise GraphExecutionError("resume_from requires GraphCheckpoint or checkpoint id with store")
             state = GraphState(self._builder.schema, checkpoint.state)
+            restored_state = state.snapshot()
+            self.hooks.restore_checkpoint(restored_state)
+            state.update(restored_state)
             frontier = self._normalize_targets(checkpoint.frontier)
             step = int(checkpoint.step)
             run_id = checkpoint.run_id
@@ -389,6 +395,10 @@ class CompiledGraph:
             executed_ok: List[str] = []
             recovery_targets: List[str] = []
             for name, update, error in results:
+                # Actual inference charges survive failed output validation and
+                # recovery; costs are not contingent on accepting the answer.
+                if isinstance(update, dict):
+                    state.update({key: update[key] for key in (BUDGET_KEY, TRAJECTORY_KEY) if key in update})
                 if error is not None:
                     err_ctx = NodeContext(
                         node=name,
@@ -552,15 +562,17 @@ class CompiledGraph:
             state=snapshot,
             metadata=dict(self.nodes[name].metadata),
         )
-        allocation = self.hooks.acquire_resource(ctx)
+        allocation = None
         try:
+            allocation = self.hooks.acquire_resource(ctx)
             await self.hooks.before_node_invoke(ctx)
             invocation = self.nodes[name].invoke(ctx.state)
             timeout = float(ctx.metadata.get("timeout_seconds") or 0)
             update = await asyncio.wait_for(invocation, timeout=timeout) if timeout > 0 else await invocation
             return name, update, None
         except Exception as exc:  # noqa: BLE001 - 交由恢复策略处理
-            return name, None, exc
+            charges = {key: ctx.state[key] for key in (BUDGET_KEY, TRAJECTORY_KEY) if key in ctx.state}
+            return name, charges or None, exc
         finally:
             self.hooks.release_resource(ctx, allocation)
 

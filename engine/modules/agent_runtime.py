@@ -21,7 +21,8 @@ from ..modules.execution import EdgeHttpExecutor, ExecutorRegistry, InferenceReq
 from ..modules.model_connections import ModelConnectionStore, connection_api_key
 from ..modules.mcp_integration import MCPConfigStore
 from ..modules.product_ops import ToolCatalogStore
-from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity
+from ..modules.scheduling import AdaptiveResourceScheduler, ResourceProfile, ResourceRequest, ResourceScheduler, ResourceTier, TaskComplexity, MutableResourceMonitor
+from ..modules.scheduling.constrained import BUDGET_KEY, TRAJECTORY_KEY
 from ..modules.tools import MCPAuthorizationStore, ToolRuntime, decode_tool_arguments, tool_function_schema
 from ..modules.workspace_tools import WorkspaceStore
 from .knowledge import KnowledgeStore
@@ -146,6 +147,7 @@ class AgentRuntimeFactory:
                 result.text = f"计算结果是 {rendered}。"
                 result.metadata = {**result.metadata, "answer_from_tool": "calculator"}
             return {
+                **{key: state[key] for key in (BUDGET_KEY, TRAJECTORY_KEY) if key in state},
                 "input": result.text,
                 spec.name: result.text,
                 "__runtime_tool_calls__": tool_calls,
@@ -905,7 +907,35 @@ class AgentRuntimeFactory:
             missing = "、".join(label for tier, label in (("device", "端"), ("edge", "边"), ("cloud", "云")) if not status["tiers"][tier]["ready"])
             return InferenceResult(text="", executor="AutoModelConnectionExecutor", endpoint="", success=False, error=f"AUTO 尚未就绪：{missing}模型未配置可用的默认连接", retryable=False, metadata={"auto_status": status})
         strict_route = bool(request.metadata.get("strict_route"))
-        allocation = self._connection_scheduler(self.model_connections, strict_router=strict_route).acquire(request)
+        scheduler = self._connection_scheduler(self.model_connections, strict_router=strict_route)
+        if scheduler.constrained_enabled(request):
+            scheduler.monitor = MutableResourceMonitor()
+            factory = self
+
+            class ConnectionExecutor:
+                def run(self, inference):
+                    tier = inference.allocation["tier"]
+                    connection = factory.model_connections.default_for_tier(tier)
+                    if connection is None:
+                        return InferenceResult(text="", executor="placement", endpoint="", success=False, error="default model connection unavailable")
+                    result = factory._run_pinned_model(connection.id, inference.prompt, inference.system_prompt)
+                    if not result.success and any(token in (result.error or "").lower() for token in ("429", "rate limit", "timeout", "timed out", "503", "502", "504", "connection")):
+                        result.retryable = True
+                    return result
+
+            executor = ConnectionExecutor()
+            result = ResilientInferenceRunner(scheduler=scheduler,
+                registry=ExecutorRegistry({tier: executor for tier in ResourceTier}),
+                max_attempts=self.max_attempts).run(resource_request=request, prompt=prompt, system_prompt=system_prompt)
+            attempts = result.metadata.get("attempts") or []
+            first = attempts[0]["allocation"] if attempts else {}
+            last = attempts[-1]["allocation"] if attempts else {}
+            result.metadata.update({"mode": "auto", "strict_route": strict_route,
+                "selected_tier": first.get("tier"), "actual_tier": last.get("tier") if result.success else None,
+                "allocation": last, "fallback": len(attempts) > 1,
+                "route_reason": (last.get("metadata") or {}).get("reason", "")})
+            return result
+        allocation = scheduler.acquire(request)
         selected_tier = allocation.tier.value
         preference = [selected_tier] if strict_route else [selected_tier] + [tier.value for tier in request.tier_preference if tier.value != selected_tier]
         decision = allocation.metadata.get("decision") or {}

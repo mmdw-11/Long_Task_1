@@ -89,6 +89,15 @@ class RuleEvaluator(Evaluator):
             path = Path(raw_path)
             if not path.exists():
                 findings.append(f"required file does not exist: {raw_path}")
+        # Evidence is supplied by a trusted verifier in the pre-execution state;
+        # a node's own output or self-reported confidence cannot approve itself.
+        registry = state.get("__external_evidence__") or {}
+        for evidence_id in _list_value(metadata.get("required_evidence_ids")):
+            evidence = registry.get(evidence_id) if isinstance(registry, dict) else None
+            if not isinstance(evidence, dict) or evidence.get("verified") is not True or evidence.get("status", "active") != "active":
+                findings.append(f"missing or unverified external evidence: {evidence_id}")
+            elif evidence.get("plan_revision") is not None and evidence["plan_revision"] != (state.get("__plan_ir__") or {}).get("revision"):
+                findings.append(f"stale external evidence: {evidence_id}")
         action = ValidationFailureAction(str(metadata.get("validation_failure_action") or "pause"))
         targets = _list_value(metadata.get("validation_failure_targets"))
         return EvaluationResult(

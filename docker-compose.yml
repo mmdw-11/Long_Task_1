@@ -21,6 +21,10 @@ services:
       SKILL_EMBEDDING_MODEL: bge-m3
       ROUTER_MODEL_BACKEND: bge_m3
       ROUTER_MODEL_PATH: /app/model_assets/bge-router
+      # Learned constrained placement; without a trained policy use the old
+      # resource ordering inside the same hard-feasible action set.
+      PLACEMENT_MODE: ${PLACEMENT_MODE:-constrained}
+      PLACEMENT_POLICY_PATH: ${PLACEMENT_POLICY_PATH:-}
     volumes:
       - agentforge_data:/app/runs
     expose:
