@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import re
 import time
+import os
+import uuid
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -70,13 +73,50 @@ class ContextLedgerStore:
     def save(self, ledger: ContextLedger) -> None:
         TodoManager(ledger).ensure_initialized()
         ledger.touch()
+        ledger.state_revision += 1
         path = self.path_for(ledger.run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(ledger.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            temporary.write_text(json.dumps(ledger.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
         self.renderer.write_markdown(ledger, self.memory_path_for(ledger.run_id))
+
+    def invalidate_fact(self, run_id: str, fact_id: str, *, reason: str) -> ContextLedger:
+        """Revoke a known fact; callers route affected work through normal repair paths."""
+        ledger = self.load_or_create(run_id)
+        matches = [fact for fact in ledger.key_facts if fact.fact_id == fact_id]
+        if not fact_id or not matches:
+            raise KeyError(fact_id)
+        for fact in matches:
+            fact.status = "revoked"
+            fact.verified = False
+            label = f"{fact.step}:{fact.node}"
+            ledger.accepted_steps = [item for item in ledger.accepted_steps if item != label]
+        ledger.failure_summaries.append(FailureSummary(
+            node=matches[0].node, step=matches[0].step, error_type="EvidenceRevoked",
+            message=reason, recoverable=True,
+        ))
+        self.save(ledger)
+        return ledger
+
+    def restore_view(self, snapshot: Dict[str, Any]) -> ContextLedger:
+        """Restore the graph's Context Ledger, retaining newer constraints/revocations."""
+        restored = ContextLedger.from_dict(snapshot)
+        if self.path_for(restored.run_id).exists():
+            current = self.load_or_create(restored.run_id)
+            if current.state_revision > restored.state_revision:
+                restored.hard_constraints = list(current.hard_constraints)
+                revoked = {fact.fact_id for fact in current.key_facts if fact.fact_id and fact.status == "revoked"}
+                for fact in restored.key_facts:
+                    if fact.fact_id in revoked:
+                        fact.status, fact.verified = "revoked", False
+                        restored.accepted_steps = [item for item in restored.accepted_steps if item != f"{fact.step}:{fact.node}"]
+                restored.state_revision = current.state_revision
+        self.save(restored)
+        return restored
 
     def path_for(self, run_id: str) -> Path:
         return self.root_dir / _safe_id(run_id) / "ledger.json"
@@ -115,6 +155,8 @@ class ContextLedgerStore:
     ) -> ContextLedger:
         ledger = self.load_or_create(run_id, state)
         TodoManager(ledger).ensure_initialized()
+        if "hard_constraints" in state:
+            ledger.hard_constraints = _coerce_str_list(state["hard_constraints"])
         ledger.next_action = f"step {step}: execute {', '.join(frontier)}"
         existing_pending = set(ledger.pending_steps)
         for node in frontier:
@@ -133,14 +175,19 @@ class ContextLedgerStore:
         update: Optional[Dict[str, Any]],
         state: Dict[str, Any],
         verified: bool = False,
+        accepted: Optional[bool] = None,
     ) -> ContextLedger:
         ledger = self.load_or_create(run_id, state)
         TodoManager(ledger).ensure_initialized()
         label = f"{step}:{node}"
+        # Preserve completed_steps as the historical execution-attempt ledger.
+        # Admission is separate, so existing UI/progress consumers keep working.
         if label not in ledger.completed_steps:
             ledger.completed_steps.append(label)
         if label in ledger.pending_steps:
             ledger.pending_steps.remove(label)
+        if (accepted is True or (accepted is None and verified)) and label not in ledger.accepted_steps:
+            ledger.accepted_steps.append(label)
 
         if update:
             compressed = self.compressor.compress_update(
@@ -163,6 +210,7 @@ class ContextLedgerStore:
                             verified=verified,
                             node=node,
                             step=step,
+                            fact_id=hashlib.sha256(f"{run_id}:{node}:{step}:{summary_text}".encode()).hexdigest()[:24],
                         )
                     ],
                     token_count_raw=int(compressed["token_count_raw"]),
@@ -228,6 +276,7 @@ class ContextLedgerStore:
 
     def _trim(self, ledger: ContextLedger) -> None:
         ledger.completed_steps = ledger.completed_steps[-self.max_completed_steps :]
+        ledger.accepted_steps = ledger.accepted_steps[-self.max_completed_steps :]
         ledger.pending_steps = ledger.pending_steps[-self.max_completed_steps :]
         ledger.key_facts = ledger.key_facts[-self.max_key_facts :]
         ledger.tool_summaries = ledger.tool_summaries[-self.max_tool_summaries :]

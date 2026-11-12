@@ -37,9 +37,13 @@ class DeterministicCapsuleCompressor(CapsuleCompressor):
             value = getattr(result, field_name)
             if len(value) > limit: setattr(result, field_name, value[: limit - 1] + "…")
         for evidence in result.evidence:
-            if len(evidence.content) > 240: evidence.content = evidence.content[:239] + "…"
-        while rough_tokens(result.to_dict()) > max_tokens and len(result.evidence) > 1:
-            result.evidence.pop()
+            if evidence.uri and len(evidence.content) > 240:
+                evidence.content = evidence.content[:239] + "…"
+        # Keep every source reference. Without an accessible raw reference the
+        # evidence body itself is protected, even if the target budget is exceeded.
+        for evidence in reversed(result.evidence):
+            if rough_tokens(result.to_dict()) > max_tokens and evidence.uri:
+                evidence.content = ""
         result.budget.original_tokens = original
         result.budget.compressed_tokens = rough_tokens(result.to_dict())
         result.budget.used_tokens = result.budget.compressed_tokens

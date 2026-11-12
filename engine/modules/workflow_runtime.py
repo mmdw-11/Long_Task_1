@@ -25,6 +25,15 @@ from .workflow_scripts import run_workflow_script
 from .workspace_tools import WorkspaceStore
 
 
+class TeamExecutionError(RuntimeError):
+    """All selected team members failed after the supervisor began execution."""
+
+    def __init__(self, events: list[Dict[str, Any]], results: list[Dict[str, Any]]) -> None:
+        super().__init__("动态智能体团队的所有成员均执行失败")
+        self.events = events
+        self.results = results
+
+
 class WorkflowNodeRuntimeFactory:
     """Dispatch persisted ``config.node_kind`` values to executable nodes."""
 
@@ -522,12 +531,17 @@ class WorkflowNodeRuntimeFactory:
         if mode == "fixed_sparse":
             fixed = [item for item in assessments if item["member"].id in fixed_ids]
             selected = fixed[:max_parallel] or ranked[: max(1, min(len(ranked), requested, max_parallel))]
+        elif mode in {"hybrid_selector", "capability_cover"} and current_todo.get("required_capabilities"):
+            selected = self._select_complementary(
+                ranked, profiles, list(current_todo["required_capabilities"]),
+                max(1, min(len(ranked), requested, max_parallel)),
+            )
         else:
             selected = ranked[: max(1, min(len(ranked), requested, max_parallel))]
         events: list[Dict[str, Any]] = [
             {"type": "team_started", "team": team.name, "team_id": team.id, "member_count": len(enabled), "eligible_member_count": len(viable), "mode": mode},
             {"type": "candidate_filtered", "team": team.name, "candidates": [self._assessment_event(item) for item in assessments]},
-            {"type": "topology_reconfigured", "team": team.name, "active_members": [item["member"].name for item in selected], "edge_ttl": int((config.get("topology") or {}).get("edge_ttl") or 1), "reason": "resource_aware_multi_metric_routing"},
+            {"type": "topology_reconfigured", "team": team.name, "active_members": [item["member"].name for item in selected], "edge_ttl": int((config.get("topology") or {}).get("edge_ttl") or 1), "reason": "capability_complementarity" if any("marginal_capability_gain" in item["breakdown"] for item in selected) else "resource_aware_multi_metric_routing", "edges": [{"source": team.id, "target": item["member"].id, "kind": "delegation", "task_id": current_todo.get("id"), "task_revision": current_todo.get("revision", 0)} for item in selected]},
         ]
         for item in selected:
             events.append({"type": "delegation_selected", "team": team.name, "source": team.name, "target": item["member"].name, "target_id": item["member"].id, "reason": "resource_aware_score", "score": round(item["score"], 4), "score_breakdown": item["breakdown"], "temporary": True})
@@ -554,7 +568,9 @@ class WorkflowNodeRuntimeFactory:
                     events.append({"type": "topology_experiment_event", "team": team.name, "node": member.name, "member_id": member.id, "event": experiment_event["audit"]})
                 if experiment_event and experiment_event["kind"] == "failure":
                     events.append({"type": "topology_experiment_event", "team": team.name, "node": member.name, "member_id": member.id, "event": experiment_event["audit"]})
-                    raise RuntimeError(experiment_event["audit"]["reason"])
+                    error = experiment_event["audit"]["reason"]
+                    events.append({"type": "team_member_failed", "team": team.name, "node": member.name, "member_id": member.id, "parent_node_id": team.id, "error": error, "latency_ms": round((time.perf_counter() - started) * 1000, 1)})
+                    return {"member_id": member.id, "member": member.name, "status": "failed", "error": error, "update": update}
                 events.append({"type": "team_member_completed", "team": team.name, "node": member.name, "member_id": member.id, "parent_node_id": team.id, "latency_ms": round((time.perf_counter() - started) * 1000, 1)})
                 events.append({"type": "goal_checked", "team": team.name, "node": member.name, "member_id": member.id, "complete": not bool(handoff), "reason": "handoff_requested" if handoff else "member_reported_completion"})
                 return {"member_id": member.id, "member": member.name, "status": "succeeded", "output": output, "update": update, "handoff": handoff}
@@ -576,7 +592,11 @@ class WorkflowNodeRuntimeFactory:
         # Handoff is intentionally sequential.  A completed member can ask for
         # a new capability; the supervisor re-scores eligible members instead
         # of trusting a raw target name returned by the model.
-        max_handoffs = max(0, min(8, int(delegation.get("max_handoffs") or 3)))
+        handoff_limit = delegation.get("max_handoffs")
+        max_handoffs = (
+            max(0, min(8, int(3 if handoff_limit is None else handoff_limit)))
+            if delegation.get("allow_handoff", True) else 0
+        )
         for _ in range(max_handoffs):
             origin = next((item for item in reversed(results) if item.get("handoff")), None)
             if origin is None:
@@ -605,7 +625,7 @@ class WorkflowNodeRuntimeFactory:
             output = "\n\n".join(f"[{item['member']}] {item['output']}" for item in successful)
         events.append({"type": "team_aggregated", "team": team.name, "mode": aggregate_mode, "success_count": len(successful), "failure_count": len(results) - len(successful)})
         if not successful:
-            raise RuntimeError("动态智能体团队的所有成员均执行失败")
+            raise TeamExecutionError(events, results)
         return {
             str(config.get("output_field") or "team_result"): output,
             "team_results": results,
@@ -659,6 +679,27 @@ class WorkflowNodeRuntimeFactory:
         weights = _routing_weights(team_config.get("routing") or {})
         score = (weights["semantic_similarity"] * semantic + weights["prompt_task_match"] * prompt_match + weights["historical_success"] * history + weights["tool_availability"] * tool["coverage"] + weights["skill_availability"] * skill["coverage"] + weights["knowledge_availability"] * knowledge["coverage"] - weights["cost"] * cost - weights["latency"] * latency - weights["failure_risk"] * risk + float(profile.get("priority") or 0) * .01)
         return {"member": member, "eligible": not excluded, "excluded_reasons": excluded, "score": score, "breakdown": {"semantic_similarity": round(semantic, 4), "prompt_task_match": round(prompt_match, 4), "historical_success": round(history, 4), "tool_availability": round(tool["coverage"], 4), "skill_availability": round(skill["coverage"], 4), "knowledge_availability": round(knowledge["coverage"], 4), "normalized_cost": round(cost, 4), "normalized_latency": round(latency, 4), "failure_risk": round(risk, 4), "priority_bonus": round(float(profile.get("priority") or 0) * .01, 4), "resources": {"tools": tool, "skills": skill, "knowledge_bases": knowledge}}}
+
+    @staticmethod
+    def _select_complementary(ranked, profiles, capabilities, count):
+        """Greedy coverage within the existing hard-filtered candidate set."""
+        required = list(dict.fromkeys(str(value).lower().strip() for value in capabilities if str(value).strip()))
+        covered = [0.0] * len(required)
+        remaining, selected = list(ranked), []
+        while remaining and len(selected) < count:
+            options = []
+            for item in remaining:
+                member = item["member"]
+                text = " ".join([member.name, member.description, *map(str, (profiles.get(member.id) or {}).get("capabilities") or [])]).lower()
+                coverage = [1.0 if capability in text else max(0.0, _semantic_similarity(capability, text)) for capability in required]
+                gain = sum(max(0.0, value - covered[index]) for index, value in enumerate(coverage)) / max(1, len(required))
+                options.append((.65 * gain + .35 * item["score"], gain, item, coverage))
+            _, gain, chosen, coverage = max(options, key=lambda option: option[0])
+            chosen = {**chosen, "breakdown": {**chosen["breakdown"], "marginal_capability_gain": round(gain, 4)}}
+            selected.append(chosen)
+            remaining = [item for item in remaining if item["member"].id != chosen["member"].id]
+            covered = [max(old, new) for old, new in zip(covered, coverage)]
+        return selected
 
     @staticmethod
     def _assessment_event(item: Dict[str, Any]) -> Dict[str, Any]:

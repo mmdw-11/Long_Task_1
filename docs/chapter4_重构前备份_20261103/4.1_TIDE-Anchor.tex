@@ -1,0 +1,542 @@
+% 第4章 详细设计与实现
+\chapter{TIDE-Swarm详细设计与实现}
+在第三章总体架构的基础上，本章介绍TIDE-Anchor上下文连续性与记忆保持、TIDE-Mesh动态异构协作与低熵通信、TIDE-Placement端边云推理调度三项核心机制，说明其状态模型、运行过程与核心算法，并分析计算与通信开销。三项机制通过任务状态和执行反馈衔接，共同支撑长程任务的持续推进与异常恢复。
+
+面向赛题提出的上下文连续性、动态异构拓扑、低熵通信、神经符号协同推理与端边云调度要求，本文以\textbf{语义生成、显式校验、受控执行和证据反馈}组织长程协作。神经侧通过大模型理解自然语言意图、生成任务计划与阶段结果，并在配置质量评审模型时提供语义判断；符号侧将任务目标、依赖、资源需求和验收条件组织为结构化状态，以计划校验、资源硬过滤、消息字段保护和质量规则约束执行。两侧通过计划中间表示、反例、任务账本与结构化消息交换信息，使推理建议转化为可检查、可修订的执行依据。
+
+三项机制在这一闭环中分别回答“依据什么继续推理”“由哪些成员协作”“在哪类资源上执行”。TIDE-Anchor提供稳定目标与可追溯证据，TIDE-Mesh依据当前任务、能力需求和失败反馈生成稀疏的活跃协作关系，TIDE-Placement依据实时性、敏感度和资源状态安排任务阶段。\textbf{神经符号协同贯穿三项机制的决策接口}：语义判断提出候选，显式规则限定可行范围，运行结果再更新计划、成员选择和资源分配。第\ref{sec:mechanism_coordination}节进一步说明计划校验、动态拓扑与分级恢复如何衔接，并给出可观测的评价口径。
+
+
+% 4.1 超长程上下文连续性与记忆保持--------------------------
+%     4.1.1 问题定义与设计目标
+%     4.1.2 上下文账本与稳定任务锚点
+%     4.1.3 分层记忆、作用域与原文归档
+%     4.1.4 混合检索与按需证据唤醒
+%     4.1.5 上下文压缩与预算控制
+%     4.1.6 目标漂移检测与检查点恢复
+%     4.1.7 核心算法伪代码与复杂度分析
+
+\section{TIDE-Anchor超长程上下文连续性与记忆保持}
+\label{sec:tide_anchor}
+
+\subsection{问题定义与设计目标}
+
+% \paragraph{从``更长 Prompt''到``可治理状态''}
+长程任务需要持续维护原始目标、执行约束、关键事实、计划进度和工具结果，并在中断后恢复执行位置。若将全部历史直接拼入上下文，过程日志可能淹没早期目标；若仅保留短摘要，又可能遗漏数值、时间更新和证据关系。执行中断后，缺少显式状态还会使任务进度难以核对。
+
+本文将\textbf{上下文连续性}定义为：
+在有限输入预算下，为每个节点重建与当前决策相关、
+来源可追溯的任务信息，并为异常后的目标、约束、
+进度和证据恢复提供依据。
+
+TIDE-Anchor围绕这一目标，将任务信息组织为两条相互配合的路径：
+一条通过上下文账本稳定提供目标、约束和执行进度，
+另一条通过分层记忆按需提供历史证据。
+摘要与原文引用支持信息压缩和证据回溯，
+预算检查、漂移检测与检查点则将上下文管理接入执行过程。
+
+% 设第 \(s\) 步的节点可见上下文为 \(C_s\)，有效输入预算为 \(B_{in}\)，则系统希望构造：
+
+% \[
+% C_s=\operatorname{Assemble}(L_s,I_s,E_s),\qquad \operatorname{Tok}(C_s)\le B_{in}.
+% \]
+
+% 其中，\(L_s\) 是稳定的 Context Ledger，\(I_s\) 是当前节点输入，\(E_s\) 是按需唤醒的历史证据。这里的核心是让``任务骨架''始终可见，让``历史细节''仅在需要时出现。
+
+
+设第$s$步的节点上下文为$C_s$，其组织方式可表示为：
+\begin{equation}
+    C_s=A(L_s)\oplus I_s\oplus E_s\oplus O_s,
+    \label{eq:anchor_context}
+\end{equation}
+其中，$A(L_s)$为上下文账本生成的任务锚点，$I_s$为当前输入，$E_s$为唤醒的历史证据，$O_s$为节点角色与输出约束，$\oplus$表示上下文组合。
+
+式~\eqref{eq:anchor_context}体现了本机制的核心设计：
+\textbf{将任务信息的稳定供给与历史证据的选择性供给分开组织}。目标与约束不依赖检索是否命中，历史细节则根据当前需求进入上下文，从而兼顾任务连续性与信息开销。
+
+
+% \begin{quote}
+% 【图片占位：图 1 超长程任务的上下文失效与解决路径。左侧为全量历史拼接导致窗口膨胀、目标稀释和中断失忆；右侧为 Ledger、Memory、Archive、Budget/Drift/Checkpoint 形成的闭环。】
+% \end{quote}
+
+% \paragraph{设计目标}
+
+% \begin{longtable}[]{@{}lll@{}}
+% \toprule
+% 目标 & 设计机制 & 节点层面的可观察结果 \\
+% \midrule
+% \endhead
+% 目标不漂移 & 原始目标、硬约束和当前 TODO 稳定注入 & 每一轮均可重锚定任务意图 \\
+% 历史可用不过载 & 分层记忆、摘要索引、原文按需展开 & 上下文随相关证据增长，而非随全部历史增长 \\
+% 事实可追溯 & \texttt{summary} 与 \texttt{raw\_ref} 双轨保存 & 摘要可回到原始会话、工具输出或归档 \\
+% 预算可治理 & BudgetController 和有效输入上限 & 超限时显式暂停并留下原因 \\
+% 中断可恢复 & Context/Graph Checkpoint & 恢复外部状态而非让模型猜进度 \\
+% \bottomrule
+% \end{longtable}
+
+% 本章不把``答案字符串在历史中出现''直接视为 QA 正确率，也不把确定性构造场景的治理通过率写成真实 LLM Agent 的端到端成功率。第 5、6 节将严格区分这。
+
+% \paragraph{实验三的核心结论}
+
+% 当前工程已经实现账本、预算控制、漂移检测、上下文压缩归档、四层记忆作用域、分级唤醒和检查点，并通过 Hook 生命周期接入图执行。新版实验三在 100 条 LoCoMo 多轮任务上验证了该闭环：Ours Full 的 Goal Retention 为 0.90、Constraint 为 0.85、Drift Rate 为 0.10、Recovery 为 0.91、Budget Violation 为 0.00，且 Avg Context Tokens 为 954。
+
+% 在记忆证据层面，Ours Full 的 Gold Recall@5 为 0.65、Evidence Sufficiency 为 0.63、Memory Use Accuracy 为 0.40。由此说明，系统能够将任务骨架、历史证据和恢复状态外部化，并在多轮扰动条件下按需重建受控上下文。
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsection{稳定任务供给：Context Ledger 与任务锚点}
+
+
+系统将任务信息划分为四类，分别承担状态维护、历史检索、证据回溯和执行恢复职责，如表~\ref{tab:anchor_state_objects}所示。
+
+
+% \begin{longtable}[]{@{}llll@{}}
+% \toprule
+% 状态对象 & 回答的问题 & 核心内容 & 生命周期 \\
+% \midrule
+% \endhead
+% Context Ledger & 现在要做什么、做到哪里 & 原始目标、约束、计划、TODO、事实、失败、预算、下一动作 & 单次 run \\
+% Memory Store & 哪些历史与当前问题相关 & 带作用域、标签、时间和重要度的记忆项及索引 & 节点至跨项目 \\
+% Cold Archive & 原始证据在哪里 & 会话片段、节点输出、工具返回等完整载荷 & 可长期保留 \\
+% Checkpoint & 中断后从何处继续 & 账本快照、归档引用、前沿节点、图状态 & 单次 run，可持久化 \\
+% \bottomrule
+% \end{longtable}
+
+\begin{table}[htbp]
+    \centering
+    \caption{TIDE-Anchor的外部状态组成}
+    \label{tab:anchor_state_objects}
+    \begin{tabular}{p{0.20\textwidth}p{0.29\textwidth}p{0.40\textwidth}}
+        \toprule
+        状态对象 & 主要职责 & 核心内容 \\
+        \midrule
+        Context Ledger
+        & 维护当前任务状态
+        & 目标、约束、计划、待办、事实与失败摘要 \\
+        Memory Store
+        & 检索相关历史
+        & 带作用域、时间、标签和重要度的记忆项 \\
+        Cold Archive
+        & 保留原始证据
+        & 会话片段、节点输出与工具返回的原始内容 \\
+        Checkpoint
+        & 支持中断恢复
+        & 上下文快照，以及独立保存的图状态与执行前沿 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+这种划分使不同信息采用适合其职责的管理方式：目标与进度稳定保存，历史内容按需检索，长结果通过归档保留，恢复位置由检查点记录。系统因此能够明确哪些内容需要持续可见、哪些可以压缩，以及哪些应在恢复时重新读取。
+
+\paragraph{Context Ledger：稳定任务锚点}
+
+\texttt{ContextLedger}是单次运行的上下文骨架，保存原始目标、硬性约束、当前计划、已完成与待完成步骤、待办项及修订事件、关键事实、开放问题、工具与失败摘要、预算和下一动作。
+
+节点执行前，系统从账本中提取目标、约束、当前待办、已验证事实与待核验假设，并结合节点角色和输出要求构造注入内容。即使历史检索未命中，节点仍可获得基本任务信息。
+
+账本中的事实保留来源与验证状态，
+便于区分已经确认的结果和仍需核验的假设。
+
+
+% \begin{verbatim}
+% [Stable Task Anchor]
+% Original Goal / Hard Constraints
+% Current Node Role and Step Objective
+% Completed and Pending Todos
+% Verified Facts / Things Not To Assume
+% Expected Output Contract / Budget / Next Action
+% \end{verbatim}
+
+% 账本的职责是保证``模型即使没有命中任何历史记忆，仍不会忘记任务是什么''。检索层只补充当前决策所需的历史细节，不能取代账本。
+
+\paragraph{四层作用域与多介质记忆}
+
+记忆按范围由窄到宽划分为四个作用域：WORKING、TASK、PROJECT、GLOBAL，通过相应标识限定读取范围。各作用域的内容与使用范围见表~\ref{tab:anchor_memory_scopes}。
+
+\begin{table}[htbp]
+    \centering
+    \caption{记忆作用域及其使用范围}
+    \label{tab:anchor_memory_scopes}
+    \begin{tabular}{p{0.18\textwidth}p{0.37\textwidth}p{0.34\textwidth}}
+        \toprule
+        作用域 & 典型内容 & 使用范围 \\
+        \midrule
+        WORKING & 当前节点草稿、局部中间量 & 当前节点 \\
+        TASK & 当前任务的中间结论与执行反馈 & 单次运行 \\
+        PROJECT & 项目历史结论与共享资料 & 同项目跨运行 \\
+        GLOBAL & 通用、稳定的知识 & 按配置跨项目使用 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+作用域与存储介质是两个独立维度。HOT提供进程内读取，WARM提供可选缓存，STRUCTURED保存结构化数据，SEMANTIC支持向量检索，COLD保存原文归档。记忆项根据配置写入相应介质，
+不要求每个作用域固定对应一种存储方式。
+
+如图~\ref{fig:anchor_memory}所示，
+账本与历史记忆分别提供任务锚点和相关证据，
+共同构成节点上下文。
+\textbf{作用域负责限定信息来源，存储介质负责承载信息，
+账本负责维持当前任务方向}，
+三者分工使历史复用与任务状态维护能够相互配合。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/任务状态与历史证据的分离管理-newnew.pdf}
+    \caption{TIDE-Anchor任务状态与历史证据的分离管理}
+    \label{fig:anchor_memory}
+\end{figure}
+
+
+% \begin{quote}
+% 【图片占位：图 2 任务状态与分层记忆。中心画 Context Ledger；外圈依次为 WORKING、TASK、PROJECT、GLOBAL；每一层映射到 HOT/WARM/STRUCTURED/SEMANTIC/COLD。用箭头显示 \texttt{summary} 与 \texttt{raw\_ref} 的双轨关系。】
+% \end{quote}
+
+\subsection{选择性证据供给：双轨保存与分级唤醒}
+
+\paragraph{摘要与原文双轨保存}
+
+对于较长的节点输出和工具结果，
+系统保留摘要与原文引用，
+避免在后续调用中反复传入完整内容。
+其处理过程包括：
+\begin{enumerate}
+    \item 提取结果摘要、关键事实、标签和失败原因；
+    \item 将需要归档的原始输出保存到冷存储，
+          并记录\texttt{raw\_ref}；
+    \item 按配置建立记忆索引，供后续节点检索；
+    \item 根据当前任务与节点输入召回相关记忆；
+    \item 按唤醒策略读取摘要或展开原文。
+\end{enumerate}
+
+图~\ref{fig:anchor_memory}中的“摘要与来源---原文归档”连接体现了这一关系。
+\textbf{摘要承担信息定位，原文承担证据核验}：
+节点可以先使用简短内容完成判断，在需要核对关键数值、事实更新或来源细节时回查原文。这一设计保留了压缩后的回溯入口，减少摘要遗漏对后续执行的不可逆影响。
+
+\paragraph{分级唤醒策略}
+
+系统提供四种预设唤醒配置，
+控制检索范围、返回数量和归档展开方式，
+如表~\ref{tab:anchor_wakeup_profiles}所示。
+
+% \begin{longtable}[]{@{}lllrl@{}}
+% \toprule
+% 等级 & 适用场景 & 作用域 & Top-K & 检索与归档策略 \\
+% \midrule
+% \endhead
+% Silent & 低风险局部步骤 & WORKING、TASK & 3 & 稠密检索；不展开 \\
+% Standard & 常规节点 & 四层级联 & 5 & 混合检索；按需展开 \\
+% Deep & 多证据复核 & 四层级联 & 8 & 混合检索；预展开前 2 条 \\
+% Recovery & 中断恢复、追溯 & 四层级联 & 10 & 时态混合检索；展开全部命中归档 \\
+% \bottomrule
+% \end{longtable}
+
+\begin{table}[htbp]
+    \centering
+    \caption{分级记忆唤醒配置}
+    \label{tab:anchor_wakeup_profiles}
+    \begin{tabular}{
+        p{0.14\textwidth}
+        p{0.21\textwidth}
+        p{0.10\textwidth}
+        p{0.40\textwidth}
+    }
+        \toprule
+        等级 & 作用域 & Top-$K$ & 检索与归档策略 \\
+        \midrule
+        Silent
+        & WORKING、TASK
+        & 3
+        & 稠密检索，不展开原文 \\
+        Standard
+        & 四个作用域
+        & 5
+        & 混合检索，保留按需展开入口 \\
+        Deep
+        & 四个作用域
+        & 8
+        & 混合检索，预展开前2条归档 \\
+        Recovery
+        & 四个作用域
+        & 10
+        & 时态混合检索，尝试展开命中归档 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+唤醒等级由运行配置指定，
+适用于局部处理、常规执行、多证据核验和恢复追溯等情况。
+当前标准唤醒路径在所选作用域内收集候选，
+统一评分、去重后返回Top-$K$结果；
+该路径采用跨作用域候选统一排序策略。
+
+分级配置使证据范围和展开深度成为可控制的运行参数，
+便于不同任务在信息充分性与输入规模之间进行调整。
+返回数量与展开长度的限制仍需和上下文预算检查配合。
+
+\subsection{ 两条路径的运行治理}
+
+\paragraph{节点前：任务锚点与历史证据分别注入}
+
+TIDE-Anchor通过运行钩子连接图执行生命周期，
+其信息流如图~\ref{fig:anchor_context}所示。
+步骤开始时，系统更新账本中的执行步数和前沿节点，
+并进行状态预算检查；
+节点执行前，按配置提供任务锚点、当前输入及历史证据；
+节点结束后，更新事实、摘要与失败记录，
+供下一步继续使用。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/节点上下文装配与状态更新-new.pdf}
+    \caption{节点上下文装配与状态更新流程}
+    \label{fig:anchor_context}
+\end{figure}
+
+图~\ref{fig:anchor_context}中的三路输入分别承担不同职责：
+任务锚点维持目标与约束，
+当前输入明确本步工作，
+历史证据补充决策依据。
+执行结果再写回外部状态，
+使上下文管理与任务推进形成连续的信息更新过程。
+
+% HookManager 在 \texttt{on\_step\_start} 更新账本中的步骤和前沿节点；在实际调用节点前，分别执行账本注入、记忆唤醒和预算检查。第 (s) 步上下文可表示为：
+
+% \[
+% C_s=A(L_s)\oplus I_s\oplus R(q_s,M)\oplus O_s.
+% \]
+
+% 其中 \(A(L_s)\) 为稳定任务锚点，\(R(q_s,M)\) 为检索证据，\(O_s\) 为节点角色和输出约束。该顺序保证检索失败时仍能保持目标和约束；检索命中时，原始证据又不会覆盖任务骨架。
+
+% \begin{quote}
+% 【图片占位：图 3 节点上下文装配泳道图。Graph State 分别产生 Ledger Anchor 和 Query；Query 经 Cascade Retrieval/Archive Expansion，与当前输入一起进入 Budget Gate，最后注入节点 Prompt。】
+% \end{quote}
+
+
+\paragraph{压缩与预算控制}
+
+系统通过结果摘要、原文归档和有限数量的记忆唤醒
+减少即时输入规模。
+预算控制器估算当前状态的Token数量，
+并在预留输出预算后计算有效输入上限：
+\begin{equation}
+    B_{\mathrm{in}}
+    =
+    \max\left(0,B_{\mathrm{max}}-B_{\mathrm{out}}\right),
+    \label{eq:anchor_budget}
+\end{equation}
+其中，$B_{\mathrm{max}}$为配置的上下文上限，
+$B_{\mathrm{out}}$为预留输出预算。
+
+超限时，系统将运行状态标为
+\texttt{budget\_paused}，
+记录估算用量、限制值和暂停原因。
+后续需压缩内容或调整上下文配置后重新检查；
+恢复检查点本身不会消除预算超限。
+
+显式记录预算状态，使资源问题能够被定位和处理，
+避免因无提示截断而丢失任务信息。
+
+
+\paragraph{漂移检测与待办更新}
+
+\texttt{DriftDetector}检查节点或操作重复、
+摘要相似、资源重复访问及待办停滞等信号，
+并可按配置启用目标语义偏离检测与模型辅助判断。
+
+检测结果写入运行状态，
+异常原因作为失败摘要进入账本，
+为后续修订提供依据。
+对于待办更新，当前实现默认记录建议；
+启用自动更新模式后，
+才将支持的修改应用到账本。
+
+这一设计将“没有进展”或“偏离目标”
+转化为带原因的状态记录，
+便于区分继续执行、调整待办与重新规划等处理需求。
+具体恢复动作由对应控制流程决定。
+
+
+% \texttt{DriftDetector} 不只检测图环，还检测语义重复、重复资源/工具/文件操作、TODO 长期不前移和目标语义偏离；必要时可加入 LLM Judge。检测结果作为带证据的失败摘要进入 Ledger，使后续节点知道``为何不能继续重复''，而不是只收到一句无来源告警。
+
+% \begin{longtable}[]{@{}lll@{}}
+% \toprule
+% 信号 & 典型现象 & 响应 \\
+% \midrule
+% \endhead
+% 节点或动作重复 & 同一操作连续重试 & 暂停、重规划或切换节点 \\
+% 语义摘要重复 & 多轮没有新增进展 & 标记停滞 \\
+% 资源重复 & 反复读同一文件、调用同一工具 & 形成结构性循环证据 \\
+% 待办积压 & TODO 反复重开或不前移 & 检查计划一致性 \\
+% 目标偏离 & 当前状态远离原始目标 & 重新注入目标并校正 \\
+% \bottomrule
+% \end{longtable}
+
+\paragraph{节点后：事实与执行信息更新}
+
+% 节点结束后，系统抽取输出、工具结果、关键事实和失败原因；长结果写入 Archive，摘要写入 TASK 记忆，账本同步记录事实、TODO 事件与下一动作。记忆更新接口支持 \texttt{ADD}、\texttt{UPDATE}、\texttt{DELETE}、\texttt{NOOP}，可用于知识更新判断。
+
+% Context Checkpoint 保存 Ledger、\texttt{MEMORY.md}、归档引用和元数据；Graph Checkpoint 保存执行步数、前沿节点和图状态。恢复流程是``恢复外部状态 → Recovery 唤醒证据 → 重新预算检查 → 从前沿节点继续''，而不是把旧 Prompt 重发并让模型猜测。
+
+% \begin{quote}
+% 【图片占位：图 4 执行与恢复状态机。至少包含 RUNNING、BUDGET\_PAUSED、NODE\_ERROR、CHECKPOINTED、RECOVERING、RESUMED；恢复路径必须同时恢复 Ledger、GraphState 和 \texttt{raw\_ref}。】
+% \end{quote}
+
+节点结束后，系统根据输出及评价结果更新账本，
+保存关键事实、工具摘要和失败信息，
+并按记忆配置写入可复用内容。
+较长的结果通过摘要与原文引用保留。
+
+由此，节点输入与输出通过外部状态衔接：
+本步使用已有目标和证据完成执行，
+新增信息再成为后续节点的任务状态或候选记忆。
+这种组织方式使上下文随任务进展更新，
+而不必将全部运行历史持续堆积在模型输入中。
+
+\paragraph{检查点与执行恢复}
+
+长程任务恢复既需要知道“任务进行到哪里”，
+也需要知道“执行应从哪里继续”。
+TIDE-Anchor分别利用上下文检查点和图检查点
+保存这两类信息，其职责与恢复关系如
+图~\ref{fig:anchor_recovery}所示。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]
+    {figure/C4/上下文与执行位置的分工恢复-new.pdf}
+    \caption{上下文与执行位置的分工恢复示意}
+    \label{fig:anchor_recovery}
+\end{figure}
+
+上下文检查点保存账本、
+\texttt{MEMORY.md}、已关联归档及元数据，
+用于恢复目标、约束、待办和证据引用；
+图检查点保存共享状态、执行步数和前沿节点，
+用于确定继续执行的位置。
+
+\textbf{将任务信息恢复与执行位置恢复分别管理，
+使恢复过程具有可核对的内容与位置依据}，
+减少仅凭历史文本重新推断进度的不确定性。
+
+
+图~\ref{fig:anchor_recovery}给出了恢复编排顺序：
+先恢复相关信息与执行位置，
+再按需唤醒证据并检查预算和运行条件，
+满足条件后从执行前沿继续。
+对于已产生外部副作用的工具操作，
+还需结合执行记录核对结果，
+避免恢复后重复调用。
+
+\subsection{核心算法与复杂度分析}
+
+\paragraph{运行治理算法}
+
+算法~\ref{alg:anchor_runtime}概括了账本更新、
+预算检查、证据注入和执行反馈的衔接方式。
+各操作对应图执行生命周期中的不同阶段，
+具体行为由组件配置决定。
+
+\begin{algorithm}[htbp]
+    \caption{TIDE-Anchor运行治理流程}
+    \label{alg:anchor_runtime}
+    \KwIn{运行状态$X$，账本存储$L$，记忆存储$M$，
+          预算控制器$B$，唤醒配置$p$}
+    \KwOut{更新后的运行状态或暂停状态}
+
+    在步骤开始时，确定运行标识并加载账本$l$\;
+    根据当前步数、执行前沿和状态$X$更新$l$\;
+    $d \leftarrow B.\mathrm{Check}(X)$\;
+    将预算判定$d$写入账本与运行状态\;
+
+    \If{预算超限}{
+        标记暂停状态并记录原因\;
+        \Return 暂停状态\;
+    }
+
+    \ForEach{进入执行的节点$n$}{
+        从账本构造节点任务锚点\;
+        根据节点输入与任务状态构造检索查询$q$\;
+        $E \leftarrow M.\mathrm{Wake}(q,p)$\;
+        按配置注入任务锚点、证据及其他上下文\;
+        执行节点并记录输出或异常\;
+        根据执行与评价结果更新账本及记忆\;
+        检测漂移，记录失败原因或待办更新建议\;
+    }
+
+    按检查点配置保存相应状态\;
+    \Return 更新后的运行状态\;
+\end{algorithm}
+
+算法~\ref{alg:anchor_runtime}将任务锚点与检索证据
+分别构造，避免目标信息完全依赖相似度检索；
+执行后的状态更新又为下一步提供可持续使用的依据。
+
+\paragraph{分级证据唤醒算法}
+
+算法~\ref{alg:anchor_wakeup}给出了当前唤醒路径：
+在指定作用域内收集候选，统一排序去重，
+再按配置组织摘要与归档内容。
+
+\begin{algorithm}[htbp]
+    \caption{分级证据唤醒}
+    \label{alg:anchor_wakeup}
+    \KwIn{查询$q$，记忆上下文$c$，唤醒配置$p$}
+    \KwOut{记忆项集合$E$及其注入文本}
+
+    按$p$指定的作用域与$c$限定检索范围\;
+    收集候选记忆，按配置的检索方式评分\;
+    排序并去重，保留至多$p.\mathrm{top\_k}$条，
+    得到$E$\;
+
+    \ForEach{记忆项$e\in E$}{
+        组织摘要、来源与原文引用\;
+        \If{展开策略要求读取原文且引用有效}{
+            读取归档，并按格式化长度限制组织内容\;
+        }
+    }
+
+    \Return $E$及其注入文本\;
+\end{algorithm}
+
+\paragraph{复杂度分析}
+
+设候选记忆数为$N$，最终返回条数为$K$，
+单条展开文本的长度上限为$R$，
+候选读取与评分成本为$T_{\mathrm{ret}}(N)$。
+采用完整排序时，
+算法~\ref{alg:anchor_wakeup}的成本可表示为：
+\begin{equation}
+    T_{\mathrm{wake}}
+    =
+    T_{\mathrm{ret}}(N)
+    +
+    O(N\log N+KR),
+    \label{eq:anchor_wakeup_cost}
+\end{equation}
+其中，$O(N\log N)$为排序成本，
+$O(KR)$为展开文本的组织成本。
+若归档需要完整读取后再截取，
+还需计入实际文件读取开销。
+
+设待检查状态的序列化长度为$S$，
+预算估算成本约为$O(S)$；
+账本渲染成本随实际输出内容长度增长。
+TIDE-Anchor以显式的检索与状态维护开销换取稳定任务锚点和有限证据供给，从而控制每步进入模型的历史内容。
+
+其效率优势应结合任务质量、实际Token用量、
+检索时间与恢复结果共同评估，
+相关实验在第六章报告。
+
+
+\paragraph{设计贡献}
+
+TIDE-Anchor的设计贡献体现在三个方面：
+将稳定任务状态与可检索历史证据分开管理，使目标与约束不依赖检索命中；
+通过摘要与原文引用连接压缩和核验，保留历史细节的回溯入口；
+将上下文管理接入图执行生命周期，为漂移分析、预算控制和中断恢复提供状态依据。
+
+上述机制共同形成任务信息的持续维护过程，为长程多智能体协作提供可追溯、可调整和可恢复的上下文支撑。
+
+

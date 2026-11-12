@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default="runs/experiments/memory")
     parser.add_argument("--run-name", default="", help="结果子目录；不同方法必须使用不同名称")
     parser.add_argument("--mem0-raw", action="store_true", help="mem0 直接写原文，不让 LLM 抽取记忆")
+    parser.add_argument("--reuse-mem0-history", action="store_true", help="Ingest identical conversation histories once per run.")
     parser.add_argument("--no-llm-judge", action="store_true", help="engine 后端关闭 DeepSeek 记忆更新判断")
     parser.add_argument(
         "--retrieval-mode",
@@ -73,6 +74,7 @@ def main() -> None:
             clean=args.fresh or not existing,
             use_llm_judge=not args.no_llm_judge,
             mem0_infer=not args.mem0_raw,
+            reuse_mem0_history=args.reuse_mem0_history,
             retrieval_mode=args.retrieval_mode,
             cascade_read=not args.project_only,
             enable_memory_update=not args.append_only,

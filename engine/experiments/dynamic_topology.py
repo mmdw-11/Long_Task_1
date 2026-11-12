@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List
 
 from ..modules.model_connections import ModelConnectionStore
 from ..modules.product_ops import ToolCatalogStore
-from ..modules.workflow_runtime import WorkflowNodeRuntimeFactory
+from ..modules.workflow_runtime import TeamExecutionError, WorkflowNodeRuntimeFactory
 from ..orchestrator import AgentSpec
 from .io import read_jsonl, write_json, write_jsonl
 
@@ -120,14 +120,20 @@ def dataset_manifest(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     return {"dataset": "dynamic_topology_mechanism_suite_v1", "count": len(payload), "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(), "families": {name: sum(1 for item in payload if item.get("family") == name) for name in FAMILIES}}
 
 
-def _ensure_tools(catalog: ToolCatalogStore) -> Dict[str, str]:
+def _ensure_tools(catalog: ToolCatalogStore, repository_api_url: str | None = None) -> Dict[str, str]:
     existing = {tool.name: tool.id for tool in catalog.list()}
     def create(name: str, **data: Any) -> str:
         if name in existing:
             return existing[name]
         return catalog.create(name=name, **data).id
+    repository_url = repository_api_url or "https://api.github.com/repos/python/cpython"
+    # Include the endpoint in the catalog identity so resumed experiments
+    # cannot silently reuse a tool pointing at another service.
+    name = "topology_github_cpython"
+    if repository_api_url:
+        name += "_" + hashlib.sha256(repository_url.encode()).hexdigest()[:12]
     return {
-        "time_api": create("topology_github_cpython", display_name="GitHub CPython Metadata API", description="读取 GitHub 公开仓库 python/cpython 的当前元数据。", category="external", tags=["github", "repository", "http", "read"], metadata={"adapter": "openapi_http", "risk": "read", "operation_url": "https://api.github.com/repos/python/cpython", "http_method": "GET", "timeout_seconds": 15}),
+        "time_api": create(name, display_name="GitHub CPython Metadata API", description="读取 GitHub 公开仓库 python/cpython 的元数据。", category="external", tags=["github", "repository", "http", "read"], metadata={"adapter": "openapi_http", "risk": "read", "operation_url": repository_url, "http_method": "GET", "timeout_seconds": 15}),
         "calculator": create("topology_calculator", display_name="Topology Calculator", description="执行数值核验所需的四则运算。", category="utility", tags=["math", "calculate"], metadata={"adapter": "calculator", "risk": "low"}),
     }
 
@@ -174,7 +180,7 @@ def _real_llm_and_tool(results: List[Dict[str, Any]]) -> tuple[bool, bool]:
     return model_seen, tool_seen
 
 
-async def run_dynamic_topology_case(case: Dict[str, Any], *, method: str, model_connection: str, root: str | Path) -> Dict[str, Any]:
+async def run_dynamic_topology_case(case: Dict[str, Any], *, method: str, model_connection: str, root: str | Path, repository_api_url: str | None = None) -> Dict[str, Any]:
     """Execute one case against the real model-connection runtime."""
     if method not in {"fixed_sparse", "dynamic_selection_only", "ours"}:
         raise ValueError("method must be fixed_sparse, dynamic_selection_only, or ours")
@@ -183,7 +189,7 @@ async def run_dynamic_topology_case(case: Dict[str, Any], *, method: str, model_
     models = ModelConnectionStore(root / "models")
     if not models.get(model_connection).runnable:
         raise RuntimeError(f"model connection {model_connection!r} is not runnable; refusing LocalEcho fallback")
-    tool_ids = _ensure_tools(catalog)
+    tool_ids = _ensure_tools(catalog, repository_api_url)
     event = dict(case.get("event_plan") or {}) or None
     graph = _graph(model_connection, tool_ids, method, event)
     factory = WorkflowNodeRuntimeFactory(catalog, models=models, graph=graph)
@@ -194,6 +200,7 @@ async def run_dynamic_topology_case(case: Dict[str, Any], *, method: str, model_
     state: Dict[str, Any] = {"input": root_task, "experimental_event_plan": event}
     all_events: List[Dict[str, Any]] = []
     all_results: List[Dict[str, Any]] = []
+    failed = False
     started = time.perf_counter()
     for todo in todo_list:
         current_todo = {**dict(todo), "id": str(todo.get("id") or f"todo-{len(all_results)+1}")}
@@ -206,7 +213,13 @@ async def run_dynamic_topology_case(case: Dict[str, Any], *, method: str, model_
         # the production planner does, instead of asking the next specialist
         # to infer its work from the previous member's prose output.
         state["input"] = f"总任务：{root_task}\n\n当前 TODO（{current_todo['id']}）：{json.dumps(current_todo, ensure_ascii=False)}"
-        update = await team.invoke(state)
+        try:
+            update = await team.invoke(state)
+        except TeamExecutionError as exc:
+            all_events.extend(exc.events)
+            all_results.extend(exc.results)
+            failed = True
+            break
         state.update(update)
         all_events.extend(update.get("__runtime_team_events__") or [])
         all_results.extend(update.get("team_results") or [])
@@ -236,11 +249,25 @@ async def run_dynamic_topology_case(case: Dict[str, Any], *, method: str, model_
         fallback_ok = bool(fallback_targets) and fallback_targets[-1] in capability_members[str(expected["fallback_target_capability"])]
     if case.get("family") == "multi_todo":
         event_ok = event_ok and len(active) >= 2 and len(set(active)) >= 2
-    passed = bool(real_llm and real_tool and event_ok and resource_ok and handoff_ok and fallback_ok and all_results and any(item.get("status") == "succeeded" for item in all_results))
+    recovery_tool_ok = True
+    if expected.get("fallback_target_capability"):
+        recovery_tool_ok = bool(fallback_ok and any(
+            item.get("member_id") == fallback_targets[-1] and item.get("status") == "succeeded"
+            and any(call.get("id") == tool_ids["time_api"] and call.get("status") == "succeeded"
+                    for call in (item.get("update") or {}).get("__runtime_tool_calls__") or [])
+            for item in all_results
+        ))
+    passed = bool(not failed and real_llm and real_tool and event_ok and resource_ok and handoff_ok and fallback_ok and recovery_tool_ok and any(item.get("status") == "succeeded" for item in all_results))
     return {
         "id": case["id"], "family": case["family"], "method": method, "passed": passed,
+        "recovery_tool_ok": recovery_tool_ok if expected.get("fallback_target_capability") else None,
+        "fault_injected": (
+            any(item.get("type") == "topology_experiment_event" and
+                (item.get("event") or {}).get("kind") == "failure_after_tool" for item in all_events)
+            if expected.get("fallback_target_capability") else None
+        ),
         "metrics": {"real_llm": int(real_llm), "real_tool": int(real_tool), "event_contract": int(event_ok), "resource_contract": int(resource_ok), "handoff_contract": int(handoff_ok), "fallback_contract": int(fallback_ok), "active_members": sum(len(item) for item in active) / max(1, len(active)), "temporary_edges": sum(1 for item in all_events if item.get("type") in {"delegation_selected", "handoff_selected", "fallback_selected"}), "trace_complete": int(bool(all_events and all_results)), "execution_ms": round((time.perf_counter() - started) * 1000, 2)},
-        "events": all_events, "results": all_results, "output": state.get("input"),
+        "events": all_events, "results": all_results, "output": None if failed else state.get("input"),
     }
 
 

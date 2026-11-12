@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import time
+import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -78,12 +80,11 @@ class GraphCheckpointStore:
         )
         path = self.path_for(run_id, checkpoint_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        _atomic_write(path,
             json.dumps(checkpoint.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
         )
         latest = self.root_dir / _safe_name(run_id) / "latest.json"
-        latest.write_text(str(path), encoding="utf-8")
+        _atomic_write(latest, str(path))
         return checkpoint
 
     def load(self, run_id: str, checkpoint_id: str = "latest") -> GraphCheckpoint:
@@ -100,3 +101,12 @@ class GraphCheckpointStore:
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value) or "item"
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

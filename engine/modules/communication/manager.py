@@ -47,6 +47,8 @@ class CommunicationManager:
         self._seen: Dict[str, set[str]] = {}
         self._snapshots: Dict[str, Dict[str, Any]] = {}
         self._revisions: Dict[str, int] = {}
+        self._received_views: Dict[str, Dict[str, Any]] = {}
+        self._received_revisions: Dict[str, int] = {}
         self.metrics = {"created": 0, "delivered": 0, "pruned": 0, "compressed": 0, "original_tokens": 0, "delivered_tokens": 0, "broadcasts": 0}
 
     def capsule_from_update(self, update: Dict[str, Any], *, sender: str, recipients: Optional[List[str]], state: Dict[str, Any], step: int) -> MessageCapsule:
@@ -92,7 +94,32 @@ class CommunicationManager:
         if not resolved and self.policy.broadcast_when_unresolved: resolved = list((roles or {}).keys()); self.metrics["broadcasts"] += 1
         events: List[Dict[str, Any]] = [{"type": "capsule_created", "capsule": capsule.to_dict()}]
         envelopes: List[CapsuleEnvelope] = []
-        for recipient in resolved:
+        source_capsule = capsule
+        for recipient in dict.fromkeys(resolved):
+            capsule = copy.deepcopy(source_capsule)
+            source_digest = capsule.digest
+            if source_digest in self._seen.get(recipient, set()):
+                events.append({"type": "capsule_pruned", "recipient": recipient, "digest": source_digest, "decision": CapsuleDecision("prune", 0.0, ["duplicate_delivery"]).to_dict()})
+                self.metrics["pruned"] += 1
+                continue
+            # Delivery to our in-process durable mailbox acknowledges receipt,
+            # separately from consumption. Pruned messages never advance it.
+            view_key = json_key(capsule.sender, recipient)
+            current_view = None
+            if capsule.state_delta is not None:
+                if capsule.sender in self._snapshots and capsule.state_delta.revision == self._revisions.get(capsule.sender):
+                    current_view = self._snapshots[capsule.sender]
+                    prior = self._received_views.get(view_key, {})
+                    capsule.state_delta = StateDelta(
+                        base_revision=self._received_revisions.get(view_key, 0),
+                        revision=capsule.state_delta.revision,
+                        changed={k: copy.deepcopy(v) for k, v in current_view.items() if k not in prior or prior[k] != v},
+                        removed=[k for k in prior if k not in current_view],
+                    )
+                    capsule.refresh_digest()
+                elif capsule.state_delta.base_revision != self._received_revisions.get(view_key, 0):
+                    events.append({"type": "capsule_snapshot_required", "sender": capsule.sender, "recipient": recipient})
+                    continue
             conflict = self._detect_conflict(capsule, recipient)
             if conflict:
                 capsule = copy.deepcopy(capsule)
@@ -104,10 +131,26 @@ class CommunicationManager:
             self.metrics["original_tokens"] += rough_tokens(capsule.to_dict())
             if rough_tokens(capsule.to_dict()) > self.policy.max_capsule_tokens:
                 delivered = self.compressor.compress(capsule, max_tokens=self.policy.max_capsule_tokens)
+                protected_fields = ("claim", "claim_id", "fact_key", "constraint_delta", "state_delta", "state_revision", "sender", "recipients", "kind", "expires_at", "provenance")
+                originals = {(item.uri, item.source, item.confidence, "" if item.uri else item.content) for item in capsule.evidence}
+                compressed_refs = {(item.uri, item.source, item.confidence, "" if item.uri else item.content) for item in delivered.evidence}
+                if any(getattr(delivered, key) != getattr(capsule, key) for key in protected_fields) or not originals.issubset(compressed_refs):
+                    delivered = capsule
+                    events.append({"type": "capsule_compression_rejected", "recipient": recipient, "reason": "protected_field_changed"})
                 if delivered.metadata.get("compressed"):
                     self.metrics["compressed"] += 1; events.append({"type": "capsule_compressed", "recipient": recipient, "digest": delivered.digest, "parent_digest": delivered.parent_digest, "original_tokens": delivered.budget.original_tokens, "compressed_tokens": delivered.budget.compressed_tokens})
             envelope = CapsuleEnvelope(delivered, recipient, decision)
-            self._mailboxes.setdefault(recipient, []).append(envelope); self._seen.setdefault(recipient, set()).add(delivered.digest)
+            self._mailboxes.setdefault(recipient, []).append(envelope)
+            self._seen.setdefault(recipient, set()).update([source_digest, delivered.digest])
+            if delivered.state_delta is not None:
+                if current_view is None:
+                    current_view = copy.deepcopy(self._received_views.get(view_key, {}))
+                    for key in delivered.state_delta.removed:
+                        current_view.pop(key, None)
+                    current_view.update(delivered.state_delta.changed)
+                self._received_views[view_key] = copy.deepcopy(current_view)
+                self._received_revisions[view_key] = delivered.state_delta.revision
+                events.append({"type": "capsule_acknowledged", "recipient": recipient, "sender": delivered.sender, "revision": delivered.state_delta.revision})
             self.metrics["delivered"] += 1; self.metrics["delivered_tokens"] += rough_tokens(delivered.to_dict())
             events.append({"type": "capsule_delivered", "recipient": recipient, "capsule": delivered.to_dict(), "decision": decision.to_dict()})
             if conflict:
@@ -128,7 +171,7 @@ class CommunicationManager:
         pressure = min(1.0, rough_tokens(capsule.to_dict()) / max(1, capsule.budget.max_tokens))
         c = {"task_relevance": relevance, "information_gain": info, "evidence_quality": evidence, "role_fit": role_fit, "freshness": freshness, "redundancy": duplicate, "budget_pressure": pressure}
         score = self.policy.task_relevance_weight*relevance + self.policy.information_gain_weight*info + self.policy.evidence_quality_weight*evidence + self.policy.role_fit_weight*role_fit + self.policy.freshness_weight*freshness - self.policy.redundancy_weight*duplicate - self.policy.budget_pressure_weight*pressure
-        protected = bool(capsule.constraint_delta and self.policy.preserve_constraints) or bool(capsule.metadata.get("conflict") and self.policy.preserve_conflicts)
+        protected = bool(capsule.constraint_delta and self.policy.preserve_constraints) or bool(capsule.metadata.get("conflict") and self.policy.preserve_conflicts) or capsule.kind in {"revoke", "cancel", "failure"}
         redundant = duplicate >= self.policy.redundancy_threshold
         known_fact_keys = {envelope.capsule.fact_key for envelope in self._mailboxes.get(recipient, []) if envelope.capsule.fact_key}
         # A distinct fact slot is semantically novel even if prose shares much
@@ -161,14 +204,26 @@ class CommunicationManager:
         ]
 
     def snapshot(self) -> Dict[str, Any]:
-        return {"schema_version": 1, "revisions": dict(self._revisions), "seen_digests": {k: sorted(v) for k, v in self._seen.items()}, "metrics": dict(self.metrics)}
+        return copy.deepcopy({
+            "schema_version": 2, "revisions": self._revisions, "snapshots": self._snapshots,
+            "seen_digests": {k: sorted(v) for k, v in self._seen.items()}, "metrics": self.metrics,
+            "received_views": self._received_views, "received_revisions": self._received_revisions,
+            "mailboxes": {key: [item.to_dict() for item in items] for key, items in self._mailboxes.items()},
+        })
 
     def restore(self, snapshot: Dict[str, Any]) -> None:
-        """Restore checkpoint-safe watermarks; payload mailboxes remain in graph state."""
-        if int(snapshot.get("schema_version", 1)) != 1:
+        """Restore mailbox payloads and acknowledged delta bases; accept legacy v1."""
+        if int(snapshot.get("schema_version", 1)) not in {1, 2}:
             raise ValueError("unsupported communication snapshot schema")
         self._revisions = {str(k): int(v) for k, v in (snapshot.get("revisions") or {}).items()}
         self._seen = {str(k): set(v) for k, v in (snapshot.get("seen_digests") or {}).items()}
+        self._snapshots = copy.deepcopy(snapshot.get("snapshots") or {})
+        self._received_views = copy.deepcopy(snapshot.get("received_views") or {})
+        self._received_revisions = dict(snapshot.get("received_revisions") or {})
+        self._mailboxes = {
+            key: [CapsuleEnvelope(MessageCapsule.from_dict(item["capsule"]), item["recipient"], CapsuleDecision(**item["decision"]), item["delivered_at"]) for item in items]
+            for key, items in (snapshot.get("mailboxes") or {}).items()
+        }
         self.metrics.update({k: int(v) for k, v in (snapshot.get("metrics") or {}).items() if k in self.metrics})
 
     @staticmethod
@@ -218,3 +273,8 @@ def _confidence(capsule: MessageCapsule) -> float:
     if capsule.evidence:
         return max(max(0.0, min(1.0, float(item.confidence))) for item in capsule.evidence)
     return max(0.0, min(1.0, 1.0 - float(capsule.uncertainty)))
+
+
+def json_key(sender: str, recipient: str) -> str:
+    # Length-prefix avoids collisions between agent names containing separators.
+    return f"{len(sender)}:{sender}{recipient}"

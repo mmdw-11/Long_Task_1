@@ -72,8 +72,11 @@ from .production import (
     router_artifact_status,
 )
 from .scheduler import AdaptiveResourceScheduler
+from .constrained import ConstrainedPlacementPolicy, PlacementInfeasible
 
 __all__ = [
+    "ConstrainedPlacementPolicy",
+    "PlacementInfeasible",
     "AdaptiveResourceScheduler",
     "AdvancedTrainingResult",
     "EmbeddingClassifierRouter",

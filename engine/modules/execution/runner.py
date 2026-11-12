@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import time
 
 from engine.modules.scheduling import ResourceRequest, ResourceScheduler, ResourceTier
+from engine.modules.scheduling import PlacementInfeasible
 
 from ._types import InferenceRequest, InferenceResult
 from .registry import ExecutorRegistry
@@ -37,7 +39,20 @@ class ResilientInferenceRunner:
         last_result: Optional[InferenceResult] = None
 
         for attempt_index in range(1, self.max_attempts + 1):
-            allocation = self.scheduler.acquire(resource_request)
+            started = time.perf_counter()
+            allocation = None
+            try:
+                allocation = self.scheduler.acquire(resource_request)
+                if allocation.metadata.get("requires_human_review"):
+                    raise PlacementInfeasible("resource allocation requires authorization")
+                preflight = getattr(self.scheduler, "preflight", None)
+                if callable(preflight):
+                    preflight(resource_request, allocation)
+            except PlacementInfeasible as exc:
+                if allocation is not None:
+                    self.scheduler.release(allocation)
+                return InferenceResult(text="", executor="placement", endpoint="", success=False,
+                    error=str(exc), retryable=False, metadata={"attempts": attempts, "placement_blocked": True})
             request = InferenceRequest(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -58,11 +73,24 @@ class ResilientInferenceRunner:
                     error=str(exc),
                     retryable=True,
                 )
+            finally:
+                self.scheduler.release(allocation)
+
+            record_outcome = getattr(self.scheduler, "record_outcome", None)
+            if callable(record_outcome):
+                record_outcome(resource_request, allocation, result, elapsed_ms=(time.perf_counter() - started) * 1000)
 
             attempts.append(
                 {
                     "attempt": attempt_index,
                     "allocation": allocation.to_dict(),
+                    "tier": allocation.tier.value,
+                    "connection_id": result.metadata.get("connection_id"),
+                    "model": result.model or None,
+                    "prompt_tokens": result.metadata.get("prompt_tokens"),
+                    "completion_tokens": result.metadata.get("completion_tokens"),
+                    "total_tokens": result.metadata.get("total_tokens"),
+                    "latency_ms": result.metadata.get("latency_ms"),
                     "success": result.success,
                     "error": result.error,
                     "retryable": result.retryable,

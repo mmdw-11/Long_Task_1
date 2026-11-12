@@ -21,12 +21,18 @@ services:
       SKILL_EMBEDDING_MODEL: bge-m3
       ROUTER_MODEL_BACKEND: bge_m3
       ROUTER_MODEL_PATH: /app/model_assets/bge-router
+      # Learned constrained placement; without a trained policy use the old
+      # resource ordering inside the same hard-feasible action set.
+      PLACEMENT_MODE: ${PLACEMENT_MODE:-constrained}
+      PLACEMENT_POLICY_PATH: ${PLACEMENT_POLICY_PATH:-}
     volumes:
       - agentforge_data:/app/runs
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/status', timeout=5)"]
+      # OpenAPI is deliberately public; unlike /api/system/status it does not
+      # require an authenticated session, so it is safe for a container probe.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=5)"]
       interval: 15s
       timeout: 8s
       retries: 10

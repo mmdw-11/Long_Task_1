@@ -1,0 +1,719 @@
+% 4.2 TIDE-Mesh动态异构拓扑与低熵通信--------------------
+%     4.2.1 问题定义与双层协作架构
+%     4.2.2 异构能力建模与候选成员筛选
+%     4.2.3 任务语义驱动的稀疏路由
+%     4.2.4 运行时委派、交接与故障替补
+%     4.2.5 面向接收方的MessageCapsule协议
+%     4.2.6 状态增量传输与时态证据记忆
+%     4.2.7 核心算法伪代码与通信复杂度分析
+
+
+\section{TIDE-Mesh：动态异构拓扑、低熵通信与时态证据记忆}
+\label{sec:tide_mesh}
+
+\subsection{设计目标与总体架构}
+
+\paragraph{从``多个 Agent 同时工作''到``受控的群体协作''}
+
+在超长程复杂任务中，仅增加智能体数量并不能自然形成高效群体智能。若所有角色采用固定流水线或静态全连接方式协作，则每个 Agent 无论是否具备当前步骤所需能力，都可能接收相同历史和中间结果。随着任务持续推进，无关消息、重复结论和局部错误会在网络中反复传播，使通信量近似随群体规模平方增长，并造成上下文污染和噪声级联。
+
+本文将有效协作拆分为两个相互约束的问题：第一，当前任务状态下，哪些异构角色真正需要参与，彼此之间应临时建立哪些协作边；第二，在这些边上，什么信息值得发送给特定接收者，如何以最小但充分的形式传输。前者决定``谁与谁协作''，后者决定``沿边传什么''。
+
+{\emergencystretch=1em 为此，本文在 TIDE-Swarm 总体架构中提出 \textbf{TIDE-Mesh（Task-state-driven\allowbreak{} Information-bottleneck\allowbreak{} Dynamic Elastic Mesh，任务状态驱动的信息瓶颈弹性协作网）}。该方法以可编译的外层业务工作流作为安全控制骨架，以当前 TODO 为语义单位，从候选智能体池中动态选择具备所需能力、工具、Skill 和知识的成员，只为本轮生成有生命周期的 Delegation、Handoff 与 Fallback 边；随后使用 MessageCapsule 将自由文本通信变换为带主张、证据、约束变化、置信度、来源和预算的结构化消息，并通过接收者条件化贡献门控、字段感知压缩和增量状态传输抑制冗余。\par}
+
+TIDE-Mesh 可以概括为：
+
+\[
+\text{TIDE-Mesh}=\text{Semantic Sparse Routing}+\text{Recipient-aware Information Bottleneck}.
+\]
+
+系统采用外层控制骨架与内层活跃协作关系分离的设计：外层工作流表达安全边界、质量反馈和可达路径；每个 TODO 内部的活跃成员集合与临时协作子图随任务语义变化。这样的``双层拓扑''既保留工程可控性，也使群体结构能够在运行时重组。
+
+% \begin{quote}
+% 【图片占位：图 1 TIDE-Mesh 总体概念图。左侧画静态全连接群体，所有节点广播长文本并产生噪声级联；右侧画外层 Planner—Dynamic Team—Quality Gate—Aggregator 控制环，以及团队内部随 TODO 生成的稀疏临时边。边上只传 MessageCapsule。】
+% \end{quote}
+
+% \paragraph{设计目标}
+
+% \begin{longtable}[]{@{}lll@{}}
+% \toprule
+% 目标 & 对应机制 & 预期作用 \\
+% \midrule
+% \endhead
+% 保证角色异构性 & 能力、模型、工具、Skill、知识库、成本和历史成功率共同形成成员画像 & 让不同专业角色承担不同子任务 \\
+% 避免静态全连接 & 当前 TODO 驱动硬过滤、评分和 Top-K 激活 & 只生成本轮必要的协作边 \\
+% 支持运行中重构 & Handoff、成员失败、质量返工和重规划触发重新选择 & 初始路由不正确时仍可纠偏 \\
+% 抑制通信冗余 & 接收者条件化贡献门控、TTL、Digest 去重 & 相似或失效消息不进入后续上下文 \\
+% 保护关键语义 & MessageCapsule 固定字段与 protected semantics & 约束变化和冲突信息不会被普通剪枝删除 \\
+% 降低状态复制 & StateDelta 只传变化字段 & 避免反复传播完整共享状态与历史消息 \\
+% 保持可解释性 & 候选过滤、分数拆解、临时边和剪枝理由全部事件化 & 能回答``为什么选它、为什么发送或丢弃'' \\
+% \bottomrule
+% \end{longtable}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+
+\paragraph{外层任务控制流程}
+
+% 系统外层由任务规划器、动态团队、质量门和结果聚合器构成。规划器将自然语言总目标转换为顺序依赖的 PlanLedger。每个 TODO 包含目标、所需能力、所需工具、Skill、知识库、期望输出、验收条件和证据要求。质量门对执行结果进行确定性检查和可选模型评审，并返回 \texttt{pass}、\texttt{revise} 或 \texttt{replan}。
+
+% \begin{verbatim}
+% Global Goal
+%     ↓
+% Task Planner → PlanLedger / Current TODO
+%     ↓
+% Dynamic Agent Team
+%     ↓
+% Quality Gate ── revise/replan ──→ Planner
+%     ↓ pass
+% Result Aggregator → Deliverable
+% \end{verbatim}
+
+% 这一骨架是预先可视化和编译的，因为循环出口、安全边界以及质量反馈路径不能完全交由模型临时生成。但是，每次 Team 被当前 TODO 激活时，其内部成员与边都会重新计算。因此，``外层稳定''并不等于``内部通信拓扑静态''。
+
+外层由任务规划器、动态团队、质量门和结果汇聚器构成。规划器维护具有顺序依赖的任务项，每项记录阶段目标、能力与资源需求、预期交付物和验收条件。
+
+动态团队完成当前任务后，质量门返回通过、修订或重规划意见，由规划器统一更新任务状态。只有全部必要阶段完成后，流程才进入结果汇聚。质量门负责阶段验收，整体交付由最终产物与任务标准共同确认。
+
+\paragraph{内层动态成员选择}
+
+设候选成员池为$\mathcal{A}=\{a_1,\ldots,a_N\}$，
+当前任务为$\tau_t$，其资源要求为$\mathcal{R}_t$。
+系统先形成可行成员集合：
+\begin{equation}
+    V_t=
+    \left\{
+        a_i\in\mathcal{A}
+        \mid
+        \operatorname{Feasible}(a_i,\mathcal{R}_t)=1
+    \right\},
+\end{equation}
+再按匹配评分选择参与者：
+\begin{equation}
+    A_t^*=
+    \operatorname{TopK}_{a_i\in V_t}
+    S(a_i,\tau_t).
+\end{equation}
+
+监督器向选中成员委派任务，并在执行过程中根据成员失败或转交请求选择其他候选者。由此形成的临时关系可表示为：
+\begin{equation}
+    G_t=
+    \left(
+        \{s\}\cup U_t,\,
+        E_t^{\mathrm{del}}
+        \cup E_t^{\mathrm{handoff}}
+        \cup E_t^{\mathrm{fallback}}
+    \right),
+\end{equation}
+其中，$s$为监督器，$U_t$包含本轮初始成员及后续加入的成员；
+三类边分别表示委派、转交和失败替补关系。
+
+% \begin{quote}
+% 【图片占位：图 2 双层拓扑图。外层用实线表示可编译控制边；内层候选 Agent 置于虚线 Team 容器中，每一轮仅点亮 Top-K Delegation 边，并用不同颜色展示 Handoff、Fallback 和过期边。】
+% \end{quote}
+
+这些关系作为运行时协作状态保存，画布中的成员定义作为可复用的候选配置保留。
+
+\textbf{团队内部不建立自由通信平面，通信只经Supervisor与Capsule通道}：团队内委派、结构化Handoff和结果聚合由Supervisor中介，图节点及其真实后继之间由Capsule标准Hook链路定向传递。协作关系图表达成员参与和交接关系，内部成员调用采用Supervisor通道；独立Capsule逐边路由在图节点边界执行。这种分工将成员自治限制在受控交接接口内，集中管理任务范围、接收者选择和结果汇聚。
+图~\ref{fig:mesh_topology}展示了外层控制流程与内层成员选择的关系。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/TIDE-Mesh双层拓扑与动态成员选择.pdf}
+    \caption{TIDE-Mesh双层拓扑与动态成员选择}
+    \label{fig:mesh_topology}
+\end{figure}
+
+\subsection{任务驱动的成员选择与拓扑重构}
+
+\paragraph{多维异构成员画像}
+
+TIDE-Mesh以能力、资源与运行表现共同刻画Agent异构性。一个成员画像同时包含：
+
+\[
+P_i=\langle C_i,T_i,K_i,B_i,M_i,H_i,c_i,l_i,r_i\rangle,
+\]
+
+其中 \(C_i\) 为能力描述，\(T_i\) 为工具集合，\(K_i\) 为知识库，\(B_i\) 为 Skill 集合，\(M_i\) 为模型和系统提示，\(H_i\) 为历史成功表现，\(c_i/l_i\) 分别为归一化成本和时延，\(r_i\) 为失败风险。该画像使``研究 Agent''``代码 Agent''之类自然语言角色，进一步落到可执行资源和运行表现上。
+
+规划器生成 TODO 时，只能引用资源目录中真实存在的精确 ID；无法确认的资源应留空。这样，路由语义与实际工具、Skill、知识库挂载状态保持一致，避免模型在计划中虚构资源。
+
+\paragraph{第一阶段：资源硬过滤}
+
+路由器先检查成员是否启用，以及所需工具、Skill、知识库是否存在、健康并可使用。如果当前 TODO 显式要求某项资源，而成员没有挂载，则按硬约束排除，语义评分在可行集合内生效。硬过滤规则为：
+
+\[
+\operatorname{Feasible}(a_i,R_t)=
+Enabled_i\land ToolOK_i\land SkillOK_i\land KnowledgeOK_i.
+\]
+
+被排除的成员及原因进入 \texttt{candidate\_filtered} 事件，例如``必要工具不可用''``未挂载当前 TODO 所需 Skill''或``已在本轮参与，防止循环转交''。这些事件使Top-$K$选择具有可追溯的资源依据。
+
+\paragraph{第二阶段：多指标可解释评分}
+
+通过硬过滤后，系统根据任务语义与运行状态评分：
+
+\[
+\begin{aligned}
+S(a_i,\tau_t)= {}&w_sS_{semantic}+w_pS_{prompt}+w_hS_{history}\\
+&+w_tC_{tool}+w_kC_{skill}+w_bC_{knowledge}\\
+&-w_cCost-w_lLatency-w_rRisk+Priority_i.
+\end{aligned}
+\]
+
+平衡模式的默认权重为：语义相似度 0.35、提示词匹配 0.13、历史成功率 0.13、工具覆盖 0.10、Skill 覆盖 0.10、知识库覆盖 0.09、成本惩罚 0.05、时延惩罚 0.05、失败风险惩罚 0.10。系统还提供偏质量和偏效率的权重预设，也允许在工作流配置中覆盖单项权重。
+
+语义相似度当前使用依赖无关的 256 维稳定哈希向量作为本地回退；历史成功率使用带 Beta 先验的平滑估计，防止单次成功支配路由。每次 \texttt{delegation\_selected} 事件同时保存总分与 \texttt{score\_breakdown}，便于复盘权重是否合理。
+
+\paragraph{Top-K 稀疏激活}
+
+通过 \texttt{selection\_top\_k} 与 \texttt{max\_parallel}，系统只激活少量高分成员：
+
+\[
+K_t=\min(selection\_top\_k,max\_parallel,|V_t|).
+\]
+
+当前 \texttt{max\_parallel} 被限制在 1 至 8，避免配置错误造成无界并发。与 \(N\) 个 Agent 的静态全连接相比，全连接潜在有 \(N(N-1)\) 条有向边，而初始委派只需 \(K_t\) 条 Supervisor 边。加上有界 Handoff 和失败替代后：
+
+\[
+|E_t|\le K_t+H_t+F_t,\qquad K_t,H_t,F_t\ll N.
+\]
+
+稀疏化不只是减少 Agent 数量，也缩小了后续 MessageCapsule 的潜在接收者集合，从拓扑层先抑制无关传播。
+
+
+\paragraph{Supervisor 主导的结构化 Handoff}
+
+运行期发现可以改变剩余任务的能力需求。成员执行后若判断剩余工作需要新能力，可提出：
+
+\begin{verbatim}
+{
+  "status": "needs_handoff",
+  "remaining_task": "需要继续完成的子任务",
+  "required_capabilities": ["新增能力"],
+  "reason": "为什么当前成员不适合继续",
+  "recommended_agent": "可选建议",
+  "context_summary": "必要交接信息"
+}
+\end{verbatim}
+
+Handoff 既可作为节点结构化字段返回，也可从输出末尾的 JSON 提取。Agent提出交接建议，Supervisor保留接收者选择权。Supervisor 使用 \texttt{remaining\_task} 和 \texttt{required\_capabilities} 对未参与成员重新执行硬过滤与评分；只有存在可行接收者时才生成临时 Handoff 边。模型给出的 \texttt{recommended\_agent} 不会绕过资源、风险和循环限制。
+
+为防止循环，已参与成员进入 \texttt{used} 集合，同一轮接收者从未参与集合中选取；\texttt{max\_handoffs} 默认 3、最大 8。系统分别记录 \texttt{goal\_checked}、\texttt{handoff\_selected} 和 \texttt{handoff\_rejected}，从而区分``任务完成''``需要交接''和``没有安全接收者''。
+
+\paragraph{成员失败触发 Fallback}
+
+若成员运行异常，团队容器捕获失败而不立即终止全局流程。启用 \texttt{allow\_substitution} 时，Supervisor 从尚未使用的可行排序列表中选择最高分备用成员，并创建一次性 Fallback 边。失败结果不会作为成功内容进入最终聚合；只有成功成员结果参与 \texttt{first}、\texttt{structured} 或 \texttt{concat} 聚合。
+
+这一机制使拓扑同时受任务语义和运行事件驱动：
+
+\[
+Event_t\in\{NewTodo,Handoff,MemberFailure,QualityReplan\},
+\]
+
+\[
+G_{t+1}=\Phi(G_t,Event_t,Context_t,Resources_t).
+\]
+
+\paragraph{质量反馈驱动下一轮重构}
+
+质量门检查输出非空、执行成功、有效来源数量、工具成功以及代码任务的测试证据；配置评审模型时进一步检查内容与来源支持关系，并组合模型质量分：
+
+\[
+Q=w_{rule}Q_{deterministic}+(1-w_{rule})Q_{model}.
+\]
+
+\texttt{pass} 会完成当前 TODO 并激活下一步；\texttt{revise} 保留当前 TODO，但把 \texttt{revision\_instruction} 注入下一轮；达到重试上限后，\texttt{replan} 只替换未完成 TODO，保留已完成工作及证据。由于每次 Team 调用都依据新的 TODO 与反馈重新选人，质量失败不仅改变提示词，也改变下一轮能力需求和活跃拓扑。
+
+% \begin{quote}
+% 【图片占位：图 3 一次完整拓扑演化时序。展示 TODO-1 选择 A/C，C 提交 Handoff 后选择 D，A 失败后由 B Fallback；Quality Gate 要求 replan 后 TODO-2 重新选择 B/E。每条边标注产生原因和 TTL。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsection{低熵通信:结构化通信与接收方信息筛选}
+
+\paragraph{MessageCapsule消息组织}
+
+自由文本交接容易混合目标复述、结论、证据和建议，
+使接收者难以区分新增信息与重复内容。
+MessageCapsule通过显式字段组织这些信息，其主要组成见
+表~\ref{tab:mesh_capsule_fields}。
+
+\begin{table}[htbp]
+    \centering
+    \caption{MessageCapsule的主要字段}
+    \label{tab:mesh_capsule_fields}
+    \begin{tabular}{p{0.27\textwidth}p{0.62\textwidth}}
+        \toprule
+        字段类别 & 内容与作用 \\
+        \midrule
+        任务信息 & 目标、当前子任务与后续动作 \\
+        主张与证据 & 阶段结论、证据内容及来源引用 \\
+        约束与冲突 & 约束变化、事实标识与冲突标记 \\
+        来源信息 & 发送者、任务、节点、步骤与轨迹标识 \\
+        生命周期 & TTL、过期时间与消息预算 \\
+        状态与版本 & 状态增量、版本号、消息摘要标识及压缩血缘 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+节点可以显式返回胶囊，也可以通过适配器将已有输出转为胶囊，
+以兼容现有工作流。
+接收者优先采用显式配置，其次采用运行时确定的图后继；
+仅在未解析出接收者且策略允许时使用广播回退。
+
+% \subsection{MessageCapsule 结构化低熵通信协议}
+
+% \paragraph{为什么自由文本广播容易形成噪声级联}
+
+% 自由文本消息往往把目标复述、推理过程、结论、证据、约束和建议动作混在一起。接收者无法判断哪些字段是新的、哪些已经看过、哪些只是猜测；一条错误结论经广播后还可能被多个 Agent 重述，形成``重复即可信''的噪声级联。
+
+% TIDE-Mesh 将节点输出规范化为 MessageCapsule：
+
+% \[
+% M=\langle goal,subtask,claim,evidence,constraint\_delta,next\_action,
+% uncertainty,ttl,budget,provenance,state\_delta\rangle.
+% \]
+
+% 其中，\texttt{claim} 是需要接收者使用的核心主张；\texttt{evidence} 保存内容、URI、来源、置信度和观察时间；\texttt{constraint\_delta} 只记录新增或变化的约束；\texttt{provenance} 绑定 task、agent、trace、node 和 step；\texttt{ttl/expires\_at} 限制消息生命周期；\texttt{budget.max\_tokens} 限制胶囊大小。旧节点仍可经 Legacy Adapter 从最后一条消息或 \texttt{result/output/answer} 自动生成胶囊，从而兼容现有工作流。
+
+% \begin{quote}
+% 【图片占位：图 4 MessageCapsule 字段解剖图。中心为 claim，左侧为 goal/subtask，右侧为 evidence/provenance，下方为 constraint\_delta/next\_action，上方标出 uncertainty、TTL、budget、digest 与 state revision。】
+% \end{quote}
+
+\paragraph{接收者条件化贡献评分}
+
+同一消息对不同角色的价值不同。系统结合接收者角色和已有消息计算贡献分：
+
+% \[
+% \begin{aligned}
+% C(m,r)= {}&0.24R_{task}+0.22I_{gain}+0.18Q_{evidence}\\
+% &+0.12F_{role}+0.10Freshness\\
+% &-0.20Redundancy-0.10BudgetPressure.
+% \end{aligned}
+% \]
+
+% 不给值？
+\begin{equation}
+\begin{aligned}
+    C(m,r)
+    ={}&
+    w_1R_{\mathrm{task}}
+    +w_2I_{\mathrm{gain}}
+    +w_3Q_{\mathrm{evidence}}\\
+    &+w_4F_{\mathrm{role}}
+    +w_5F_{\mathrm{freshness}}\\
+    &-w_6D_{\mathrm{redundancy}}
+    -w_7P_{\mathrm{budget}}.
+\end{aligned}
+\end{equation}
+
+% \texttt{R\_task} 衡量目标/子任务与主张及接收者角色的词项覆盖；\texttt{I\_gain=1-Redundancy}；证据质量是证据置信度均值；角色匹配判断消息语义是否与接收职责一致；新鲜度由过期时间计算；预算压力由消息 token 与胶囊预算比值给出。冗余度是消息与该接收者 mailbox 历史消息的最大 token Jaccard 相似度。
+其中，任务相关性和角色匹配采用文本特征；
+证据质量使用证据置信度；
+冗余度取消息与接收者历史消息的最大词项Jaccard相似度；
+信息增益近似为$1-D_{\mathrm{redundancy}}$；
+预算压力由估算消息长度与预算的比值确定。
+这些量共同构成接收者条件化的通信筛选信号。
+
+
+默认贡献阈值为 0.28、冗余阈值为 0.82、胶囊预算为 512 tokens。门控顺序为：
+
+% \begin{verbatim}
+% if TTL=0 or expired: PRUNE(expired)
+% else:
+%     score ← Contribution(capsule, recipient, recipient_mailbox)
+%     protected ← has constraint_delta or explicit conflict
+%     if protected: DELIVER(protected_semantics)
+%     else if redundancy ≥ 0.82: PRUNE(redundant)
+%     else if score < 0.28: PRUNE(low_contribution)
+%     else: DELIVER(contribution_threshold_met)
+% \end{verbatim}
+\begin{enumerate}
+    \item 过期消息直接剪枝；
+    \item 按策略保留约束变化和冲突消息；
+    \item 剪除达到冗余阈值的普通消息；
+    \item 启用新主张保护时，保留符合新颖性条件的主张；
+    \item 其余消息依据贡献阈值决定是否投递。
+\end{enumerate}
+
+约束变化和冲突消息属于 protected semantics，即使文本与旧消息相似，也不会被普通冗余规则误删。这一设计优先保护改变执行边界的信息，并对重复解释实施筛选，使冗余抑制与约束保持协同生效。
+
+% \paragraph{字段感知的信息瓶颈}
+
+% 通过门控的胶囊还要接受字段级预算控制。确定性压缩器依次去重证据，裁剪过长的 \texttt{goal}、\texttt{subtask} 和 \texttt{next\_action}，压缩证据正文，并在超预算时移除低优先级证据；\texttt{claim} 与 \texttt{constraint\_delta} 被视为语义不变量。可选 LLMLingua 适配器也只压缩描述字段，不能改写主张或约束。
+
+% 该过程可表示为：
+
+% \[
+% Z=\mathcal{B}(M,R,B),
+% \]
+
+% 其中 \(M\) 是原始消息，\(R\) 是接收角色，\(B\) 是通信预算，\(Z\) 是保留决策所需主张、约束和证据的最小充分表示。压缩前后的消息由 \texttt{parent\_digest} 建立血缘，并记录原始与压缩 token，便于检查压缩是否真实发生。
+
+% \paragraph{StateDelta：只传播变化，不复制完整状态}
+
+% 对于发送者 \(a\) 的第 \(r\) 个状态快照，系统只传输变化与删除字段：
+
+% \[
+% \Delta S_a^r=\{k\mid S_a^r[k]\ne S_a^{r-1}[k]\},
+% \]
+
+% \[
+% Removed_a^r=Keys(S_a^{r-1})-Keys(S_a^r).
+% \]
+
+% 内部 \texttt{\_\_*} 控制字段和原始 \texttt{messages} 不进入差分，从而避免运行时元数据与完整历史被重复广播。\texttt{base\_revision/revision} 保证接收端知道增量基于哪个版本；checkpoint 保存 revision 和已见 digest 水位，恢复后结合消息队列、差分基准和业务状态核验投递连续性。
+
+% \paragraph{私有 Mailbox 与定向注入}
+
+% 胶囊优先发送给显式 \texttt{recipients}，否则发送给路由策略确定的真实图后继；没有明确接收者且策略允许时才退化为广播。每个 Agent 拥有独立 mailbox，节点启动时 Hook 只把该接收者的胶囊注入 \texttt{\_\_capsule\_context\_\_}。因此：
+
+% \[
+% C_t^i=Ledger_t\oplus Mailbox_t^i\oplus RetrievedMemory_t^i
+% \oplus SkillContext_t^i\oplus CurrentInput_t.
+% \]
+
+% 不同 Agent 即使处于同一 run，也看到与自身职责相关的局部通信，而非共享全部成员的自由文本历史。
+
+% \begin{quote}
+% 【图片占位：图 5 低熵通信流水线。Agent Output → Explicit/Legacy Capsule → Digest/StateDelta → Recipient Contribution Gate → Prune 或 Compress → Private Mailbox → Recipient Context；在每个阶段标注事件名和 token 变化。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+% \subsection{从短期消息到时态证据记忆}
+
+% 通过即时通信的 Capsule 还可以沉淀为长期可检索事实。\texttt{TemporalEvidenceMemoryStore} 将 \texttt{claim} 转为 claims 事实，将 \texttt{constraint\_delta} 转为 \texttt{constraint:*} 事实，并把证据、来源、观察时间和 capsule digest 绑定到事实记录：
+
+% \[
+% f=\langle subject,predicate,object,[valid\_from,valid\_to),status,
+% confidence,version,evidence\rangle.
+% \]
+
+% 当相同事实在有效区间重叠时合并证据并更新置信度；当 \texttt{replace=true} 时，旧事实被标记为 \texttt{superseded}，新事实版本加一；当不同对象在有效区间重叠且未声明替换时，系统建立 \texttt{conflict\_set\_id} 并将相关事实标为 \texttt{disputed}。失效、替代和冲突都采用非破坏性保存，支持历史版本和 \texttt{as\_of} 查询。
+
+% 默认检索同时考虑语义、稀疏词项、时态有效性、来源可靠度、证据支持、作用域和新近性，并惩罚冲突事实。正常查询排除失效、已替代和争议事实；恢复或审计可显式请求历史与冲突集合。由此形成闭环：
+
+% \begin{verbatim}
+% MessageCapsule → Temporal Evidence / Versioned Fact
+%         ↑                         ↓
+% Recipient-local Context ← Time/Source/Conflict-aware Retrieval
+% \end{verbatim}
+
+% 这一闭环抑制了另一类噪声级联：旧结论不会只因在多轮对话中反复出现就覆盖新事实，冲突信息也不会被直接广播为确定结论。
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+% \subsection{核心算法与复杂度分析}
+
+% \begin{verbatim}
+% Algorithm 1  TIDE-Mesh Dynamic Heterogeneous Sparse Collaboration
+% Input : global goal G, candidate agents A, workflow state S, budget B
+% Output: verified deliverable
+
+% 1  P ← Planner(G, RealResourceCatalog(A)); initialize PlanLedger(P)
+% 2  while PlanLedger has executable TODO do
+% 3      τ ← first dependency-satisfied pending/retry TODO
+% 4      x ← BuildTodoPrompt(G, τ, previous_quality_feedback)
+% 5      C ← HardFilter(A, τ.required_tools/skills/knowledge)
+% 6      for each ai in C do
+% 7          score[ai] ← SemanticAndResourceScore(ai, x, S)
+% 8      end for
+% 9      selected ← TopK(score, τ.selection_top_k, max_parallel)
+% 10     create temporary Supervisor→selected edges; emit topology events
+% 11     results ← ParallelInvoke(selected, x)
+% 12     for each failed member do
+% 13         choose highest-ranked unused feasible fallback and invoke it
+% 14     end for
+% 15     while a member requests handoff and handoff_count < max_handoffs do
+% 16         reassess unused members by remaining_task and required_capabilities
+% 17         Supervisor creates a temporary handoff edge or rejects the request
+% 18     end while
+% 19     result ← AggregateSuccessfulResults(results)
+% 20     quality ← QualityGate(result, τ.acceptance_criteria, τ.evidence_requirements)
+% 21     if quality=pass then Complete(τ)
+% 22     else if quality=revise then Retry(τ, quality.revision_instruction)
+% 23     else ReplanOnlyUnfinishedTodos(PlanLedger, quality)
+% 24  end while
+% 25  return AggregateCompletedResults(PlanLedger)
+% \end{verbatim}
+
+% \begin{verbatim}
+% Algorithm 2  Recipient-aware Low-Entropy Capsule Transport
+% 1  m ← ExplicitCapsule(update) or LegacyToCapsule(update)
+% 2  m.provenance ← current task/trace/node/step
+% 3  m.state_delta ← Diff(current_state, previous_snapshot[sender])
+% 4  m.digest ← SHA256(canonical_payload(m)); emit capsule_created
+% 5  for each routed recipient r do
+% 6      if Expired(m): emit capsule_pruned(expired); continue
+% 7      contribution ← EvaluateForRecipient(m, r, Mailbox[r])
+% 8      if not Protected(m) and (Redundant(m,r) or contribution<threshold):
+% 9          emit capsule_pruned(score_breakdown); continue
+% 10     z ← FieldAwareCompress(m, max_tokens=512)
+% 11     Mailbox[r].append(z); SeenDigest[r].add(z.digest)
+% 12     emit capsule_delivered and state_delta
+% 13 end for
+% 14 on NodeStart(r): inject only Mailbox[r]
+% \end{verbatim}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+
+% 设候选成员数为 \(N\)，每个成员资源项数为 \(R\)，激活成员数为 \(K\)，最大 Handoff 数为 \(H\)，历史事件数为 \(E_h\)。硬过滤复杂度为 \(O(NR)\)，多指标评分约为 \(O(N(L+D+E_h))\)，当前完整排序为 \(O(N\log N)\)；每次 Handoff 对剩余成员重新评分，最坏乘以有界常数 \(H\)。
+
+% 静态全连接每轮潜在边数为 \(N(N-1)\)，而本方法为：
+
+% \[
+% |E_t|=O(K+H+F).
+% \]
+
+% 若自由文本平均长度为 \(T_{full}\)，Capsule 平均长度为 \(T_{cap}\)，则通信量分别近似为：
+
+% \[
+% V_{full}=O(N^2T_{full}),\qquad
+% V_{TIDE}=O(|E_t|T_{cap}),
+% \]
+
+% 且在设计目标下 \(|E_t|\ll N^2\)、\(T_{cap}\ll T_{full}\)。因此 TIDE-Mesh 同时从边数和每边载荷两个维度降低通信规模。对于单个接收者，冗余比较与 mailbox 长度 \(M_r\) 和消息 token 数 \(T\) 近似成 \(O(M_rT)\)；这是定向去重带来的可解释计算代价。
+
+% 评价口径与实现范围已在本节“低熵评价口径”和“适用范围”中统一说明。
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+% \subsection{可观测性、实现映射与验证边界}
+
+% \paragraph{可审计事件}
+
+% 动态团队记录 \texttt{team\_started}、\texttt{candidate\_filtered}、\texttt{topology\_reconfigured}、\texttt{delegation\_selected}、\texttt{goal\_checked}、\texttt{handoff\_selected/rejected}、\texttt{team\_member\_failed}、\texttt{fallback\_selected} 和 \texttt{team\_aggregated}。通信层记录 \texttt{capsule\_created/pruned/compressed/delivered}、\texttt{state\_delta} 和 \texttt{temporal\_facts\_updated}。候选事件保存排除原因与评分分解，消息事件保存贡献分、剪枝理由、digest 和压缩血缘。服务端将这些底层事件翻译为可读运行轨迹，供前端观察和复盘。
+
+% \paragraph{代码调用链}
+
+% \begin{longtable}[]{@{}
+%   >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}
+%   >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.50}}@{}}
+% \toprule
+% 机制 & 当前实现位置 \\
+% \midrule
+% \endhead
+% Planner、PlanLedger、Quality Gate、Dynamic Team & \texttt{engine/modules/workflow\_runtime.py} \\
+% 资源硬过滤、评分、Top-K、Handoff、Fallback & \texttt{engine/modules/workflow\_runtime.py} \\
+% MessageCapsule、EvidenceRef、StateDelta、Digest & \texttt{engine/modules/communication/types.py} \\
+% 贡献门控、Mailbox、状态差分、快照 & \texttt{engine/modules/communication/manager.py} \\
+% 字段感知压缩与 LLMLingua 适配 & \texttt{engine/modules/communication/compressor.py} \\
+% 节点前注入、节点后建 Capsule、后继路由、时态事实抽取 & \texttt{engine/hooks.py} \\
+% 事实版本、冲突集合与时态检索 & \texttt{engine/modules/memory/temporal.py} \\
+% 阈值和通信权重 & \texttt{configs/communication\_policy.yaml} \\
+% 前端事件解释 & \texttt{engine/server/app.py} \\
+% \bottomrule
+% \end{longtable}
+
+% 自动化测试已覆盖动态成员选择与聚合、资源缺失硬过滤、成员失败替代、Supervisor 批准结构化 Handoff、保存后的工作流 API 运行、顺序 TODO 闭环、质量返工/重规划、Capsule 定向投递与过期剪枝、Canonical Digest、StateDelta，以及时态事实更新与冲突。它们证明核心执行分支在代码层存在，但不等同于大规模性能实验。
+
+% \paragraph{当前可宣称与不可宣称的结论}
+
+% \textbf{可以宣称：}项目已实现由当前 TODO 和真实资源状态驱动的两阶段成员选择；每轮只激活有界 Top-K，并支持受监督 Handoff 与故障替代；图后继通信已接入结构化 Capsule、接收者门控、字段压缩、私有 mailbox、增量状态、digest 水位和时态证据记忆；路由和通信决策均可审计。
+
+% 评价口径与实现范围已在本节“低熵评价口径”和“适用范围”中统一说明。
+
+% \begin{quote}
+% 【图片占位：图 6 一次真实运行的可观测轨迹截图。应同时出现 candidate\_filtered 的分数明细、topology\_reconfigured、handoff/fallback、capsule\_pruned/delivered 和 state\_delta；不要只截静态画布。】
+% \end{quote}
+
+% \begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+
+\paragraph{字段感知压缩}
+
+通过门控且超过目标预算的胶囊进入压缩器。
+确定性压缩器去重证据，裁剪过长的目标、子任务和后续动作描述，
+限制证据正文长度，并在必要时减少证据条目。
+主张与约束变化字段保持不变。
+可选的模型压缩适配器也主要作用于描述字段。
+
+
+\paragraph{状态增量}
+
+状态差分优先基于节点输出中的业务字段构造，
+排除完整消息历史、内部控制字段以及胶囊已表达的部分信息。
+设发送者$a$的第$r$次可传输字段集合为$S_a^r$，则：
+\begin{equation}
+    \Delta S_a^r
+    =
+    \left\{
+        (k,S_a^r[k])
+        \mid
+        k\notin S_a^{r-1}
+        \ \lor\
+        S_a^r[k]\ne S_a^{r-1}[k]
+    \right\},
+\end{equation}
+删除字段为：
+\begin{equation}
+    D_a^r
+    =
+    \operatorname{Keys}(S_a^{r-1})
+    -
+    \operatorname{Keys}(S_a^r).
+\end{equation}
+
+增量携带基础版本与当前版本，便于追踪字段变化。
+
+
+\paragraph{接收者信箱与上下文注入}
+
+每个接收节点具有独立信箱。
+节点启动时，通信钩子将其消息转为精简的语义字段，
+注入对应上下文；完整协议信息用于运行记录与审计。
+
+
+完整流程如图~\ref{fig:mesh_communication}所示。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]
+    {figure/C4/接收方感知的消息通信流程.pdf}
+    \caption{接收方感知的消息门控、压缩与定向注入流程}
+    \label{fig:mesh_communication}
+\end{figure}
+
+
+\subsection{时态证据记忆}
+
+启用时态证据记忆后，胶囊中的主张和约束变化可转为事实记录，
+并关联来源、证据、有效时间与版本。
+
+对于相同事实，系统可以合并证据；
+显式替换时，将旧版本标为已替代并保留历史；
+同一事实槽位出现有效时间重叠的不同取值时，
+建立冲突关系供后续核验。
+
+检索综合语义、词项、时间、来源与证据支持等因素，
+默认过滤部分失效、已替代或争议记录。
+恢复与审计可通过历史或冲突查询读取相关版本。
+
+
+
+\subsection{核心算法与复杂度分析}
+
+\begin{algorithm}[H]
+    \caption{动态异构成员协作}
+    \label{alg:mesh_collaboration}
+    \KwIn{当前任务$\tau$，候选成员$\mathcal{A}$，
+          运行状态$X$，协作配置$b$}
+    \KwOut{团队结果与执行记录}
+
+    $V\leftarrow\mathrm{Filter}(\mathcal{A},\tau,X)$\;
+    \If{$V=\varnothing$}{
+        \Return 无可行成员的失败结果\;
+    }
+    对$V$评分并排序，选择有界Top-$K$成员\;
+    初始化已参与成员集合$U$并记录委派关系\;
+    按配置执行所选成员，收集结果与异常\;
+
+    \If{启用失败替补}{
+        对失败成员选择尚未使用的可行候选并执行\;
+        更新$U$及替补记录\;
+    }
+
+    \While{存在转交请求且未达到转交上限}{
+        根据剩余任务与所需能力重新评估未参与成员\;
+        \eIf{存在可行接收者}{
+            由监督器选择接收者并执行，更新$U$\;
+        }{
+            记录转交拒绝原因并结束本轮转交\;
+            \textbf{break}\;
+        }
+    }
+
+    汇聚成功成员结果，保留失败与转交记录\;
+    \Return 团队结果与执行记录\;
+\end{algorithm}
+
+\begin{algorithm}[t]
+    \caption{接收方感知的胶囊通信}
+    \label{alg:mesh_transport}
+    \KwIn{节点输出$u$，发送者$a$，候选接收者$\mathcal{R}$，
+          通信策略$p$}
+    \KwOut{消息投递结果及运行事件}
+
+    从显式字段或旧格式输出构造胶囊$m$\;
+    构造业务字段增量，更新版本与消息摘要标识\;
+    解析实际接收者集合$\mathcal{R}^{*}$\;
+
+    \ForEach{$r\in\mathcal{R}^{*}$}{
+        结合接收者历史检查冲突并计算门控信号\;
+        按过期、保护语义、冗余、新主张和贡献规则判定\;
+        \eIf{判定为剪枝}{
+            记录接收者与剪枝原因\;
+        }{
+            \If{消息估算长度超过目标预算}{
+                执行字段感知压缩并记录用量变化\;
+            }
+            将消息写入$r$的信箱并记录投递事件\;
+        }
+    }
+
+    接收节点启动时注入其信箱的精简语义内容\;
+\end{algorithm}
+
+设候选成员数为$N$，单个成员资源检查成本为$C_r$，
+评分成本为$C_s$，则一次成员选择的成本为：
+\begin{equation}
+    T_{\mathrm{select}}
+    =
+    O\left(N(C_r+C_s)+N\log N\right).
+\end{equation}
+
+若最多发生$H$次转交并重新评分，
+选择成本上界约为$O((H+1)T_{\mathrm{select}})$，
+模型推理与工具调用耗时另行统计。
+若初始激活$K$名成员，产生$H$次转交和$F$次替补，
+则本轮新增协作关系数量为$O(K+H+F)$。
+该数量不包含每名成员内部的工具调用，也不等同于全部网络消息数。
+
+对于单条长度为$T$的消息，
+若向$R$个接收者分别与至多$M$条历史消息比较，
+冗余评估成本约为$O(RMT)$。
+通信载荷应按实际投递次数和每次载荷求和：
+\begin{equation}
+    V_{\mathrm{comm}}
+    =
+    \sum_{j=1}^{J}\operatorname{Size}(m_j).
+\end{equation}
+
+全连接潜在边数为$N(N-1)$，用于拓扑规模对照；实测通信量按上述投递载荷累计。
+动态成员选择与消息压缩分别控制参与范围和载荷，
+其收益需要结合任务质量、实际消息数与Token用量评估。
+
+
+% 实验部分在这章删了
+% \begin{quote}
+% 【图片占位：图 7 动态拓扑和通信成本实验图。左图画随任务阶段变化的活跃边数，右图画 Success—Tokens 帕累托前沿；另附错误主张注入后的传播范围对比。当前无正式结果前不要填写虚构数值。】
+% \end{quote}
+
+
+\paragraph{设计贡献}
+
+TIDE-Mesh通过资源过滤、匹配评分和受监督转交调整协作成员，
+通过结构化消息、接收方门控、字段压缩与状态增量控制信息传递。
+运行事件保留成员选择、失败替补和消息处理依据，
+为后续通信效率、语义保真与错误传播实验提供观测基础。
+
+% \subsection{附：本章本地证据来源（后面删掉）}
+
+% \begin{itemize}
+% \tightlist
+% \item
+%   设计说明：\texttt{docs/8.29低熵通信与时态证据记忆研究设计.md}、\texttt{docs/9.4动态编排版本1.md}、\texttt{docs/9.4动态编排计划.md}。
+% \item
+%   题目映射：\texttt{docs/8.30写文档前对题目文件的总结.md}。
+% \item
+%   总论文上下文：\texttt{docs/8.30论文/8.30论文1.md}。
+% \item
+%   实现与测试：\texttt{engine/modules/workflow\_runtime.py}、\texttt{engine/modules/communication/}、\texttt{engine/modules/memory/temporal.py}、\texttt{engine/hooks.py}、\texttt{tests/test\_dynamic\_team\_runtime.py}、\texttt{tests/test\_communication.py}、\texttt{tests/test\_temporal\_memory.py}。
+% \end{itemize}
+
+

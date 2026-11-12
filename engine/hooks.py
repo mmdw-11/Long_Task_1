@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -21,7 +22,7 @@ from .failure import (
     FailureContext, FailureRecord, FailureTrace,
 )
 from .modules.flow import FlowController, FlowDecision, NoOpFlowController
-from .modules.evaluation import Evaluator, EvaluationResult, RuleEvaluator
+from .modules.evaluation import Evaluator, EvaluationResult, RuleEvaluator, ValidationFailureAction
 from .modules.context import (
     BUDGET_PAUSED,
     CONTEXT_INJECTION_KEY,
@@ -152,6 +153,10 @@ class ExecutionHook:
         """Serializable runtime watermarks for graph checkpoints."""
         return {}
 
+    def restore_checkpoint(self, state: Dict[str, Any]) -> None:
+        """Restore component state before resuming a graph checkpoint."""
+        return None
+
     async def before_node_invoke(self, ctx: NodeContext) -> None:
         return None
 
@@ -203,7 +208,7 @@ class HookManager(ExecutionHook):
         self.context_budget = context_budget
         self.context_injector = context_injector or ContextInjector()
         self.drift_detector = drift_detector or DriftDetector()
-        self.validation_control_enabled = context_ledger is not None or evaluator is not None
+        self.validation_control_enabled = context_ledger is not None or evaluator is not None or reasoner is not None
         self.evaluator = evaluator or RuleEvaluator()
         self.redactor = redactor or SensitiveDataRedactor()
         self.audit_builder = audit_builder or AuditPackBuilder()
@@ -283,12 +288,39 @@ class HookManager(ExecutionHook):
             state=ctx.state,
             metadata={**ctx.metadata, **self._node_metadata(ctx.node)},
         )
+        reasoning = ctx.state.get(REASONING_CONTEXT_KEY) or {}
+        planned_task = reasoning.get("subtask") or {}
+        if planned_task and evaluation.passed:
+            update_dict = update if isinstance(update, dict) else {}
+            missing = [
+                criterion for criterion in planned_task.get("acceptance_criteria") or []
+                if criterion not in update_dict or update_dict[criterion] is False or update_dict[criterion] is None
+            ]
+            if missing:
+                evaluation.passed = False
+                evaluation.score = 0.0
+                evaluation.findings.extend(f"missing acceptance evidence: {item}" for item in missing)
+                evaluation.retryable = True
+                evaluation.action = ValidationFailureAction.PAUSE
+            else:
+                completed = list(ctx.state.get(COMPLETED_SUBTASKS_KEY) or [])
+                task_id = str(planned_task.get("id") or "")
+                if task_id and task_id not in completed:
+                    completed.append(task_id)
+                    ctx.state[COMPLETED_SUBTASKS_KEY] = completed
         ctx.state[EVALUATION_RESULT_KEY] = evaluation.to_dict()
         self._update_context_on_node_end(ctx, update, evaluation)
         # 将节点产出写入记忆（NoOp 桩会丢弃）。
-        if update:
+        if update and evaluation.passed:
+            memory_update = update
+            if self.context_ledger is not None:
+                ledger = self.context_ledger.load_or_create(self._run_id_from_state(ctx.state))
+                if ledger.tool_summaries:
+                    summary = ledger.tool_summaries[-1]
+                    memory_update = {"summary": summary.short_summary, "raw_ref": summary.raw_ref,
+                                     "source_node": ctx.node, "state_revision": ledger.state_revision}
             self.memory.append(
-                update,
+                memory_update,
                 MemoryScope.TASK,
                 context=self._memory_context(ctx),
                 tags=[ctx.node],
@@ -333,9 +365,9 @@ class HookManager(ExecutionHook):
                         })
         episodes = list(ctx.state.get(RECOVERY_TRACE_KEY) or [])
         if episodes and episodes[-1].get("status") == "planned" and episodes[-1].get("failure", {}).get("node") == ctx.node:
-            episodes[-1] = {**episodes[-1], "status": "succeeded"}
+            episodes[-1] = {**episodes[-1], "status": "succeeded" if evaluation.passed else "validation_failed"}
             ctx.state[RECOVERY_TRACE_KEY] = episodes
-            self._runtime_events.append({"type": "recovery_succeeded", "episode": episodes[-1]})
+            self._runtime_events.append({"type": "recovery_succeeded" if evaluation.passed else "recovery_validation_failed", "episode": episodes[-1]})
         side_effect_class = str(ctx.metadata.get("idempotency") or "idempotent")
         if side_effect_class in {"compensatable", "non_idempotent"}:
             journal = list(ctx.state.get(SIDE_EFFECT_JOURNAL_KEY) or [])
@@ -373,25 +405,6 @@ class HookManager(ExecutionHook):
         failure_ctx = FailureContext.from_error(
             error, node=ctx.node, step=ctx.step, metadata=ctx.metadata, attempt=attempts
         )
-        reasoning = ctx.state.get(REASONING_CONTEXT_KEY) or {}
-        planned_task = reasoning.get("subtask") or {}
-        if planned_task and evaluation.passed:
-            update_dict = update if isinstance(update, dict) else {}
-            missing = [
-                criterion for criterion in planned_task.get("acceptance_criteria") or []
-                if criterion not in update_dict and criterion not in str(update_dict)
-            ]
-            if missing:
-                evaluation.passed = False
-                evaluation.score = 0.0
-                evaluation.findings.extend(f"missing acceptance evidence: {item}" for item in missing)
-                evaluation.retryable = True
-            else:
-                completed = list(ctx.state.get(COMPLETED_SUBTASKS_KEY) or [])
-                task_id = str(planned_task.get("id") or "")
-                if task_id and task_id not in completed:
-                    completed.append(task_id)
-                    ctx.state[COMPLETED_SUBTASKS_KEY] = completed
         ctx.state["__failure_context__"] = failure_ctx.to_dict()
         rec = trace.record(
             ctx.node, error, step=ctx.step,
@@ -532,18 +545,49 @@ class HookManager(ExecutionHook):
         }
         return data
 
+    def restore_checkpoint(self, state: Dict[str, Any]) -> None:
+        if self.context_ledger is not None and isinstance(state.get(CONTEXT_LEDGER_KEY), dict):
+            ledger = self.context_ledger.restore_view(state[CONTEXT_LEDGER_KEY])
+            state[CONTEXT_LEDGER_KEY] = ledger.to_dict()
+            state["hard_constraints"] = list(ledger.hard_constraints)
+        if self.communication is not None and isinstance(state.get(COMMUNICATION_STATE_KEY), dict):
+            self.communication.restore(state[COMMUNICATION_STATE_KEY])
+            self._communication_restored = True
+        self._pending_capsules.clear()
+        for hook in self.extra_hooks:
+            hook.restore_checkpoint(state)
+
     def _ensure_verified_plan(self, state: Dict[str, Any]) -> None:
         if self.reasoner is None:
             return
         run_id = self._run_id_from_state(state)
-        if run_id in self._reasoned_runs or isinstance(state.get(PLAN_IR_KEY), dict):
+        raw = state.get(PLAN_IR_KEY)
+        if isinstance(raw, dict):
+            digest = hashlib.sha256(json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            previous = state.get(PLAN_VALIDATION_KEY) or {}
+            if previous.get("plan_digest") == digest:
+                return
+            validation = self.reasoner.validator.validate(PlanIR.from_dict(raw))
+            state[PLAN_VALIDATION_KEY] = {**validation.to_dict(), "plan_digest": digest}
+            # A replacement plan must not inherit completion from an older plan.
+            state[COMPLETED_SUBTASKS_KEY] = []
+            if not validation.passed:
+                state[RUN_STATUS_KEY] = "plan_validation_paused"
+                state[PAUSE_REASON_KEY] = "updated symbolic plan validation failed"
+            elif state.get(RUN_STATUS_KEY) == "plan_validation_paused":
+                state.pop(RUN_STATUS_KEY, None)
+                state.pop(PAUSE_REASON_KEY, None)
+            self._runtime_events.append({"type": "plan_verified" if validation.passed else "plan_rejected", "validation": state[PLAN_VALIDATION_KEY]})
             return
         goal = str(state.get("original_goal") or state.get("goal") or state.get("task") or state.get("input") or "")
         raw_plan = state.get("current_plan") or state.get("plan") or []
         context = {"subtasks": raw_plan} if isinstance(raw_plan, list) and raw_plan else {}
         outcome = self.reasoner.reason(goal, context)
         state[PLAN_IR_KEY] = outcome.plan.to_dict()
-        state[PLAN_VALIDATION_KEY] = outcome.validation.to_dict()
+        state[PLAN_VALIDATION_KEY] = {
+            **outcome.validation.to_dict(),
+            "plan_digest": hashlib.sha256(json.dumps(state[PLAN_IR_KEY], sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+        }
         state[PLAN_REVISIONS_KEY] = [item.to_dict() for item in outcome.revisions]
         for capsule in outcome.feedback_capsules:
             self._runtime_events.append({"type": "symbolic_counterexample", "capsule": capsule.to_dict()})
@@ -702,6 +746,7 @@ class HookManager(ExecutionHook):
             update=update,
             state=ctx.state,
             verified=evaluation.passed,
+            accepted=evaluation.passed,
         )
         if not evaluation.passed:
             message = "; ".join(evaluation.findings) or "post-execution validation failed"

@@ -110,12 +110,12 @@ class ContextInjector:
         verified = [
             fact.text
             for fact in ledger.key_facts
-            if fact.verified
+            if fact.verified and fact.status == "active"
         ][-self.max_verified_facts :]
         unverified = [
             fact.text
             for fact in ledger.key_facts
-            if not fact.verified
+            if not fact.verified or fact.status != "active"
         ][-self.max_unverified :]
         active_todo = _active_todo_text(ledger)
         adjacent_todos = _adjacent_todo_text(ledger)

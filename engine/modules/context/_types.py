@@ -283,6 +283,8 @@ class ContextLedger:
     budget: ContextBudget = field(default_factory=ContextBudget)
     next_action: str = ""
     updated_at: float = field(default_factory=time.time)
+    state_revision: int = 0
+    accepted_steps: List[str] = field(default_factory=list)
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -308,6 +310,8 @@ class ContextLedger:
             "budget": self.budget.to_dict(),
             "next_action": self.next_action,
             "updated_at": self.updated_at,
+            "state_revision": self.state_revision,
+            "accepted_steps": list(self.accepted_steps),
         }
 
     @classmethod
@@ -350,4 +354,6 @@ class ContextLedger:
             budget=ContextBudget.from_dict(data.get("budget")),
             next_action=str(data.get("next_action", "")),
             updated_at=float(data.get("updated_at", time.time())),
+            state_revision=int(data.get("state_revision", 0)),
+            accepted_steps=[str(item) for item in data.get("accepted_steps", [])],
         )
