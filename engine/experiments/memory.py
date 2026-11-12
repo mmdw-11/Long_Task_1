@@ -9,6 +9,7 @@ such in the row metadata.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -75,6 +76,7 @@ class MemoryExperimentConfig:
     embedding_backend: str = "bge_m3"
     bge_batch_size: int = 32
     history_chunk_chars: int = 0
+    reuse_mem0_history: bool = False
 
 
 def run_memory_experiment(
@@ -170,7 +172,7 @@ def _run_engine_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfi
                     "reranker": "bge_m3" if bge_reranker is not None else "none",
                     "evidence_selection": evidence_stats,
                 },
-                retrieval_evidence_texts=retrieved_sessions,
+                retrieval_evidence_texts=visible,
             ))
     finally:
         action_counts = Counter(store.memory_update_action_counts)
@@ -245,29 +247,38 @@ def _run_mem0_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfig)
     _disable_mem0_thinking(memory)
     rows: List[ExperimentRow] = []
     started = time.perf_counter()
+    ingested_users: set[str] = set()
     for example in examples:
         indexed_example = _with_chunked_memories(example, cfg.history_chunk_chars)
         user_id = _mem0_user_id(indexed_example)
+        if cfg.reuse_mem0_history:
+            history = json.dumps(indexed_example.memories, ensure_ascii=False)
+            user_id = "history-" + hashlib.sha256(history.encode("utf-8")).hexdigest()
         write_started = time.perf_counter()
-        for index, text in enumerate(indexed_example.memories):
-            memory.add([{"role": "user", "content": text}], user_id=user_id,
-                       metadata={"source": example.source, "example_id": example.id, "index": index}, infer=cfg.mem0_infer)
+        history_reused = user_id in ingested_users
+        if not history_reused:
+            for index, text in enumerate(indexed_example.memories):
+                memory.add([{"role": "user", "content": text}], user_id=user_id,
+                           metadata={"source": example.source, "example_id": example.id, "index": index}, infer=cfg.mem0_infer)
+            ingested_users.add(user_id)
         write_seconds = time.perf_counter() - write_started
         retrieval_started = time.perf_counter()
         result = memory.search(indexed_example.question, top_k=cfg.top_k, filters={"user_id": user_id}, threshold=cfg.mem0_threshold)
         retrieval_seconds = time.perf_counter() - retrieval_started
         result_items = _mem0_results(result)
+        visible = _fit_context_to_budget([_mem0_memory_text(item) for item in result_items], cfg.context_token_budget)
         rows.append(_evaluate_example(
-            indexed_example, [_mem0_memory_text(item) for item in result_items], cfg,
+            indexed_example, visible, cfg,
             write_seconds=write_seconds, retrieval_seconds=retrieval_seconds, retrieval_applicable=True,
             metadata={
                 "backend": "mem0",
                 "source": example.source,
-                "retrieval_provenance": "mem0_metadata_index_to_source_session",
+                "retrieval_provenance": "visible_mem0_results",
+                "history_reused": history_reused,
                 "history_units_original": len(example.memories),
                 "history_units_indexed": len(indexed_example.memories),
             },
-            retrieval_evidence_texts=_deduplicated_mem0_source_sessions(result_items, indexed_example),
+            retrieval_evidence_texts=visible,
         ))
     return ExperimentReport(
         name="memory-mem0", rows=rows,
@@ -275,6 +286,7 @@ def _run_mem0_memory(examples: List[MemoryExample], cfg: MemoryExperimentConfig)
             "backend": "mem0", "top_k": cfg.top_k, "infer": cfg.mem0_infer,
             "embedding_backend": "bge_m3", "embedding_model": "BGEM3EmbeddingModel",
             "history_chunk_chars": cfg.history_chunk_chars,
+            "reuse_mem0_history": cfg.reuse_mem0_history,
             "thinking_disabled": True,
             "threshold": cfg.mem0_threshold, "qa_solver": cfg.qa_solver,
             "qa_model": _reported_model(cfg.qa_model), "storage_bytes": _directory_size(root),

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from fastapi.testclient import TestClient
 from engine.modules.product_ops import ApplicationStore
 from engine.modules.workflows import RunStore, WorkflowStore, WorkflowRecord
@@ -107,19 +109,29 @@ def test_current_todo_required_tool_hard_filters_team_candidates(tmp_path, monke
     assert "未挂载当前 TODO 所需工具" in backup["excluded_reasons"]
 
 
-def test_dynamic_team_supervisor_approves_structured_handoff(tmp_path, monkeypatch):
+@pytest.mark.parametrize("allow_handoff,max_handoffs", [(True, 2), (True, 0), (False, 2)])
+def test_dynamic_team_supervisor_respects_structured_handoff_limits(
+    tmp_path, monkeypatch, allow_handoff, max_handoffs,
+):
     monkeypatch.chdir(tmp_path)
     graph = _team_graph()
     search = next(item for item in graph["agents"] if item["id"] == "worker-search")
     search["config"]["code"] = "def main(params):\n    return {'answer': 'need specialist', 'handoff_request': {'status': 'needs_handoff', 'remaining_task': 'resolve backup search facts', 'required_capabilities': ['backup'], 'reason': 'specialist needed'}}"
     team = next(item for item in graph["agents"] if item["id"] == "team")
-    team["config"]["delegation"] = {"mode": "single", "selection_top_k": 1, "max_parallel": 1, "allow_handoff": True, "max_handoffs": 2}
+    team["config"]["delegation"] = {
+        "mode": "single", "selection_top_k": 1, "max_parallel": 1,
+        "allow_handoff": allow_handoff, "max_handoffs": max_handoffs,
+    }
     events = _run(graph)
     update = next(event for event in events if event.get("type") == "node_end" and event.get("node") == "research-team")["update"]
-    handoff = next(event for event in update["__runtime_team_events__"] if event["type"] == "handoff_selected")
-    assert handoff["source"] == "search-worker"
-    assert handoff["target"] == "backup-worker"
-    assert any(item["member"] == "backup-worker" for item in update["team_results"])
+    handoffs = [event for event in update["__runtime_team_events__"] if event["type"] == "handoff_selected"]
+    used_backup = any(item["member"] == "backup-worker" for item in update["team_results"])
+    if allow_handoff and max_handoffs:
+        assert [(event["source"], event["target"]) for event in handoffs] == [("search-worker", "backup-worker")]
+        assert used_backup
+    else:
+        assert handoffs == []
+        assert not used_backup
 
 
 def test_dynamic_team_runs_through_saved_workflow_api(tmp_path, monkeypatch):

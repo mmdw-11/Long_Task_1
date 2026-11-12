@@ -32,11 +32,14 @@ def main() -> None:
     summary = save_results(rows, args.root)
     task_trials = {}
     for row in rows:
-        task_trials.setdefault((row["task_id"], row["trial"]), set()).add(row["initial_state_hash"])
+        state_hash = row.get("initial_state_hash")
+        if state_hash:
+            task_trials.setdefault((row["task_id"], row["trial"]), set()).add(state_hash)
     audit = {
         "rows": len(rows), "unique_keys": len({row["key"] for row in rows}),
         "errors": sum(bool(row.get("error")) for row in rows),
         "state_hash_mismatches": sum(len(values) != 1 for values in task_trials.values()),
+        "missing_initial_state_hash": sum(not row.get("initial_state_hash") for row in rows),
         "missing_final_state_hash": sum(not row.get("final_state_hash") for row in rows),
         "missing_trajectory_hash": sum(not row.get("trajectory_sha256") for row in rows),
         "summary": summary,
@@ -45,14 +48,14 @@ def main() -> None:
     if args.expected_runs is not None:
         audit["expected_runs"] = args.expected_runs
         audit["complete"] = len(rows) == args.expected_runs and audit["unique_keys"] == args.expected_runs
-    if args.strict and (
+    failed = (
         not audit.get("complete", True) or audit["errors"] or audit["state_hash_mismatches"]
-        or audit["missing_final_state_hash"] or audit["missing_trajectory_hash"]
-    ):
-        (args.root / "audit.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
-        raise SystemExit("strict result audit FAILED; inspect audit.json")
-    audit["status"] = "PASS"
+        or audit["missing_initial_state_hash"] or audit["missing_final_state_hash"] or audit["missing_trajectory_hash"]
+    )
+    audit["status"] = "FAIL" if failed else "PASS"
     (args.root / "audit.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.strict and failed:
+        raise SystemExit("strict result audit FAILED; inspect audit.json")
     print(json.dumps(audit, ensure_ascii=False, indent=2))
 
 

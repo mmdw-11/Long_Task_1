@@ -919,6 +919,8 @@ class AgentRuntimeFactory:
                     if connection is None:
                         return InferenceResult(text="", executor="placement", endpoint="", success=False, error="default model connection unavailable")
                     result = factory._run_pinned_model(connection.id, inference.prompt, inference.system_prompt)
+                    result.model = result.model or getattr(connection, "model_id", "")
+                    result.metadata.setdefault("connection_id", connection.id)
                     if not result.success and any(token in (result.error or "").lower() for token in ("429", "rate limit", "timeout", "timed out", "503", "502", "504", "connection")):
                         result.retryable = True
                     return result
@@ -954,9 +956,9 @@ class AgentRuntimeFactory:
                 "model": connection.model_id,
                 "success": result.success,
                 "error": result.error,
-                "prompt_tokens": int(result.metadata.get("prompt_tokens") or 0),
-                "completion_tokens": int(result.metadata.get("completion_tokens") or 0),
-                "total_tokens": int(result.metadata.get("total_tokens") or 0),
+                "prompt_tokens": result.metadata.get("prompt_tokens"),
+                "completion_tokens": result.metadata.get("completion_tokens"),
+                "total_tokens": result.metadata.get("total_tokens"),
                 "latency_ms": result.metadata.get("latency_ms"),
             })
             if result.success:

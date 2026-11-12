@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import datetime
 import json
 import os
 import re
 import time
 import traceback
 import random
+import sys
 import multiprocessing as mp
 import queue as queue_module
 from collections import Counter
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable, cast
+from unittest.mock import patch
 
 from .toolsandbox_skills import BGEPolicyRetriever, METHODS, ToolSandboxSkill, load_skill_library, retrieve_skills
 
@@ -219,7 +224,46 @@ def make_roles(skills: list[ToolSandboxSkill], model: str, skill_budget_chars: i
     }, agent, user
 
 
+@contextmanager
+def _controlled_sandbox_world():
+    """Pair simulated timestamps and shuffled tool lists across spawned arms."""
+    import tool_sandbox.scenarios  # Load scenario and tool modules before patching.
+
+    real_datetime = datetime.datetime
+    anchor = real_datetime(2026, 9, 9, 12, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+
+    class ScenarioDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return anchor.astimezone(tz).replace(tzinfo=None) if tz is None else anchor.astimezone(tz)
+
+    clock = SimpleNamespace(**{**vars(datetime), "datetime": ScenarioDateTime})
+    random_state = random.getstate()
+    try:
+        random.seed(20260909)
+        with ExitStack() as stack:
+            for name, module in list(sys.modules.items()):
+                if not name.startswith("tool_sandbox.") or module is None:
+                    continue
+                binding = getattr(module, "datetime", None)
+                if binding is datetime:
+                    stack.enter_context(patch.object(module, "datetime", clock))
+                elif binding is real_datetime:
+                    stack.enter_context(patch.object(module, "datetime", ScenarioDateTime))
+            yield
+    finally:
+        random.setstate(random_state)
+
+
 def run_task(task: dict[str, Any], method: str, trial: int, output_root: Path, model: str,
+             *, skill_root: Path, skill_budget_chars: int,
+             skills_override: list[ToolSandboxSkill] | None = None) -> dict[str, Any]:
+    with _controlled_sandbox_world():
+        return _run_task(task, method, trial, output_root, model, skill_root=skill_root,
+                         skill_budget_chars=skill_budget_chars, skills_override=skills_override)
+
+
+def _run_task(task: dict[str, Any], method: str, trial: int, output_root: Path, model: str,
              *, skill_root: Path, skill_budget_chars: int,
              skills_override: list[ToolSandboxSkill] | None = None) -> dict[str, Any]:
     from tool_sandbox.common.tool_discovery import ToolBackend

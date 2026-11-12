@@ -84,6 +84,13 @@ class ResilientInferenceRunner:
                 {
                     "attempt": attempt_index,
                     "allocation": allocation.to_dict(),
+                    "tier": allocation.tier.value,
+                    "connection_id": result.metadata.get("connection_id"),
+                    "model": result.model or None,
+                    "prompt_tokens": result.metadata.get("prompt_tokens"),
+                    "completion_tokens": result.metadata.get("completion_tokens"),
+                    "total_tokens": result.metadata.get("total_tokens"),
+                    "latency_ms": result.metadata.get("latency_ms"),
                     "success": result.success,
                     "error": result.error,
                     "retryable": result.retryable,

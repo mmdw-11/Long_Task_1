@@ -1,4 +1,4 @@
-"""Reproducible strict AUTO versus all-cloud routing experiment."""
+"""Paired AUTO versus all-cloud routing experiment."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ class EnvironmentRoutingStore:
                  edge_url: str, cloud_model: str, cloud_url: str) -> None:
         values = {
             "device": (device_model, device_url, "ollama"),
-            "edge": (edge_model, edge_url, "ollama" if "11434" in edge_url and edge_url.rstrip("/").endswith("/v1") else "edge-http"),
+            "edge": (edge_model, edge_url, "openai-compatible" if edge_url.rstrip("/").endswith("/v1") else "edge-http"),
             "cloud": (cloud_model, cloud_url, "deepseek"),
         }
         self.items = {
@@ -104,16 +104,29 @@ EnvironmentDeepSeekStore = EnvironmentRoutingStore
 
 
 class RoutingExperimentRunner:
-    """Runs exactly one call per strict AUTO case and records every attempt."""
+    """Compare routing with a fixed cloud baseline and record every attempt."""
 
-    def __init__(self, connections: ModelConnectionStore, pricing: Dict[str, Pricing]) -> None:
+    def __init__(
+        self, connections: ModelConnectionStore, pricing: Dict[str, Pricing], *,
+        auto_arm: str = "strict_auto", validated_local_tiers: tuple[str, ...] = (),
+        accuracy_margin_pp: float = 5.0,
+    ) -> None:
+        if auto_arm not in {"strict_auto", "quality_auto"}:
+            raise ValueError("unknown AUTO experiment arm")
+        if not 0 <= accuracy_margin_pp <= 100:
+            raise ValueError("accuracy margin must be between 0 and 100 percentage points")
+        if set(validated_local_tiers) - {"device", "edge"}:
+            raise ValueError("validated local tiers must be device or edge")
         self.connections = connections
         self.pricing = pricing
+        self.auto_arm = auto_arm
+        self.quality_tiers = ("cloud", *validated_local_tiers)
+        self.accuracy_margin_pp = accuracy_margin_pp
         self.runtime = AgentRuntimeFactory(model_connection_store=connections)
 
     def run_case(self, case: RoutingCase, arm: str) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        if arm not in {"all_cloud", "strict_auto"}:
-            raise ValueError("arm must be all_cloud or strict_auto")
+        if arm not in {"all_cloud", self.auto_arm}:
+            raise ValueError(f"arm must be all_cloud or {self.auto_arm}")
         started = time.perf_counter()
         if arm == "all_cloud":
             connection = self.connections.default_for_tier("cloud")
@@ -126,9 +139,12 @@ class RoutingExperimentRunner:
             router_backend = ""
             router_score = None
         else:
+            metadata = {**(case.metadata or {}), "strict_route": arm == "strict_auto"}
+            if arm == "quality_auto":
+                metadata.update(placement_mode="constrained", placement_quality_tiers=self.quality_tiers)
             request = ResourceRequest(
                 node="routing_experiment",
-                metadata={**(case.metadata or {}), "strict_route": True},
+                metadata=metadata,
                 state={"input": case.input},
             )
             result = self.runtime._run_auto_model(request, case.input, case.system_prompt)
@@ -146,6 +162,11 @@ class RoutingExperimentRunner:
              "cloud_cost_cny": self._attempt_cloud_cost(attempt)}
             for index, attempt in enumerate(attempts)
         ]
+        costs = [item["cloud_cost_cny"] for item in attempt_rows]
+        usage = {}
+        for field in ("prompt_tokens", "completion_tokens"):
+            counts = [item.get(field) for item in attempt_rows]
+            usage[field] = None if None in counts else sum(counts)
         success = bool(result.success) and _evaluate(case, result.text)
         row = {
             "case_id": case.case_id,
@@ -159,9 +180,8 @@ class RoutingExperimentRunner:
             "router_score": router_score,
             "fallback": bool(result.metadata.get("fallback")),
             "strict_route": arm == "strict_auto",
-            "prompt_tokens": sum(int(item.get("prompt_tokens") or 0) for item in attempts),
-            "completion_tokens": sum(int(item.get("completion_tokens") or 0) for item in attempts),
-            "cloud_cost_cny": sum(float(item["cloud_cost_cny"]) for item in attempt_rows),
+            **usage,
+            "cloud_cost_cny": None if None in costs else sum(costs),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "success": success,
             "raw_success": bool(result.success),
@@ -175,6 +195,9 @@ class RoutingExperimentRunner:
         root.mkdir(parents=True, exist_ok=True)
         write_json(root / "manifest.json", {
             **manifest,
+            "auto_arm": self.auto_arm,
+            "quality_tiers": self.quality_tiers if self.auto_arm == "quality_auto" else None,
+            "accuracy_margin_pp": self.accuracy_margin_pp,
             "auto_status": self.connections.auto_status(),
             "pricing_cny_per_million_tokens": {
                 model: {"input": price.input_per_million_cny, "output": price.output_per_million_cny}
@@ -185,7 +208,7 @@ class RoutingExperimentRunner:
         attempts: List[Dict[str, Any]] = []
         completed = 0
         for case in cases:
-            for arm in ("all_cloud", "strict_auto"):
+            for arm in ("all_cloud", self.auto_arm):
                 row, call_rows = self.run_case(case, arm)
                 rows.append(row)
                 attempts.extend(call_rows)
@@ -197,18 +220,23 @@ class RoutingExperimentRunner:
                                   "arm": arm, "success": bool(row.get("success"))}, ensure_ascii=False), flush=True)
         write_jsonl(root / "rows.jsonl", rows)
         write_jsonl(root / "attempts.jsonl", attempts)
-        summary = summarize_routing_rows(rows)
+        summary = summarize_routing_rows(rows, auto_arm=self.auto_arm, accuracy_margin_pp=self.accuracy_margin_pp)
         write_json(root / "summary.json", summary)
         (root / "report.md").write_text(_render_report(summary), encoding="utf-8")
         return summary
 
-    def _attempt_cloud_cost(self, attempt: Dict[str, Any]) -> float:
-        price = self.pricing.get(str(attempt.get("model") or ""))
-        if price is None:
+    def _attempt_cloud_cost(self, attempt: Dict[str, Any]) -> float | None:
+        tier = attempt.get("tier") or (attempt.get("allocation") or {}).get("tier")
+        if tier in {"device", "edge"}:
             return 0.0
+        price = self.pricing.get(str(attempt.get("model") or ""))
+        prompt = attempt.get("prompt_tokens")
+        completion = attempt.get("completion_tokens")
+        if tier != "cloud" or price is None or prompt is None or completion is None:
+            return None
         return round(
-            int(attempt.get("prompt_tokens") or 0) / 1_000_000 * price.input_per_million_cny
-            + int(attempt.get("completion_tokens") or 0) / 1_000_000 * price.output_per_million_cny,
+            prompt / 1_000_000 * price.input_per_million_cny
+            + completion / 1_000_000 * price.output_per_million_cny,
             12,
         )
 
@@ -217,64 +245,86 @@ class RoutingExperimentRunner:
         return {
             "tier": tier, "connection_id": connection_id, "model": model,
             "success": bool(result.success), "error": result.error,
-            "prompt_tokens": int(result.metadata.get("prompt_tokens") or 0),
-            "completion_tokens": int(result.metadata.get("completion_tokens") or 0),
-            "total_tokens": int(result.metadata.get("total_tokens") or 0),
+            "prompt_tokens": result.metadata.get("prompt_tokens"),
+            "completion_tokens": result.metadata.get("completion_tokens"),
+            "total_tokens": result.metadata.get("total_tokens"),
             "latency_ms": result.metadata.get("latency_ms"),
         }
 
 
-def summarize_routing_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_routing_rows(
+    rows: Iterable[Dict[str, Any]], *, auto_arm: str = "strict_auto", accuracy_margin_pp: float = 5.0,
+) -> Dict[str, Any]:
     selected = list(rows)
     result: Dict[str, Any] = {"total_rows": len(selected), "arms": {}}
-    for arm in ("all_cloud", "strict_auto"):
+    for arm in ("all_cloud", auto_arm):
         arm_rows = [row for row in selected if row.get("arm") == arm]
         successes = sum(bool(row.get("success")) for row in arm_rows)
-        costs = [float(row.get("cloud_cost_cny") or 0) for row in arm_rows]
+        costs = [row.get("cloud_cost_cny") for row in arm_rows]
+        unknown_cost = costs.count(None)
+        total_cost = sum(costs) if arm_rows and not unknown_cost else None
         result["arms"][arm] = {
             "n": len(arm_rows),
             "task_success_rate": successes / len(arm_rows) if arm_rows else 0.0,
-            "cloud_cost_cny": sum(costs),
-            "cloud_cost_per_success_cny": sum(costs) / successes if successes else None,
+            "cloud_cost_cny": total_cost,
+            "unknown_cloud_cost_rows": unknown_cost,
+            "cloud_cost_per_success_cny": total_cost / successes if successes and total_cost is not None else None,
             "p50_latency_ms": statistics.median([float(row.get("latency_ms") or 0) for row in arm_rows]) if arm_rows else None,
         }
     cloud = result["arms"]["all_cloud"]
-    auto = result["arms"]["strict_auto"]
+    auto = result["arms"][auto_arm]
+    result["auto_arm"] = auto_arm
     result["success_rate_delta_pp"] = round((auto["task_success_rate"] - cloud["task_success_rate"]) * 100, 6)
-    result["cloud_cost_reduction"] = (1 - auto["cloud_cost_cny"] / cloud["cloud_cost_cny"]) if cloud["cloud_cost_cny"] else None
+    result["cloud_cost_reduction"] = (
+        1 - auto["cloud_cost_cny"] / cloud["cloud_cost_cny"]
+        if cloud["cloud_cost_cny"] and auto["cloud_cost_cny"] is not None else None
+    )
     strict_rows = [row for row in selected if row.get("arm") == "strict_auto"]
     result["strict_route_match_rate"] = (
-        sum(row.get("selected_tier") == row.get("actual_tier") for row in strict_rows) / len(strict_rows)
-        if strict_rows else 0.0
+        sum(bool(row.get("selected_tier")) and row.get("selected_tier") == row.get("actual_tier") for row in strict_rows)
+        / len(strict_rows) if strict_rows else None
     )
-    result["paired_bootstrap_95ci"] = _paired_bootstrap(selected)
+    intervals = _paired_bootstrap(selected, auto_arm=auto_arm)
+    result["paired_bootstrap_95ci"] = intervals
+    delta_ci = intervals["success_rate_delta_pp"]
+    cloud_cases = {row["case_id"] for row in selected if row.get("case_id") and row.get("arm") == "all_cloud"}
+    auto_cases = {row["case_id"] for row in selected if row.get("case_id") and row.get("arm") == auto_arm}
+    complete_pairs = cloud_cases == auto_cases and len(cloud_cases) == cloud["n"] == auto["n"]
+    result["accuracy_check"] = {
+        "margin_pp": accuracy_margin_pp,
+        "paired_cases": len(cloud_cases & auto_cases),
+        "passes": delta_ci[0] >= -accuracy_margin_pp if delta_ci and complete_pairs else None,
+    }
     return result
 
 
-def _paired_bootstrap(rows: List[Dict[str, Any]], samples: int = 1_000, seed: int = 42) -> Dict[str, List[float] | None]:
+def _paired_bootstrap(
+    rows: List[Dict[str, Any]], samples: int = 1_000, seed: int = 42, *, auto_arm: str = "strict_auto",
+) -> Dict[str, List[float] | None]:
     by_case: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for row in rows:
         by_case.setdefault(str(row.get("case_id")), {})[str(row.get("arm"))] = row
-    pairs = [item for item in by_case.values() if {"all_cloud", "strict_auto"} <= set(item)]
+    pairs = [item for item in by_case.values() if {"all_cloud", auto_arm} <= set(item)]
     if not pairs:
         return {"success_rate_delta_pp": None, "cloud_cost_delta_cny": None}
     rng = random.Random(seed)
     success_deltas: List[float] = []
     cost_deltas: List[float] = []
+    costs_known = all(pair[arm].get("cloud_cost_cny") is not None for pair in pairs for arm in ("all_cloud", auto_arm))
     for _ in range(samples):
         draw = [pairs[rng.randrange(len(pairs))] for _ in range(len(pairs))]
         success_deltas.append(100 * sum(
-            float(pair["strict_auto"].get("success", False)) - float(pair["all_cloud"].get("success", False))
+            float(pair[auto_arm].get("success", False)) - float(pair["all_cloud"].get("success", False))
             for pair in draw
         ) / len(draw))
-        cost_deltas.append(sum(
-            float(pair["strict_auto"].get("cloud_cost_cny") or 0) - float(pair["all_cloud"].get("cloud_cost_cny") or 0)
-            for pair in draw
-        ) / len(draw))
+        if costs_known:
+            cost_deltas.append(sum(
+                pair[auto_arm]["cloud_cost_cny"] - pair["all_cloud"]["cloud_cost_cny"] for pair in draw
+            ) / len(draw))
     def interval(values: List[float]) -> List[float]:
         values.sort()
         return [round(values[int(.025 * (len(values) - 1))], 8), round(values[int(.975 * (len(values) - 1))], 8)]
-    return {"success_rate_delta_pp": interval(success_deltas), "cloud_cost_delta_cny": interval(cost_deltas)}
+    return {"success_rate_delta_pp": interval(success_deltas), "cloud_cost_delta_cny": interval(cost_deltas) if costs_known else None}
 
 
 def load_routing_cases(path: str | Path) -> List[RoutingCase]:
@@ -309,15 +359,21 @@ def _evaluate(case: RoutingCase, output: str) -> bool:
 
 def _render_report(summary: Dict[str, Any]) -> str:
     cloud = summary["arms"]["all_cloud"]
-    auto = summary["arms"]["strict_auto"]
+    auto_arm = summary["auto_arm"]
+    auto = summary["arms"][auto_arm]
+    accuracy = summary["accuracy_check"]
+    def format_cost(value: float | None) -> str:
+        return f"{value:.8f}" if value is not None else "unknown"
+
     return "\n".join([
-        "# Strict-AUTO vs All-Cloud", "",
+        f"# {auto_arm} vs All-Cloud", "",
         "| Arm | N | Task success rate | Cloud cost (CNY) | Cost per success (CNY) |",
         "| --- | ---: | ---: | ---: | ---: |",
-        f"| All-Cloud | {cloud['n']} | {cloud['task_success_rate']:.4f} | {cloud['cloud_cost_cny']:.8f} | {cloud['cloud_cost_per_success_cny']} |",
-        f"| Strict-AUTO | {auto['n']} | {auto['task_success_rate']:.4f} | {auto['cloud_cost_cny']:.8f} | {auto['cloud_cost_per_success_cny']} |",
+        f"| All-Cloud | {cloud['n']} | {cloud['task_success_rate']:.4f} | {format_cost(cloud['cloud_cost_cny'])} | {format_cost(cloud['cloud_cost_per_success_cny'])} |",
+        f"| {auto_arm} | {auto['n']} | {auto['task_success_rate']:.4f} | {format_cost(auto['cloud_cost_cny'])} | {format_cost(auto['cloud_cost_per_success_cny'])} |",
         "",
         f"- Success-rate delta: {summary['success_rate_delta_pp']:.4f} pp",
         f"- Cloud-cost reduction: {summary['cloud_cost_reduction']}",
-        f"- Strict route match rate: {summary['strict_route_match_rate']:.4f}",
+        f"- Accuracy check (lower 95% CI bound ≥ −{accuracy['margin_pp']} pp): {accuracy['passes']}",
+        f"- Strict route match rate: {summary['strict_route_match_rate']}",
     ]) + "\n"

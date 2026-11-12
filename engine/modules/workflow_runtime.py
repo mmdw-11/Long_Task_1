@@ -25,6 +25,15 @@ from .workflow_scripts import run_workflow_script
 from .workspace_tools import WorkspaceStore
 
 
+class TeamExecutionError(RuntimeError):
+    """All selected team members failed after the supervisor began execution."""
+
+    def __init__(self, events: list[Dict[str, Any]], results: list[Dict[str, Any]]) -> None:
+        super().__init__("动态智能体团队的所有成员均执行失败")
+        self.events = events
+        self.results = results
+
+
 class WorkflowNodeRuntimeFactory:
     """Dispatch persisted ``config.node_kind`` values to executable nodes."""
 
@@ -559,7 +568,9 @@ class WorkflowNodeRuntimeFactory:
                     events.append({"type": "topology_experiment_event", "team": team.name, "node": member.name, "member_id": member.id, "event": experiment_event["audit"]})
                 if experiment_event and experiment_event["kind"] == "failure":
                     events.append({"type": "topology_experiment_event", "team": team.name, "node": member.name, "member_id": member.id, "event": experiment_event["audit"]})
-                    raise RuntimeError(experiment_event["audit"]["reason"])
+                    error = experiment_event["audit"]["reason"]
+                    events.append({"type": "team_member_failed", "team": team.name, "node": member.name, "member_id": member.id, "parent_node_id": team.id, "error": error, "latency_ms": round((time.perf_counter() - started) * 1000, 1)})
+                    return {"member_id": member.id, "member": member.name, "status": "failed", "error": error, "update": update}
                 events.append({"type": "team_member_completed", "team": team.name, "node": member.name, "member_id": member.id, "parent_node_id": team.id, "latency_ms": round((time.perf_counter() - started) * 1000, 1)})
                 events.append({"type": "goal_checked", "team": team.name, "node": member.name, "member_id": member.id, "complete": not bool(handoff), "reason": "handoff_requested" if handoff else "member_reported_completion"})
                 return {"member_id": member.id, "member": member.name, "status": "succeeded", "output": output, "update": update, "handoff": handoff}
@@ -581,7 +592,11 @@ class WorkflowNodeRuntimeFactory:
         # Handoff is intentionally sequential.  A completed member can ask for
         # a new capability; the supervisor re-scores eligible members instead
         # of trusting a raw target name returned by the model.
-        max_handoffs = max(0, min(8, int(delegation.get("max_handoffs") or 3)))
+        handoff_limit = delegation.get("max_handoffs")
+        max_handoffs = (
+            max(0, min(8, int(3 if handoff_limit is None else handoff_limit)))
+            if delegation.get("allow_handoff", True) else 0
+        )
         for _ in range(max_handoffs):
             origin = next((item for item in reversed(results) if item.get("handoff")), None)
             if origin is None:
@@ -610,7 +625,7 @@ class WorkflowNodeRuntimeFactory:
             output = "\n\n".join(f"[{item['member']}] {item['output']}" for item in successful)
         events.append({"type": "team_aggregated", "team": team.name, "mode": aggregate_mode, "success_count": len(successful), "failure_count": len(results) - len(successful)})
         if not successful:
-            raise RuntimeError("动态智能体团队的所有成员均执行失败")
+            raise TeamExecutionError(events, results)
         return {
             str(config.get("output_field") or "team_result"): output,
             "team_results": results,

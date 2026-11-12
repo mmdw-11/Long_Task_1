@@ -181,11 +181,21 @@ class AdaptiveResourceScheduler(ResourceScheduler):
         mode = request.metadata.get("placement_mode", self.placement_mode)
         if mode not in {"auto", "legacy", "constrained"}:
             raise ValueError("unknown placement mode")
-        return mode == "constrained" or (mode == "auto" and self.placement_policy is not None and self.placement_policy.updates > 0)
+        return (
+            "placement_quality_tiers" in request.metadata
+            or mode == "constrained"
+            or (mode == "auto" and self.placement_policy is not None and self.placement_policy.updates > 0)
+        )
 
     def _safe_candidates(self, request, profile):
         budget = budget_for(request)
         allowed = request.metadata.get("allowed_tiers")
+        quality_tiers = request.metadata.get("placement_quality_tiers")
+        if "placement_quality_tiers" in request.metadata and (
+            not isinstance(quality_tiers, (list, tuple))
+            or any(tier not in ("device", "edge", "cloud") for tier in quality_tiers)
+        ):
+            raise ValueError("placement_quality_tiers must list device, edge or cloud tiers")
         estimates = request.metadata.get("placement_estimates") or {}
         safe, excluded = [], {}
         for candidate in self._ordered_candidates(request, profile):
@@ -193,6 +203,8 @@ class AdaptiveResourceScheduler(ResourceScheduler):
             tier = candidate.tier.value
             if allowed is not None and tier not in allowed:
                 reasons.append("unauthorized_tier")
+            if quality_tiers is not None and tier not in quality_tiers:
+                reasons.append("quality_not_validated")
             if not candidate.supports(profile.complexity):
                 reasons.append("insufficient_capability")
             sensitive = profile.requires_trusted_workspace or self.trusted_policy.is_sensitive(profile.sensitivity)
